@@ -75,7 +75,7 @@ terminal states, applies cooldowns, and clears recoverable errors only after
 successful use. Cooldown-aware request restarts are disabled in this mode;
 each selected account is excluded after failure for that request.
 
-The dedicated client's API key must have `allowedConnections` set to the three
+The dedicated client's API key must have `allowedConnections` set to the explicitly
 approved IDs, only traffic scope, and Claude model/endpoint restrictions. Existing
 shared keys are not changed. AUTO strips inherited `x-omniroute-connection`;
 `fixed_connection_id` emits an explicit pin. A direct explicit pin never silently
@@ -111,9 +111,9 @@ credentials. It stops immediate retries and receives scheduler backoff.
 refresh credentials are not destroyed merely on that generic classification.
 No invalid connection is reactivated by this change.
 
-The continuity OAuth flow also excludes `org:create_api_key`: the three existing
-grants did not contain that scope. Recovery retains the subscription user scopes
-and does not grant organization API-key creation or switch to paid API billing.
+The continuity OAuth flow also excludes `org:create_api_key`: the original grants
+did not contain that scope. Recovery retains the subscription user scopes and
+does not grant organization API-key creation or switch to paid API billing.
 
 ## Persistent client and operational verification
 
@@ -125,7 +125,7 @@ It reads `~/.omniroute/claude-continuity-client.json` (owner-only, mode 0600):
 {
   "base_url": "http://127.0.0.1:20128",
   "gateway_key": "REPLACE_WITH_DEDICATED_KEY_LOCALLY",
-  "allowed_connections": ["APPROVED_ID_1", "APPROVED_ID_2", "APPROVED_ID_3"]
+  "allowed_connections": ["APPROVED_ID_1", "APPROVED_ID_2"]
 }
 ```
 
@@ -160,8 +160,57 @@ the previous package and plist for rollback. Never restore the database backup
 over credentials that were reauthenticated after it was taken; reconcile only
 the specific reversible configuration changes.
 
-The 2026-11-15 implementation checkpoint has no real failover acceptance yet:
-official OAuth is open, but the browser account does not match the authorized
-three. The account holder must select the correct account. Existing credentials
-remain inactive until successful official authentication. This is an authentication
-blocker, not a claim that implementation tests establish operational completion.
+## Operational evidence and final authorized pool (2026-11-15)
+
+The account holder explicitly excluded Financeiro (`78dc4b41...`) from failover.
+The production traffic key and private client configuration therefore authorize
+only the following original connections, in their unchanged priority order:
+
+| Account prefix | Priority | Continuity policy      |
+| -------------- | -------- | ---------------------- |
+| `6726837b...`  | 1        | First eligible account |
+| `598035c1...`  | 2        | Next eligible account  |
+
+Both were recovered through the official OAuth flow under their original IDs.
+Financeiro was not recovered, reactivated, deleted, or used for inference. Its
+historical row remains outside this client's authorization.
+
+The persistently installed Mac build is `1e791d7`, from reviewed source commit
+`1e791d754a991f533f747739a5f1721caf3284b5`, integrated by
+`d0005c076dee5ceeee904b0409d00f5744d3e6d3`. The documentation update does not
+change that executable build. One LaunchAgent supervises one loopback listener.
+The private environment preserves the original encryption, gateway and JWT
+secrets. Migration 163 remains applied and SQLite integrity checks pass.
+
+The installed client and actual VS Code bundled Claude Code 2.1.319 completed
+real `claude-haiku-5-5` inference through port 20128. An isolated gateway clone
+then completed these real-account checks, with background work disabled and no
+refresh tokens in the clone:
+
+- Healthy priority 1: one attempt, `CONTINUIDADE_OK JCMAC-731`.
+- A synthetic invalid access token on priority 1, only in the clone: real upstream
+  HTTP 401, then priority 2 succeeded after two account attempts with the same
+  model and context marker.
+- Both authorized accounts invalid only in the clone: two upstream attempts,
+  explicit account reauthentication guidance, and no inference through Financeiro
+  or any other provider/model.
+- An explicit fixed account did not switch to its healthy sibling.
+
+The original production credential pairs and priority order were unchanged by
+these canaries. The final two-account policy was exercised again after the
+Financeiro exclusion. An explicit excluded-account pin on the live gateway
+returned unavailable with zero upstream attempts.
+
+The VS Code machine setting `claudeCode.claudeProcessWrapper` now points to the
+installed `~/.local/bin/claude-continuity`. Existing native processes were
+preserved; already running native sessions keep their original authentication
+until safely reopened or resumed. This setting alone is not evidence that an
+existing process changed its request path. Real bundled-client inference and
+failover evidence are recorded separately from authenticated dashboard and
+native UI acceptance in the private mission checkpoint.
+
+Backups, sanitized reports, final policy, client activation proof, and rollback
+are under `~/.omniroute/mission-backups/20261115T124526/`. Additional real inference
+and canary reports are in the adjacent `continuity-live-inference-*` and
+`continuity-real-canary-*` directories. These files contain no printed tokens or
+keys; private configuration and SQLite backups remain owner-only.
