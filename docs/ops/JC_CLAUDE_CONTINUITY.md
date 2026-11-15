@@ -55,6 +55,12 @@ existing `preferClaudeCodeForUnprefixedClaudeModels` setting. Together with the
 continuity flag, that preference stays on the subscription route even when all
 Claude accounts are inactive, so the client receives account recovery guidance.
 Explicit provider prefixes retain their meaning; no model ID is substituted.
+If all upstream accounts reject authentication, the accepted gateway request
+returns HTTP 502 with `upstream_status: 401` and code
+`upstream_accounts_unavailable`. Invalid gateway credentials retain HTTP 401.
+Terminal pool exhaustion includes `x-should-retry: false`, so the Claude Code
+client reports the recovery message instead of retrying an unavailable pool.
+Temporary usage exhaustion retains its reset time and `Retry-After` for a later retry.
 The normal authorized account selector uses configured priorities, excludes
 terminal states, applies cooldowns, and clears recoverable errors only after
 successful use. Cooldown-aware request restarts are disabled in this mode;

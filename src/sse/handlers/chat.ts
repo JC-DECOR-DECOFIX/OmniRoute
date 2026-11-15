@@ -1744,7 +1744,11 @@ async function handleSingleModelChat(
           const responseHeaders = new Headers({
             "Content-Type": "application/json",
             "x-omniroute-continuity-status": "accounts-unavailable",
+            "x-should-retry": "false",
           });
+          // Gateway authentication already succeeded. Do not label an exhausted
+          // upstream credential pool as an invalid client API key.
+          const responseStatus = status === 401 ? 502 : status;
           if (credentials?.allRateLimited && credentials.retryAfter) {
             const retryAfter = unavailableResponse(status, "", credentials.retryAfter).headers.get(
               "Retry-After"
@@ -1754,6 +1758,7 @@ async function handleSingleModelChat(
           const continuity = {
             provider: "claude",
             requested_model: model,
+            upstream_status: status,
             mode: hasForcedConnection ? "fixed" : "authorized-pool",
             attempts: continuityAttemptedConnections.size,
             attempted_connections: Array.from(
@@ -1770,16 +1775,18 @@ async function handleSingleModelChat(
               : {}),
           };
           log.warn("CLAUDE_CONTINUITY", JSON.stringify(continuity));
+          const errorBody = buildErrorBody(
+            responseStatus,
+            `Claude upstream accounts unavailable: ${reason}. ${recovery}`
+          );
           return new Response(
             JSON.stringify({
-              ...buildErrorBody(
-                status,
-                `Claude upstream accounts unavailable: ${reason}. ${recovery}`
-              ),
+              ...errorBody,
+              error: { ...errorBody.error, code: "upstream_accounts_unavailable" },
               continuity,
             }),
             {
-              status,
+              status: responseStatus,
               headers: responseHeaders,
             }
           );

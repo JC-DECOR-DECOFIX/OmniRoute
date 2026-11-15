@@ -95,9 +95,12 @@ for (const failures of [1, 2, 3]) {
     };
     const response = await call(key.key);
     const responseText = await response.text();
-    assert.equal(response.status, failures < 3 ? 200 : 401);
+    assert.equal(response.status, failures < 3 ? 200 : 502);
     if (failures === 3) {
       const error = JSON.parse(responseText);
+      assert.equal(response.headers.get("x-should-retry"), "false");
+      assert.equal(error.error.code, "upstream_accounts_unavailable");
+      assert.equal(error.continuity.upstream_status, 401);
       assert.match(error.error.message, /Claude upstream accounts unavailable/);
       assert.equal(error.continuity.attempts, 3);
       assert.match(error.continuity.recovery, /Re-authenticate/);
@@ -174,6 +177,7 @@ test("invalid gateway credentials do not reach any upstream account", async () =
   const response = await call("sk-invalidsynthetic");
   await response.text();
   assert.equal(response.status, 401);
+  assert.notEqual(response.headers.get("x-omniroute-continuity-status"), "accounts-unavailable");
   assert.equal(attempts, 0);
   process.env.REQUIRE_API_KEY = "false";
 });
@@ -534,11 +538,14 @@ test("native model with all Claude accounts inactive reports recovery even while
   };
   const nativeModel = "claude-haiku-5-5";
   const response = await call(key.key, { ...body(), model: nativeModel });
-  assert.equal(response.status, 401);
+  assert.equal(response.status, 502);
   const error = await response.json();
   assert.equal(error.continuity.requested_model, nativeModel);
   assert.equal(error.continuity.provider, "claude");
   assert.equal(error.continuity.attempts, 0);
+  assert.equal(error.continuity.upstream_status, 401);
+  assert.equal(error.error.code, "upstream_accounts_unavailable");
+  assert.equal(response.headers.get("x-should-retry"), "false");
   assert.match(error.continuity.recovery, /Re-authenticate/);
 
   const { getModelInfo } = await import("../../src/sse/services/model.ts");
