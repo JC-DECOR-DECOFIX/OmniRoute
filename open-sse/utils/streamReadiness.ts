@@ -318,6 +318,8 @@ type StreamReadinessSignalState = {
   dataLines: string[];
   pendingLine: string;
   upstreamDiagnostic: string | null;
+  requireUsefulClaudeOutput?: boolean;
+  upstreamStatus?: number;
 };
 
 function resetCurrentEvent(state: StreamReadinessSignalState): void {
@@ -345,9 +347,30 @@ function processStreamReadinessEvent(state: StreamReadinessSignalState): boolean
       const diagnostic = sanitizeErrorMessage(rawMessage).trim();
       if (diagnostic) state.upstreamDiagnostic = diagnostic;
     }
+    if (state.requireUsefulClaudeOutput) {
+      if (isRecord(payload) && isErrorOnlyStructuredPayload(payload)) {
+        const error = isRecord(payload.error) ? payload.error : {};
+        const type = String(error.type || "");
+        state.upstreamStatus =
+          type === "authentication_error"
+            ? 401
+            : type === "rate_limit_error"
+              ? 429
+              : type === "permission_error"
+                ? 403
+                : 502;
+        return false;
+      }
+      if (hasUsefulJsonPayload(payload)) return true;
+      return (
+        isRecord(payload) &&
+        isRecord(payload.delta) &&
+        LEGIT_EMPTY_TERMINAL_REASONS.has(String(payload.delta.stop_reason || ""))
+      );
+    }
     return hasNonPingStructuredPayload(payload, eventType);
   } catch {
-    return data.length > 0;
+    return !state.requireUsefulClaudeOutput && data.length > 0;
   }
 }
 
@@ -476,7 +499,11 @@ export async function ensureStreamReadiness(
     log?: StreamReadinessLogger | null;
   }
 ): Promise<StreamReadinessResult> {
-  if (!response.body || options.timeoutMs <= 0) return { ok: true, response };
+  const requireUsefulClaudeOutput =
+    options.provider === "claude" &&
+    process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true";
+  if (!response.body || (options.timeoutMs <= 0 && !requireUsefulClaudeOutput))
+    return { ok: true, response };
 
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -486,9 +513,14 @@ export async function ensureStreamReadiness(
     dataLines: [],
     pendingLine: "",
     upstreamDiagnostic: null,
+    requireUsefulClaudeOutput,
   };
+  let bufferedBytes = 0;
   const startedAt = Date.now();
-  const effectiveTimeoutMs = Math.max(0, Math.floor(options.timeoutMs));
+  const effectiveTimeoutMs = Math.max(
+    0,
+    Math.floor(options.timeoutMs > 0 ? options.timeoutMs : 30_000)
+  );
   const deadline = startedAt + effectiveTimeoutMs;
   let handedOffReader = false;
 
@@ -593,7 +625,31 @@ export async function ensureStreamReadiness(
       chunks.push(readResult.value);
       const decodedChunk = decoder.decode(readResult.value, { stream: true });
 
-      if (appendStreamReadinessSignal(readinessState, decodedChunk)) {
+      const ready = appendStreamReadinessSignal(readinessState, decodedChunk);
+      bufferedBytes += readResult.value.byteLength;
+      if (
+        requireUsefulClaudeOutput &&
+        (readinessState.upstreamDiagnostic || (!ready && bufferedBytes > 256 * 1024))
+      ) {
+        const reason =
+          readinessState.upstreamDiagnostic || "Stream pre-output buffer limit exceeded";
+        const status = readinessState.upstreamStatus || 502;
+        await reader.cancel(reason).catch(() => {});
+        return {
+          ok: false,
+          reason,
+          classificationReason: reason,
+          code: "STREAM_PRE_OUTPUT_ERROR",
+          type: "stream_early_eof",
+          response: createErrorResponse(
+            status,
+            reason,
+            "STREAM_PRE_OUTPUT_ERROR",
+            "stream_early_eof"
+          ),
+        };
+      }
+      if (ready) {
         options.log?.debug?.(
           "STREAM",
           `Stream readiness confirmed in ${Date.now() - startedAt}ms (${options.provider || "provider"}/${options.model || "unknown"})`

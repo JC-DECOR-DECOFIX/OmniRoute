@@ -27,7 +27,12 @@ import {
 import { getCombo, getComboForModel, getModelInfo } from "../services/model";
 import { stripContextWindowSuffix } from "@omniroute/open-sse/services/model.ts";
 import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
-import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
+import {
+  errorResponse,
+  buildErrorBody,
+  sanitizeErrorMessage,
+  unavailableResponse,
+} from "@omniroute/open-sse/utils/error.ts";
 import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import { applyNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
@@ -1430,6 +1435,8 @@ async function handleSingleModelChat(
     // Intentional override (e.g. providerId points to a different credential pool).
     return runtimeOptions.providerId;
   })();
+  const claudeAccountContinuityOnly =
+    provider === "claude" && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true";
   const forceLiveComboTest = runtimeOptions.forceLiveComboTest === true;
   const bypassProviderQuotaPolicy = hasProviderQuotaBypassScope(apiKeyInfo?.scopes);
   const hasForcedConnection =
@@ -1522,6 +1529,7 @@ async function handleSingleModelChat(
   const retrySettings = disableCooldownAwareRetry(
     baseRetrySettings,
     provider === "claude-web" ||
+      claudeAccountContinuityOnly ||
       isCombo ||
       forceLiveComboTest ||
       runtimeOptions.emergencyFallbackTried === true
@@ -1549,6 +1557,7 @@ async function handleSingleModelChat(
   // re-attempt to exactly one for the whole request. Declared outside both retry
   // loops so it can never reset and loop.
   let streamEarlyEofRetries = 0;
+  const continuityAttemptedConnections = new Set<string>();
   const sameAccountTransportRetries = new Map<string, number>();
   const occupancySessionKey =
     runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId ?? `request:${randomUUID()}`;
@@ -1574,6 +1583,7 @@ async function handleSingleModelChat(
               {
                 sessionKey: occupancySessionKey,
                 reserveOAuthSession: true,
+                strictForcedConnection: hasForcedConnection && !comboName,
                 excludeConnectionIds: Array.from(excludedConnectionIds),
                 ...(runtimeOptions.allowRateLimitedConnection
                   ? { allowRateLimitedConnections: true }
@@ -1685,6 +1695,102 @@ async function handleSingleModelChat(
                 (candidate): candidate is string => typeof candidate === "string"
               )
             : undefined;
+        if (claudeAccountContinuityOnly) {
+          const upstreamStatus = Number(lastStatus || credentials?.lastErrorCode);
+          const terminalStatus =
+            credentials?.expiredStatus === "credits_exhausted"
+              ? 402
+              : credentials?.expiredStatus === "banned"
+                ? 403
+                : 401;
+          const status =
+            upstreamStatus >= 400 && upstreamStatus <= 599
+              ? upstreamStatus
+              : credentials?.allExpired
+                ? terminalStatus
+                : credentials?.allRateLimited
+                  ? 429
+                  : 503;
+          const reason = sanitizeErrorMessage(
+            String(
+              lastError ||
+                credentials?.lastError ||
+                (credentials?.allExpired
+                  ? `${credentials.expiredCount} authorized account(s) are ${credentials.expiredStatus}`
+                  : "No authorized healthy Claude account is available")
+            )
+          );
+          const subscriptionExpired =
+            /(?:subscription|assinatura|plan).{0,48}(?:expired|inactive|expirad[ao]|expirou|inativ[ao])|(?:renew|renov[ae]).{0,32}(?:subscription|assinatura|plan)/i.test(
+              reason
+            );
+          const recovery =
+            (credentials?.expiredStatus === "banned" && !lastError) ||
+            /\b(?:account|conta)\b.{0,24}\b(?:banned|suspended|banid[ao]|suspens[ao])\b/i.test(
+              reason
+            )
+              ? "Verify the Claude account restriction with Anthropic support before retrying."
+              : status === 429
+                ? "Wait for the account usage reset or cooldown, then retry the same model."
+                : status === 401
+                  ? "Re-authenticate the unavailable accounts through OmniRoute's official Claude OAuth flow."
+                  : subscriptionExpired
+                    ? "Verify or renew the Claude subscription with Anthropic before retrying the same model."
+                    : status === 403
+                      ? "Verify Claude account permissions and access to the requested model in Anthropic."
+                      : status === 402
+                        ? "Verify the account's Claude subscription, billing and available credits with Anthropic."
+                        : "Check upstream service health and account availability in OmniRoute before retrying the same model.";
+          const responseHeaders = new Headers({
+            "Content-Type": "application/json",
+            "x-omniroute-continuity-status": "accounts-unavailable",
+            "x-should-retry": "false",
+          });
+          // Gateway authentication already succeeded. Do not label an exhausted
+          // upstream credential pool as an invalid client API key.
+          const responseStatus = status === 401 ? 502 : status;
+          if (credentials?.allRateLimited && credentials.retryAfter) {
+            const retryAfter = unavailableResponse(status, "", credentials.retryAfter).headers.get(
+              "Retry-After"
+            );
+            if (retryAfter) responseHeaders.set("Retry-After", retryAfter);
+          }
+          const continuity = {
+            provider: "claude",
+            requested_model: model,
+            upstream_status: status,
+            mode: hasForcedConnection ? "fixed" : "authorized-pool",
+            attempts: continuityAttemptedConnections.size,
+            attempted_connections: Array.from(
+              continuityAttemptedConnections,
+              (id) => `${id.slice(0, 8)}...`
+            ),
+            result: "unavailable",
+            recovery,
+            ...(responseHeaders.has("Retry-After")
+              ? {
+                  retry_after: Number(responseHeaders.get("Retry-After")),
+                  retry_after_at: credentials.retryAfter,
+                }
+              : {}),
+          };
+          log.warn("CLAUDE_CONTINUITY", JSON.stringify(continuity));
+          const errorBody = buildErrorBody(
+            responseStatus,
+            `Claude upstream accounts unavailable: ${reason}. ${recovery}`
+          );
+          return new Response(
+            JSON.stringify({
+              ...errorBody,
+              error: { ...errorBody.error, code: "upstream_accounts_unavailable" },
+              continuity,
+            }),
+            {
+              status: responseStatus,
+              headers: responseHeaders,
+            }
+          );
+        }
         const noCredsRes = handleNoCredentials(
           credentials,
           excludedConnectionIds.size > 0 ? Array.from(excludedConnectionIds)[0] : null,
@@ -1865,6 +1971,7 @@ async function handleSingleModelChat(
         return execution.localResourcePressureResult.response;
       }
       const { result, tlsFingerprintUsed } = execution;
+      if (claudeAccountContinuityOnly) continuityAttemptedConnections.add(credentials.connectionId);
       if (!result.success) releaseOAuthSession();
 
       const proxyLatency = Date.now() - proxyStartTime;
@@ -1891,6 +1998,20 @@ async function handleSingleModelChat(
       });
 
       if (result.success) {
+        if (claudeAccountContinuityOnly) {
+          const attempts = Array.from(continuityAttemptedConnections);
+          log.info(
+            "CLAUDE_CONTINUITY",
+            JSON.stringify({
+              provider: "claude",
+              model,
+              initial: `${attempts[0].slice(0, 8)}...`,
+              final: `${credentials.connectionId.slice(0, 8)}...`,
+              attempts: attempts.length,
+              result: requestBody.stream === true ? "stream-started" : "completed",
+            })
+          );
+        }
         clearModelLock(provider, credentials.connectionId, model);
         if (!forceLiveComboTest) {
           breaker._onSuccess();
@@ -1936,6 +2057,35 @@ async function handleSingleModelChat(
         (result.errorType === "stream_timeout" || result.errorType === "stream_early_eof") &&
         !isAntigravityStreamReadinessFailure
       ) {
+        if (claudeAccountContinuityOnly && !hasForcedConnection) {
+          // This verdict exists only before the first useful output. Retry the
+          // SAME immutable request on the next authorized account, once per ID.
+          // After partial output streamHandler reports recovery to the client.
+          await markAccountUnavailable(
+            credentials.connectionId,
+            result.status || 502,
+            "Claude stream interrupted before useful output",
+            provider,
+            model,
+            providerProfile
+          );
+          excludedConnectionIds.add(credentials.connectionId);
+          if (runtimeOptions.sessionAffinityKey) {
+            evictSessionAccountAffinityForConnection(
+              runtimeOptions.sessionAffinityKey,
+              provider,
+              credentials.connectionId
+            );
+          }
+          lastError = result.error;
+          lastStatus = result.status;
+          log.warn(
+            "STREAM",
+            `Claude account ${credentials.connectionId.slice(0, 8)}... failed before output; trying next authorized account`
+          );
+          continue;
+        }
+
         // Bug #3758: flaky OpenAI-compatible upstreams (e.g. NVIDIA NIM) sometimes
         // send HTTP 200 then close the SSE early with zero useful frames
         // (STREAM_EARLY_EOF). That is a transient upstream glitch, not a bad key — so
@@ -2099,7 +2249,12 @@ async function handleSingleModelChat(
       // Combo targets never emergency-hop: the combo is the operator's fallback policy
       // (target-level orchestration plus the global fallback #689 after it), and a
       // per-target hop burns extra upstream calls against exhausted providers (#1731).
-      if (!runtimeOptions.emergencyFallbackTried && !comboName) {
+      if (
+        !claudeAccountContinuityOnly &&
+        !hasForcedConnection &&
+        !runtimeOptions.emergencyFallbackTried &&
+        !comboName
+      ) {
         const fallbackDecision = shouldUseFallback(
           Number(result.status || 0),
           String(result.error || ""),

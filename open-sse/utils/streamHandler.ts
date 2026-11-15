@@ -4,6 +4,7 @@ import { FORMATS } from "../translator/formats.ts";
 import { PENDING_REQUEST_CLEARED_MARKER } from "./stream.ts";
 import { createCompletedResponsesToolHandoffWatcher } from "./responsesToolHandoff.ts";
 import { createStreamContentWatcher, type StreamContentWatcher } from "./streamReadiness.ts";
+import { buildClaudeInterruptedError } from "./claudeContinuityError.ts";
 
 // Stream handler with disconnect detection - shared for all providers
 
@@ -417,6 +418,7 @@ export function createStreamController({
       abortController.abort();
     },
     clientResponseFormat,
+    provider,
     clientDisconnectGracePeriodMs,
   };
 
@@ -449,7 +451,8 @@ export function createStreamController({
 export function buildStreamErrorChunks(
   errorMsg: string,
   statusCode: number,
-  clientResponseFormat?: string | null
+  clientResponseFormat?: string | null,
+  explicitClaudeRecovery = false
 ) {
   const statusMapping = getStreamErrorStatusMapping(statusCode);
 
@@ -473,10 +476,9 @@ export function buildStreamErrorChunks(
   if (clientResponseFormat === FORMATS.CLAUDE) {
     const errorEvent = {
       type: "error",
-      error: {
-        type: statusMapping.claude.type,
-        message: errorMsg,
-      },
+      error: explicitClaudeRecovery
+        ? buildClaudeInterruptedError(errorMsg)
+        : { type: statusMapping.claude.type, message: errorMsg },
     };
 
     // #7699 — emit message_stop after event:error so Anthropic SDK / Claude Code
@@ -584,12 +586,23 @@ function resolveSilentCloseOutcome(input: {
   bytesWereForwarded: boolean;
   clientTerminalSeen: boolean;
   clientResponseFormat?: string | null;
+  provider?: string | null;
   contentWatcher: StreamContentWatcher;
 }): SilentCloseOutcome | null {
   if (!input.bytesWereForwarded) return null;
 
   if (!input.clientTerminalSeen) {
     if (input.clientResponseFormat === FORMATS.CLAUDE && input.contentWatcher.sawContent()) {
+      if (
+        input.provider === "claude" &&
+        process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true"
+      ) {
+        return {
+          kind: "error",
+          reason:
+            "Upstream stream interrupted after partial output. Resume explicitly from the preserved conversation context; do not replay completed tools or external effects.",
+        };
+      }
       // #7699 — upstream dropped after content reached the client on a Claude
       // stream. Keep the partial response: emit a clean max_tokens completion
       // instead of an error frame so Anthropic SDK / Claude Code don't report
@@ -713,6 +726,7 @@ export function createDisconnectAwareStream(transformStream, streamController) {
               bytesWereForwarded,
               clientTerminalSeen,
               clientResponseFormat: streamController.clientResponseFormat,
+              provider: streamController.provider,
               contentWatcher,
             });
 
@@ -739,7 +753,10 @@ export function createDisconnectAwareStream(transformStream, streamController) {
                 for (const chunk of buildStreamErrorChunks(
                   silentClose.reason,
                   502,
-                  streamController.clientResponseFormat
+                  streamController.clientResponseFormat,
+                  streamController.provider === "claude" &&
+                    process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true" &&
+                    contentWatcher.sawContent()
                 )) {
                   controller.enqueue(chunk);
                 }
@@ -789,7 +806,10 @@ export function createDisconnectAwareStream(transformStream, streamController) {
             for (const chunk of buildStreamErrorChunks(
               errorMsg,
               statusCode,
-              streamController.clientResponseFormat
+              streamController.clientResponseFormat,
+              streamController.provider === "claude" &&
+                process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true" &&
+                contentWatcher.sawContent()
             )) {
               controller.enqueue(chunk);
             }

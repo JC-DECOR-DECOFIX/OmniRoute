@@ -80,12 +80,18 @@ export const claude = {
   config: CLAUDE_CONFIG,
   flowType: "authorization_code_pkce",
   buildAuthUrl: (config, _redirectUri, state, codeChallenge) => {
+    // Subscription-account continuity needs the existing user scopes, not
+    // permission to create organization API keys (a separate billing path).
+    const scopes =
+      process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true"
+        ? config.scopes.filter((scope: string) => scope !== "org:create_api_key")
+        : config.scopes;
     const params = new URLSearchParams({
       code: "true",
       client_id: config.clientId,
       response_type: "code",
       redirect_uri: config.redirectUri,
-      scope: config.scopes.join(" "),
+      scope: scopes.join(" "),
       code_challenge: codeChallenge,
       code_challenge_method: config.codeChallengeMethod,
       state: state,

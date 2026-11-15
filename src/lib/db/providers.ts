@@ -6,6 +6,10 @@ import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel, cleanNulls } from "./core";
 import { backupDbFile } from "./backup";
 import {
+  getActiveCasGuard,
+  RefreshCredentialConflictError,
+} from "@omniroute/open-sse/services/tokenRefresh/casGuard.ts";
+import {
   encryptConnectionFields,
   decryptConnectionFields,
   migrateLegacyEncryptedString,
@@ -836,72 +840,89 @@ function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
 
 export async function updateProviderConnection(id: string, data: JsonRecord) {
   const db = getDbInstance() as unknown as DbLike;
-  const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
-  if (!existing) return null;
-
   // The incoming value only. A connection that already holds the password has
   // to stay editable, or an operator cannot repair the one this guard exists
   // to prevent -- and re-checking the merged value would spend a bcrypt round
   // on every unrelated field edit.
   await assertApiKeyIsNotManagementPassword(data.apiKey);
 
-  const existingCamel = toRecord(rowToCamel(existing));
-  const merged: JsonRecord = {
-    ...existingCamel,
-    ...data,
-    updatedAt: new Date().toISOString(),
-  };
-  merged.providerSpecificData = normalizeConnectionProviderSpecificData(
-    toStringOrNull(merged.provider),
-    merged.providerSpecificData,
-    merged,
-    existingCamel.providerSpecificData
-  );
-  // Mirror the sanitization the create path applies — keep the returned
-  // object in lockstep with what we persist.
-  if ("quotaWindowThresholds" in merged) {
-    const result = sanitizeQuotaWindowThresholds(merged.quotaWindowThresholds);
-    if (result.rejected.length > 0) {
-      throw new Error(
-        `Refusing to persist quotaWindowThresholds with rejected keys: ${result.rejected.join(", ")}`
-      );
+  // Validation may await bcrypt. Never keep a row snapshot across that await:
+  // a concurrent refresh must not be undone by an unrelated metadata write.
+  const merged = db.transaction(() => {
+    const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
+    const guard = getActiveCasGuard();
+    if (!existing) {
+      if (guard?.connectionId === id) throw new RefreshCredentialConflictError();
+      return null;
     }
-    // For updates we always carry the key forward (even as null) so the read
-    // path surfaces the cleared state to callers that merged it.
-    merged.quotaWindowThresholds = result.sanitized;
-  }
-  if ("rateLimitOverrides" in merged) {
-    const result = sanitizeRateLimitOverrides(merged.rateLimitOverrides);
-    if (result.rejected.length > 0) {
-      throw new Error(
-        `Refusing to persist rateLimitOverrides with rejected keys: ${result.rejected.join(", ")}`
-      );
+    if (guard?.connectionId === id) {
+      const current = decryptConnectionFields(toRecord(rowToCamel(existing)));
+      if (
+        (current.refreshToken || null) !== guard.expectedRefreshToken ||
+        (guard.expectedAccessToken !== undefined &&
+          (current.accessToken || null) !== guard.expectedAccessToken)
+      ) {
+        throw new RefreshCredentialConflictError();
+      }
     }
-    merged.rateLimitOverrides = result.sanitized;
-  }
-  const existingRecord = toRecord(existing);
+    const existingCamel = toRecord(rowToCamel(existing));
+    const merged: JsonRecord = {
+      ...existingCamel,
+      ...data,
+      updatedAt: new Date().toISOString(),
+    };
+    merged.providerSpecificData = normalizeConnectionProviderSpecificData(
+      toStringOrNull(merged.provider),
+      merged.providerSpecificData,
+      merged,
+      existingCamel.providerSpecificData
+    );
+    // Mirror the sanitization the create path applies — keep the returned
+    // object in lockstep with what we persist.
+    if ("quotaWindowThresholds" in merged) {
+      const result = sanitizeQuotaWindowThresholds(merged.quotaWindowThresholds);
+      if (result.rejected.length > 0) {
+        throw new Error(
+          `Refusing to persist quotaWindowThresholds with rejected keys: ${result.rejected.join(", ")}`
+        );
+      }
+      // For updates we always carry the key forward (even as null) so the read
+      // path surfaces the cleared state to callers that merged it.
+      merged.quotaWindowThresholds = result.sanitized;
+    }
+    if ("rateLimitOverrides" in merged) {
+      const result = sanitizeRateLimitOverrides(merged.rateLimitOverrides);
+      if (result.rejected.length > 0) {
+        throw new Error(
+          `Refusing to persist rateLimitOverrides with rejected keys: ${result.rejected.join(", ")}`
+        );
+      }
+      merged.rateLimitOverrides = result.sanitized;
+    }
+    const existingRecord = toRecord(existing);
 
-  db.transaction(() => {
     reconcileCodexUsageHistory(db, {
       connectionId: id,
       existing: existingRecord,
       merged,
     });
     _updateConnectionRow(db, id, encryptConnectionFields({ ...merged }));
+
+    if (data.priority !== undefined) {
+      const existingRecord = toRecord(existing);
+      const providerId =
+        typeof existingRecord.provider === "string"
+          ? existingRecord.provider
+          : String(existingRecord.provider || "");
+      reorderConnections(db, providerId);
+    }
+
+    return merged;
   })();
+  if (!merged) return null;
   backupDbFile("pre-write");
-  invalidateDbCache("connections"); // Bust connections read cache
+  invalidateDbCache("connections");
   bumpProxyConfigGeneration();
-
-  if (data.priority !== undefined) {
-    const existingRecord = toRecord(existing);
-    const providerId =
-      typeof existingRecord.provider === "string"
-        ? existingRecord.provider
-        : String(existingRecord.provider || "");
-    reorderConnections(db, providerId);
-  }
-
   return withNullableRateLimitOverrides(
     withNullableQuotaWindowThresholds(
       withNullableMaxConcurrent(cleanNulls(merged), merged),

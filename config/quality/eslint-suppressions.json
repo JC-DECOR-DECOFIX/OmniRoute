@@ -230,11 +230,6 @@
       "count": 1
     }
   },
-  "open-sse/handlers/chatCore.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 26
-    }
-  },
   "open-sse/handlers/chatCore/clientUsageBuffer.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
@@ -6058,11 +6053,6 @@
   },
   "tests/unit/signature-cache.test.ts": {
     "@typescript-eslint/no-explicit-any": {
-      "count": 1
-    }
-  },
-  "tests/unit/silent-sse-close-7699.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
   },

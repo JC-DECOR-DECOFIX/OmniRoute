@@ -31,6 +31,11 @@ import { refreshGithubCopilotSubTokenIfNeeded } from "@/lib/tokenHealthCheckCopi
 import { checkCursorConnectionIfNeeded } from "@/lib/tokenHealthCheckCursor";
 import { checkKimiWebConnectionIfNeeded } from "@/lib/tokenHealthCheckKimi";
 
+import {
+  runWithCasGuard,
+  RefreshCredentialConflictError,
+} from "@omniroute/open-sse/services/tokenRefresh/casGuard.ts";
+
 const LOG_PREFIX = "[HealthCheck]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 const TICK_MS = 60 * 1000; // sweep interval: every 60 seconds (restored — #7719 dropped the const but kept two call sites)
@@ -911,6 +916,7 @@ export async function checkConnection(conn) {
         try {
           await updateProviderConnection(conn.id, updateData);
         } catch (dbErr) {
+          if (dbErr instanceof RefreshCredentialConflictError) throw dbErr;
           // DB write failed after successful refresh - log but do not throw.
           // The outer catch would misclassify this as a network error.
           logWarn(
@@ -989,11 +995,31 @@ export async function checkConnection(conn) {
 
   const now = new Date().toISOString();
 
+  if (result?.error === "refresh_state_changed") return;
+
   // ─── Handle unrecoverable errors (e.g. refresh_token_reused) ───────────
   // OpenAI Codex uses rotating one-time-use refresh tokens.
   // Once used, the old token is permanently invalidated.
   // Retrying will never succeed → deactivate and stop the loop.
   if (isUnrecoverableRefreshError(result)) {
+    // Compare again IN the DB transaction, including error-only writes. A login
+    // or another successful rotation can land after the sweep's reread.
+    const updateIfCurrent = async (data) => {
+      try {
+        return await runWithCasGuard(
+          {
+            connectionId: conn.id,
+            expectedRefreshToken: attemptedRefreshToken,
+            expectedAccessToken: attemptedAccessToken,
+            reread: async () => attemptedRefreshToken,
+          },
+          () => updateProviderConnection(conn.id, data)
+        );
+      } catch (error) {
+        if (error instanceof RefreshCredentialConflictError) return null;
+        throw error;
+      }
+    };
     const currentConnection = await getCachedProviderConnectionById(conn.id);
     const credentialsChangedSinceSweep =
       !!currentConnection &&
@@ -1001,7 +1027,7 @@ export async function checkConnection(conn) {
         (currentConnection.accessToken || null) !== attemptedAccessToken);
 
     if (credentialsChangedSinceSweep) {
-      await updateProviderConnection(conn.id, {
+      await updateIfCurrent({
         lastHealthCheckAt: now,
       });
       logWarn(
@@ -1014,7 +1040,7 @@ export async function checkConnection(conn) {
       getEffectiveTokenExpiryMs(currentConnection || conn) > Date.now() + TOKEN_EXPIRY_BUFFER;
 
     if (accessTokenStillValid) {
-      await updateProviderConnection(conn.id, {
+      const applied = await updateIfCurrent({
         lastHealthCheckAt: now,
         testStatus: "active",
         lastError: `Health check refresh failed (${result.error}). Re-authenticate before the current access token expires.`,
@@ -1023,18 +1049,20 @@ export async function checkConnection(conn) {
         lastErrorSource: "oauth",
         errorCode: result.error,
       });
+      if (!applied) return;
       logWarn(
         `${LOG_PREFIX} ! ${conn.provider}/${getConnectionLogLabel(conn)} refresh token is invalid (${result.error}), but the current access token is still valid; keeping connection active`
       );
       return;
     }
 
-    await updateProviderConnection(conn.id, {
+    const applied = await updateIfCurrent({
       lastHealthCheckAt: now,
       testStatus: "expired",
-      lastError: isRotatingProvider
-        ? `Refresh token consumed (${result.error}). Please re-authenticate this account.`
-        : `Refresh token rejected (${result.error}). Please re-authenticate this account.`,
+      lastError:
+        result.reason === "refresh_token_expired"
+          ? `Refresh token expired (${result.code}). Please re-authenticate this account.`
+          : `Refresh token rejected (${result.code || result.error}). Please re-authenticate this account.`,
       lastErrorAt: now,
       lastErrorType: result.error,
       lastErrorSource: "oauth",
@@ -1046,8 +1074,9 @@ export async function checkConnection(conn) {
       // gemini) the stored refresh_token is the user's only recovery
       // artifact — nulling it caused #3679 (the connection reports "No valid refresh
       // token available" and can never recover even after re-activation). Preserve it.
-      ...(isRotatingProvider ? { refreshToken: null } : {}),
+      ...(isRotatingProvider && conn.provider !== "claude" ? { refreshToken: null } : {}),
     });
+    if (!applied) return;
     logError(
       `${LOG_PREFIX} ✗ ${conn.provider}/${getConnectionLogLabel(conn)} — ` +
         `Refresh token is permanently invalid (${result.error}). ` +
@@ -1061,7 +1090,7 @@ export async function checkConnection(conn) {
     // Only write the lastHealthCheckAt timestamp (and any fields onPersist may have
     // missed) here, to avoid a redundant full update that would race against another
     // concurrent refresh that already wrote fresh credentials.
-    if (persistedResult) {
+    if (persistedResult || result.refreshPersistenceHandled) {
       await updateProviderConnection(conn.id, { lastHealthCheckAt: now });
     } else {
       // No onPersist (e.g. no connectionId — token-hash dedup path). Write all fields.
