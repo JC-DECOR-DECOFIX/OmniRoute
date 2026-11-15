@@ -31,7 +31,9 @@ five-hour usage limit, resetting at 14:00 America/Sao_Paulo on 2026-11-15.
 
 Inspected running VS Code Claude processes had no gateway base URL, gateway
 credential or connection pin. Global settings had no `apiKeyHelper`. Those
-processes used the native path; they were preserved. Mission Worker uses the
+processes used the native path; they were preserved. The official CLI's read-only
+`auth status` independently reported `loggedIn=true`, `authMethod=claude.ai`,
+`apiProvider=firstParty`, and `subscriptionType=max`. Mission Worker uses the
 gateway only when explicitly configured as `OMNIROUTE`. Its AUTO environment
 builder already strips inherited pins. Engineering Control's separate AUTO
 builder still retains an inherited pin and must not be used as proof of this
@@ -79,6 +81,10 @@ credentials. It stops immediate retries and receives scheduler backoff.
 `invalid_grant` retains an expiration/rejection reason. Failed rotating Claude
 refresh credentials are not destroyed merely on that generic classification.
 No invalid connection is reactivated by this change.
+
+The continuity OAuth flow also excludes `org:create_api_key`: the three existing
+grants did not contain that scope. Recovery retains the subscription user scopes
+and does not grant organization API-key creation or switch to paid API billing.
 
 ## Persistent client and operational verification
 

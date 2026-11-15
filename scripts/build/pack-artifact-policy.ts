@@ -90,6 +90,7 @@ export const PACK_ARTIFACT_ALLOWED_PATH_PREFIXES: string[] = APP_STAGING_ALLOWED
 );
 
 export const PACK_ARTIFACT_ROOT_ALLOWED_EXACT_PATHS: string[] = [
+  "scripts/ops/claude-continuity-client.mjs",
   ".env.example",
   "LICENSE",
   "README.md",
@@ -179,6 +180,7 @@ export const PACK_ARTIFACT_ROOT_ALLOWED_PATH_PREFIXES: string[] = [
 ];
 
 export const PACK_ARTIFACT_REQUIRED_PATHS: string[] = [
+  "scripts/ops/claude-continuity-client.mjs",
   "dist/open-sse/services/compression/engines/rtk/filters/generic-output.json",
   "dist/src/lib/usage/callLogArtifactWorker.js",
   "dist/open-sse/vendor/codex-chatgpt-web/adapters/chatgpt-web/mcp-server.js",

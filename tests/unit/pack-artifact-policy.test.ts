@@ -15,6 +15,12 @@ import {
   parseJsonValuesOutput,
 } from "../../scripts/build/pack-artifact-policy.ts";
 
+test("the committed Claude continuity client is allowed and required in the package", () => {
+  const client = "scripts/ops/claude-continuity-client.mjs";
+  assert.ok(PACK_ARTIFACT_ALLOWED_EXACT_PATHS.includes(client));
+  assert.ok(PACK_ARTIFACT_REQUIRED_PATHS.includes(client));
+});
+
 test("normalizeArtifactPath normalizes slashes and leading relative markers", () => {
   assert.equal(
     normalizeArtifactPath("./app\\scripts\\ad-hoc\\test.js"),
@@ -269,6 +275,7 @@ test("findMissingArtifactPaths flags missing root runtime files in the tarball",
     "scripts/build/fixTlsClientNodeBinary.mjs",
     "scripts/build/native-binary-compat.mjs",
     "scripts/build/runtime-env.mjs",
+    "scripts/ops/claude-continuity-client.mjs",
     "scripts/packs/optionalPackInstaller.mjs",
     "scripts/packs/optionalPackManifest.mjs",
     "src/shared/utils/nodeRuntimeSupport.ts",

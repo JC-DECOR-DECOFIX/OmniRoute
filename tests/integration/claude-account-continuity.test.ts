@@ -387,3 +387,78 @@ for (const first of ["lifecycle-only", "authentication-error"] as const) {
     assert.doesNotMatch(text, /not-useful|synthetic account expired/);
   });
 }
+
+for (const failure of [
+  {
+    message: "Your subscription does not include access to this model",
+    recovery: /permissions and access to the requested model/,
+  },
+  {
+    message: "Your Claude subscription has expired. Renew your subscription to continue.",
+    recovery: /renew the Claude subscription/,
+  },
+  {
+    message: "Permission denied for the requested model",
+    recovery: /permissions and access to the requested model/,
+  },
+]) {
+  test(`upstream 403 recovery distinguishes ${failure.message}`, async () => {
+    const { key } = await pool();
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({ error: { type: "permission_error", message: failure.message } }),
+        { status: 403 }
+      );
+    const response = await call(key.key);
+    const error = await response.json();
+    assert.equal(response.status, 403);
+    assert.match(error.continuity.recovery, failure.recovery);
+    assert.doesNotMatch(error.continuity.recovery, /Re-authenticate/);
+  });
+}
+
+test("temporary pool exhaustion preserves Retry-After and recovery time", async () => {
+  const { key, connections } = await pool();
+  const db = await import("../../src/lib/db/providers.ts");
+  const reset = new Date(Date.now() + 60000).toISOString();
+  for (const connection of connections)
+    await db.updateProviderConnection(connection.id, {
+      rateLimitedUntil: reset,
+      errorCode: "429",
+      testStatus: "unavailable",
+      lastError: "Usage limit reached for your Claude subscription",
+    });
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    throw new Error("cooling accounts must not dispatch");
+  };
+  const response = await call(key.key);
+  const error = await response.json();
+  assert.equal(response.status, 429);
+  assert.equal(attempts, 0);
+  assert.ok(Number(response.headers.get("Retry-After")) > 0);
+  assert.equal(error.continuity.retry_after_at, reset);
+  assert.match(error.continuity.recovery, /Wait for the account usage reset/);
+});
+
+test("existing exhausted-credit state requests account billing recovery rather than OAuth", async () => {
+  const { key, connections } = await pool();
+  const db = await import("../../src/lib/db/providers.ts");
+  for (const connection of connections)
+    await db.updateProviderConnection(connection.id, {
+      isActive: false,
+      testStatus: "credits_exhausted",
+    });
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    throw new Error("inactive accounts must not dispatch");
+  };
+  const response = await call(key.key);
+  const error = await response.json();
+  assert.equal(response.status, 402);
+  assert.equal(attempts, 0);
+  assert.match(error.continuity.recovery, /billing and available credits/);
+  assert.doesNotMatch(error.continuity.recovery, /Re-authenticate/);
+});

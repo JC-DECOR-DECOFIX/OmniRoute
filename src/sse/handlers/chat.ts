@@ -31,6 +31,7 @@ import {
   errorResponse,
   buildErrorBody,
   sanitizeErrorMessage,
+  unavailableResponse,
 } from "@omniroute/open-sse/utils/error.ts";
 import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
@@ -1696,12 +1697,20 @@ async function handleSingleModelChat(
             : undefined;
         if (claudeAccountContinuityOnly) {
           const upstreamStatus = Number(lastStatus || credentials?.lastErrorCode);
+          const terminalStatus =
+            credentials?.expiredStatus === "credits_exhausted"
+              ? 402
+              : credentials?.expiredStatus === "banned"
+                ? 403
+                : 401;
           const status =
             upstreamStatus >= 400 && upstreamStatus <= 599
               ? upstreamStatus
               : credentials?.allExpired
-                ? 401
-                : 503;
+                ? terminalStatus
+                : credentials?.allRateLimited
+                  ? 429
+                  : 503;
           const reason = sanitizeErrorMessage(
             String(
               lastError ||
@@ -1711,12 +1720,32 @@ async function handleSingleModelChat(
                   : "No authorized healthy Claude account is available")
             )
           );
+          const subscriptionExpired =
+            /(?:subscription|assinatura|plan).{0,48}(?:expired|inactive|expirad[ao]|expirou|inativ[ao])|(?:renew|renov[ae]).{0,32}(?:subscription|assinatura|plan)/i.test(
+              reason
+            );
           const recovery =
-            status === 401 || status === 403
-              ? "Re-authenticate the unavailable accounts through OmniRoute's official Claude OAuth flow."
-              : status === 429
-                ? "Wait for the account usage reset or cooldown, then retry the same model."
-                : "Check account authentication, subscription and model availability in OmniRoute before retrying.";
+            status === 429
+              ? "Wait for the account usage reset or cooldown, then retry the same model."
+              : status === 401
+                ? "Re-authenticate the unavailable accounts through OmniRoute's official Claude OAuth flow."
+                : subscriptionExpired
+                  ? "Verify or renew the Claude subscription with Anthropic before retrying the same model."
+                  : status === 403
+                    ? "Verify Claude account permissions and access to the requested model in Anthropic."
+                    : status === 402
+                      ? "Verify the account's Claude subscription, billing and available credits with Anthropic."
+                      : "Check upstream service health and account availability in OmniRoute before retrying the same model.";
+          const responseHeaders = new Headers({
+            "Content-Type": "application/json",
+            "x-omniroute-continuity-status": "accounts-unavailable",
+          });
+          if (credentials?.allRateLimited && credentials.retryAfter) {
+            const retryAfter = unavailableResponse(status, "", credentials.retryAfter).headers.get(
+              "Retry-After"
+            );
+            if (retryAfter) responseHeaders.set("Retry-After", retryAfter);
+          }
           const continuity = {
             provider: "claude",
             requested_model: model,
@@ -1728,6 +1757,12 @@ async function handleSingleModelChat(
             ),
             result: "unavailable",
             recovery,
+            ...(responseHeaders.has("Retry-After")
+              ? {
+                  retry_after: Number(responseHeaders.get("Retry-After")),
+                  retry_after_at: credentials.retryAfter,
+                }
+              : {}),
           };
           log.warn("CLAUDE_CONTINUITY", JSON.stringify(continuity));
           return new Response(
@@ -1740,10 +1775,7 @@ async function handleSingleModelChat(
             }),
             {
               status,
-              headers: {
-                "Content-Type": "application/json",
-                "x-omniroute-continuity-status": "accounts-unavailable",
-              },
+              headers: responseHeaders,
             }
           );
         }

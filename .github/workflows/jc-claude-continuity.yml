@@ -27,6 +27,7 @@ jobs:
       - run: npm run typecheck:core
       - run: npm run check:any-budget:t11
       - run: npm run check:docs-all
+      - run: npm run check:pack-policy
       - name: Exercise routing, token rotation, pins, tools and streaming
         run: >-
           node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts
@@ -34,6 +35,7 @@ jobs:
           tests/integration/claude-account-continuity.test.ts
           tests/unit/claude-continuity-refresh.test.ts
           tests/unit/claude-continuity-client.test.mjs
+          tests/unit/claude-continuity-oauth-scope.test.ts
           tests/unit/token-refresh-race-comprehensive.test.ts
           tests/unit/token-refresh-cas-guard-4038.test.ts
           tests/unit/token-refresh-cas-guard.test.ts
@@ -44,3 +46,4 @@ jobs:
           tests/unit/stream-readiness.test.ts
           tests/unit/silent-sse-close-7699.test.ts
           tests/unit/reject-management-password-as-apikey.test.ts
+          tests/unit/pack-artifact-policy.test.ts
