@@ -21,6 +21,41 @@ export const CLAUDE_CODE_VERSION = CLAUDE_CODE_CLIENT_VERSION;
 /** Bundled @anthropic-ai/sdk version for the pinned CLI release. */
 export const CLAUDE_CODE_STAINLESS_VERSION = CLAUDE_CODE_SDK_PACKAGE_VERSION;
 
+/** Preserve a native client's coherent wire identity instead of downgrading it.
+ * Only the native provider accepts this small grammar; credentials and account
+ * metadata always come from the selected upstream connection, never the client.
+ */
+export function resolveNativeClaudeCodeIdentity(
+  provider: string,
+  clientHeaders: Record<string, string> | null | undefined,
+  body: Record<string, unknown>
+): { userAgent: string; billingLine: string } | null {
+  if (provider !== "claude" || !clientHeaders || !Array.isArray(body.system)) return null;
+  const agents = Object.entries(clientHeaders).filter(
+    ([key]) => key.toLowerCase() === "user-agent"
+  );
+  if (agents.length !== 1) return null;
+  const userAgent = agents[0][1];
+  const ua = /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli)\)$/.exec(
+    userAgent
+  );
+  if (!ua) return null;
+  const lines = body.system.flatMap((block: unknown) => {
+    if (!block || typeof block !== "object") return [];
+    const text = (block as Record<string, unknown>).text;
+    return typeof text === "string" && text.startsWith("x-anthropic-billing-header:") ? [text] : [];
+  });
+  if (lines.length !== 1) return null;
+  const billing =
+    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli);(?: cch=[a-f0-9]{5};)?$/.exec(
+      lines[0]
+    );
+  if (!billing || billing[1] !== ua[1] || billing[3] !== ua[2]) return null;
+  // Older native clients include CCH. The body changes during account routing,
+  // so re-sign those requests; newer clients omit CCH and must keep that shape.
+  return { userAgent, billingLine: lines[0].replace(/cch=[a-f0-9]{5};/, "cch=00000;") };
+}
+
 // ---------- Stainless OS / Arch / Runtime --------------------------------
 
 export function stainlessOS(): string {
