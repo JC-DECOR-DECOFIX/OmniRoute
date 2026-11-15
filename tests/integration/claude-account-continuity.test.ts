@@ -45,7 +45,8 @@ function sse(text: string, complete = true) {
         usage: { input_tokens: 1, output_tokens: 0 },
       },
     },
-    { type: "content_block_start", index: 0, content_block: { type: "text", text } },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
   ];
   if (complete)
     events.push(
@@ -161,9 +162,54 @@ test("after partial output signals recovery without dispatching B or synthesizin
   assert.equal(attempts, 1);
   assert.match(text, /partial A/);
   assert.match(text, /event: error/);
+  assert.match(text, /upstream_interrupted_error/);
+  assert.match(text, /Resume explicitly from the preserved conversation context/);
+  assert.equal(response.headers.get("x-should-retry"), "false");
   assert.doesNotMatch(text, /"stop_reason":"max_tokens"/);
   assert.ok(text.indexOf("event: error") < text.indexOf("event: message_stop"));
 });
+
+for (const continuity of [true, false]) {
+  test(`upstream SSE error after useful output preserves cause and explicit recovery=${continuity}`, async () => {
+    const { key } = await pool();
+    process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = String(continuity);
+    let attempts = 0;
+    globalThis.fetch = async () => {
+      attempts++;
+      const source =
+        (await sse("partial A", false).text()) +
+        'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"synthetic upstream stream failure"}}\n\n' +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+      const bytes = new TextEncoder().encode(source);
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            for (let i = 0; i < bytes.length; i += 13) controller.enqueue(bytes.slice(i, i + 13));
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } }
+      );
+    };
+    try {
+      const response = await call(key.key, body(true));
+      const text = await response.text();
+      assert.equal(attempts, 1);
+      assert.match(text, /partial A/);
+      assert.match(text, /synthetic upstream stream failure/);
+      if (continuity) {
+        assert.match(text, /upstream_interrupted_error/);
+        assert.match(text, /Resume explicitly from the preserved conversation context/);
+        assert.equal(response.headers.get("x-should-retry"), "false");
+      } else {
+        assert.match(text, /api_error/);
+        assert.doesNotMatch(text, /upstream_interrupted_error/);
+      }
+    } finally {
+      process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "true";
+    }
+  });
+}
 
 test("invalid gateway credentials do not reach any upstream account", async () => {
   await pool();
@@ -354,7 +400,11 @@ test("partial tool output is never replayed against another account", async () =
   assert.doesNotMatch(text, /"stop_reason":"max_tokens"/);
 });
 
-for (const first of ["lifecycle-only", "authentication-error"] as const) {
+for (const first of [
+  "lifecycle-only",
+  "authentication-error",
+  "empty-text-then-authentication-error",
+] as const) {
   test(`before useful output ${first} fails over without forwarding A`, async () => {
     const { key } = await pool();
     const attempts: string[] = [];
@@ -379,7 +429,11 @@ for (const first of ["lifecycle-only", "authentication-error"] as const) {
               type: "error",
               error: { type: "authentication_error", message: "synthetic account expired" },
             };
-      return new Response(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`, {
+      const emptyText =
+        first === "empty-text-then-authentication-error"
+          ? 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+          : "";
+      return new Response(`${emptyText}event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`, {
         headers: { "content-type": "text/event-stream" },
       });
     };

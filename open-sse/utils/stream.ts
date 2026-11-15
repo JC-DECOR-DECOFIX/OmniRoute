@@ -46,6 +46,8 @@ import {
   createTranslateCommentaryFilter,
 } from "./responsesCommentaryDrop.ts";
 import { buildErrorBody } from "./error.ts";
+import { buildClaudeInterruptedError } from "./claudeContinuityError.ts";
+import { hasUsefulStreamContent } from "./streamReadiness.ts";
 import { parseTextualToolCallCandidate, isValidToolCallHeaderPrefix } from "./textualToolCall.ts";
 import {
   formatTranslatedStreamError,
@@ -855,6 +857,7 @@ export function createSSEStream(options: StreamOptions = {}) {
   let idleTimer: ReturnType<typeof setInterval> | null = null;
   let streamTimedOut = false;
   const claudeEmptyResponseLifecycle = createClaudeEmptyResponseLifecycle();
+  let claudeContinuityContentSeen = false;
   // `event:` framing is only part of the SSE protocol for OpenAI Responses API
   // and Claude Messages API passthrough; a plain OpenAI Chat-Completions-format
   // client has no `event:` field at all, so it is dropped to stop upstream
@@ -1641,10 +1644,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                         isResponsesCommentaryMessageItem
                       ).items
                     : passthroughResponsesOutputItems;
-                  const backfilled = backfillResponsesCompletedOutput(
-                    parsed,
-                    backfillCandidates
-                  );
+                  const backfilled = backfillResponsesCompletedOutput(parsed, backfillCandidates);
                   const usageNormalized = normalizeUsage(parsed);
                   if (
                     stripped ||
@@ -1659,6 +1659,30 @@ export function createSSEStream(options: StreamOptions = {}) {
                   }
                 } else if (isClaudeSSE) {
                   // Claude SSE: extract usage, track content, forward as-is
+                  const claudeContinuityOnly =
+                    provider === "claude" &&
+                    process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true";
+                  if (
+                    claudeContinuityOnly &&
+                    parsed.type !== "error" &&
+                    !claudeContinuityContentSeen &&
+                    hasUsefulStreamContent(`data: ${JSON.stringify(parsed)}\n\n`)
+                  ) {
+                    claudeContinuityContentSeen = true;
+                  }
+                  if (
+                    parsed.type === "error" &&
+                    claudeContinuityOnly &&
+                    claudeContinuityContentSeen
+                  ) {
+                    failurePayload = normalizeStreamFailurePayload(parsed);
+                    parsed = {
+                      ...parsed,
+                      error: buildClaudeInterruptedError(parsed.error?.message),
+                    };
+                    output = `data: ${JSON.stringify(parsed)}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`;
+                    injectedUsage = true;
+                  }
                   const thinkingSignatureInjected = injectThinkingSignature(parsed, provider);
                   const extracted = extractUsage(parsed);
                   if (extracted) {

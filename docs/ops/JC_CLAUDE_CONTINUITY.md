@@ -78,6 +78,15 @@ timeout and a 256 KiB pre-output buffer. Once text, reasoning or a tool call has
 been forwarded, another account is never spliced into that stream. A drop emits
 an explicit SSE error explaining recovery from preserved conversation context;
 completed tools and external effects must not be replayed.
+Post-output interruptions use the distinct SSE error type
+`upstream_interrupted_error`, rather than a generic `api_error` that Claude Code
+can automatically continue. This applies to both a dropped stream and an
+upstream error frame, using the existing frame parser across split network chunks.
+The real CLI preserved partial text, displayed the explicit recovery and made no
+further text request in isolated protocol tests. A fully completed tool block can
+still produce the client's normal next turn with its original `tool_result` under
+existing permissions; that is a context-preserving continuation, not reexecution
+or a server-side splice into the interrupted stream.
 
 The existing per-connection in-process refresh mutex remains. Metadata writes
 now read, merge and write inside one SQLite transaction after asynchronous

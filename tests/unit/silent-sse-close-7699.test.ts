@@ -62,6 +62,25 @@ test("#7699 buildStreamErrorChunks (Claude) emits error before message_stop", ()
   assert.ok(errorIdx < stopIdx, "event: error must precede event: message_stop");
 });
 
+test("Claude continuity interruption is explicit and sanitizes the upstream cause", () => {
+  const text = decodeChunks(
+    buildStreamErrorChunks('upstream access_token="synthetic-private"', 502, FORMATS.CLAUDE, true)
+  );
+  assert.match(text, /upstream_interrupted_error/);
+  assert.match(text, /upstream_partial_output/);
+  assert.match(text, /Resume explicitly from the preserved conversation context/);
+  assert.doesNotMatch(text, /synthetic-private/);
+  assert.ok(text.indexOf("event: error") < text.indexOf("event: message_stop"));
+});
+
+test("explicit Claude recovery does not change OpenAI or Responses error framing", () => {
+  for (const format of [FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES]) {
+    const text = decodeChunks(buildStreamErrorChunks("upstream interrupted", 502, format, true));
+    assert.doesNotMatch(text, /upstream_interrupted_error/);
+    assert.doesNotMatch(text, /preserved conversation context/);
+  }
+});
+
 test("#7699 buildStreamErrorChunks (OpenAI) still emits [DONE] terminator (unchanged)", () => {
   const chunks = buildStreamErrorChunks("Upstream stream error", 502, null) as Uint8Array[];
   const text = decodeChunks(chunks);
@@ -206,6 +225,48 @@ test("#7699 createDisconnectAwareStream still errors when upstream ends with NO 
   assert.match(text, /Provider returned empty content/);
   // Empty-content failure must NOT be masked as a max_tokens truncation.
   assert.doesNotMatch(text, /"stop_reason":\s*"max_tokens"/);
+});
+
+test("continuity recovery is scoped to the Claude provider, preserving other Claude-shaped providers", async () => {
+  const previous = process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY;
+  process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "true";
+  try {
+    for (const provider of ["claude", "kiro"]) {
+      const upstream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n'
+            )
+          );
+          controller.close();
+        },
+      });
+      const text = await drainStream(
+        createDisconnectAwareStream(
+          {
+            readable: upstream.pipeThrough(buildPassthroughTransform()),
+            writable: createNoopAbortWritableStream(),
+          },
+          createStreamController({
+            provider,
+            model: "test-model",
+            clientResponseFormat: FORMATS.CLAUDE,
+          })
+        )
+      );
+      if (provider === "claude") {
+        assert.match(text, /upstream_interrupted_error/);
+        assert.doesNotMatch(text, /max_tokens/);
+      } else {
+        assert.match(text, /max_tokens/);
+        assert.doesNotMatch(text, /upstream_interrupted_error/);
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY;
+    else process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = previous;
+  }
 });
 
 // Minimal noop writable for the test wiring (mirrors createNoopAbortWritable).

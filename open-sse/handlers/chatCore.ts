@@ -5410,6 +5410,9 @@ export async function handleChatCore({
     compressionResponseMeta,
     comboStrategy,
   });
+  if (provider === "claude" && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true") {
+    responseHeaders["x-should-retry"] = "false";
+  }
 
   // The streaming headers (turn-state included, when present) are committed to
   // the client from here on — record which connection minted the blob so a

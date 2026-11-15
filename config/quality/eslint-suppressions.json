@@ -6056,11 +6056,6 @@
       "count": 1
     }
   },
-  "tests/unit/silent-sse-close-7699.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "tests/unit/skills-collect-routes.test.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
