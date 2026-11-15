@@ -1725,17 +1725,19 @@ async function handleSingleModelChat(
               reason
             );
           const recovery =
-            status === 429
-              ? "Wait for the account usage reset or cooldown, then retry the same model."
-              : status === 401
-                ? "Re-authenticate the unavailable accounts through OmniRoute's official Claude OAuth flow."
-                : subscriptionExpired
-                  ? "Verify or renew the Claude subscription with Anthropic before retrying the same model."
-                  : status === 403
-                    ? "Verify Claude account permissions and access to the requested model in Anthropic."
-                    : status === 402
-                      ? "Verify the account's Claude subscription, billing and available credits with Anthropic."
-                      : "Check upstream service health and account availability in OmniRoute before retrying the same model.";
+            credentials?.expiredStatus === "banned"
+              ? "Verify the Claude account restriction with Anthropic support before retrying."
+              : status === 429
+                ? "Wait for the account usage reset or cooldown, then retry the same model."
+                : status === 401
+                  ? "Re-authenticate the unavailable accounts through OmniRoute's official Claude OAuth flow."
+                  : subscriptionExpired
+                    ? "Verify or renew the Claude subscription with Anthropic before retrying the same model."
+                    : status === 403
+                      ? "Verify Claude account permissions and access to the requested model in Anthropic."
+                      : status === 402
+                        ? "Verify the account's Claude subscription, billing and available credits with Anthropic."
+                        : "Check upstream service health and account availability in OmniRoute before retrying the same model.";
           const responseHeaders = new Headers({
             "Content-Type": "application/json",
             "x-omniroute-continuity-status": "accounts-unavailable",

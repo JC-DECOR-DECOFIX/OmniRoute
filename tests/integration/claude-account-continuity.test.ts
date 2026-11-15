@@ -462,3 +462,21 @@ test("existing exhausted-credit state requests account billing recovery rather t
   assert.match(error.continuity.recovery, /billing and available credits/);
   assert.doesNotMatch(error.continuity.recovery, /Re-authenticate/);
 });
+
+test("an account restriction stays terminal and requests provider support", async () => {
+  const { key, connections } = await pool();
+  const db = await import("../../src/lib/db/providers.ts");
+  for (const connection of connections)
+    await db.updateProviderConnection(connection.id, { isActive: false, testStatus: "banned" });
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    throw new Error("restricted accounts must not dispatch");
+  };
+  const response = await call(key.key);
+  const error = await response.json();
+  assert.equal(response.status, 403);
+  assert.equal(attempts, 0);
+  assert.match(error.continuity.recovery, /restriction with Anthropic support/);
+  assert.doesNotMatch(error.continuity.recovery, /Re-authenticate/);
+});
