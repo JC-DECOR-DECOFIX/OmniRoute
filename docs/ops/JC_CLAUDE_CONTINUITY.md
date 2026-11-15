@@ -11,6 +11,15 @@ The npm repository URL redirects from `diegosouzapw/OmniRoute` to
 `cheaper-inference/OmniRoute`. The local build is identified by its committed build SHA. JC's canonical maintenance branch is
 `JC-DECOR-DECOFIX/OmniRoute:jc/macos-v3.8.50`.
 
+The published package additionally contained upstream migration
+`163_model_capabilities.sql`, already applied locally on 2026-09-17. It is retained
+byte-for-byte from the actual upstream build commit
+`dea6bb8b6b64d3a3d9f639a044625c3452442c56` (SHA-256
+`f1c75ae4b6e15c3af225c0d86816ec4129a10e00130b528e23311be9a5b0df05`).
+The other 159 migration SQL files and 3,227 comparable installed source files
+matched the base tag. Fresh creation, reapplication and a populated legacy table
+are tested without changing the live database.
+
 ## Observed cause and request path
 
 The three Claude connections, in configured priority order, were inactive,

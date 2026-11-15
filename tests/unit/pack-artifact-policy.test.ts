@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   APP_STAGING_ALLOWED_EXACT_PATHS,
@@ -19,6 +20,55 @@ test("the committed Claude continuity client is allowed and required in the pack
   const client = "scripts/ops/claude-continuity-client.mjs";
   assert.ok(PACK_ARTIFACT_ALLOWED_EXACT_PATHS.includes(client));
   assert.ok(PACK_ARTIFACT_REQUIRED_PATHS.includes(client));
+});
+
+const capabilityMigration = readFileSync(
+  new URL("../../src/lib/db/migrations/163_model_capabilities.sql", import.meta.url),
+  "utf8"
+);
+
+test("the installed release capability migration is safe for a fresh database and reapplication", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(capabilityMigration);
+    const before = db
+      .prepare("SELECT sql FROM sqlite_master WHERE name='model_capabilities'")
+      .get();
+    db.exec(capabilityMigration);
+    assert.deepEqual(
+      db.prepare("SELECT sql FROM sqlite_master WHERE name='model_capabilities'").get(),
+      before
+    );
+    db.prepare(
+      "INSERT INTO model_capabilities(provider,model_id,tool_call,limit_context) VALUES(?,?,?,?)"
+    ).run("claude", "claude-haiku-5-5", 1, 200000);
+    assert.equal(db.prepare("SELECT tool_call FROM model_capabilities").get()?.tool_call, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test("the release migration preserves populated legacy capability data and schema", () => {
+  const source = readFileSync(new URL("../../src/lib/modelsDevSync.ts", import.meta.url), "utf8");
+  const legacy = source.match(
+    /CREATE TABLE IF NOT EXISTS model_capabilities \([\s\S]+?^\s*\)/m
+  )?.[0];
+  assert.ok(legacy);
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(legacy);
+    db.prepare(
+      "INSERT INTO model_capabilities(provider,model_id,tool_call,last_synced) VALUES(?,?,?,?)"
+    ).run("claude", "claude-haiku-5-5", 1, "2026-09-17");
+    const rows = db.prepare("SELECT * FROM model_capabilities").all();
+    const columns = db.prepare("PRAGMA table_info(model_capabilities)").all();
+    db.exec(capabilityMigration);
+    db.exec(capabilityMigration);
+    assert.deepEqual(db.prepare("SELECT * FROM model_capabilities").all(), rows);
+    assert.deepEqual(db.prepare("PRAGMA table_info(model_capabilities)").all(), columns);
+  } finally {
+    db.close();
+  }
 });
 
 test("normalizeArtifactPath normalizes slashes and leading relative markers", () => {
