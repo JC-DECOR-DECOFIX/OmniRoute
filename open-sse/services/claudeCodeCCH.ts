@@ -40,10 +40,36 @@ export async function computeCCH(bodyBytes: Uint8Array): Promise<string> {
 
 export async function signRequestBody(bodyString: string): Promise<string> {
   if (!CCH_PATTERN.test(bodyString)) return bodyString;
+  // Sign only billing, never CCH-looking literals in user text or tool results.
+  // Newer native clients omit billing CCH and must keep that request shape.
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(bodyString);
+  } catch {
+    return bodyString;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return bodyString;
+  const blocks = Array.isArray(body.system) ? body.system : [];
+  const billing = blocks.find((block: unknown) => {
+    if (!block || typeof block !== "object") return false;
+    const text = (block as Record<string, unknown>).text;
+    return (
+      typeof text === "string" &&
+      text.startsWith("x-anthropic-billing-header:") &&
+      CCH_PATTERN.test(text)
+    );
+  }) as Record<string, unknown> | undefined;
+  // Retain the helper's legacy explicit billing-field form.
+  const target = billing ?? body;
+  const field = billing ? "text" : "x-anthropic-billing-header";
+  const text = target[field];
+  if (typeof text !== "string" || !CCH_PATTERN.test(text)) return bodyString;
+  target[field] = text.replace(CCH_PATTERN, "cch=00000;");
   const encoder = new TextEncoder();
-  const bodyBytes = encoder.encode(bodyString);
+  const bodyBytes = encoder.encode(JSON.stringify(body));
   const token = await computeCCH(bodyBytes);
-  return bodyString.replace(CCH_PATTERN, `cch=${token};`);
+  target[field] = String(target[field]).replace(CCH_PATTERN, `cch=${token};`);
+  return JSON.stringify(body);
 }
 
 export { CCH_PATTERN };

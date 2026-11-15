@@ -115,6 +115,18 @@ The continuity OAuth flow also excludes `org:create_api_key`: the original grant
 did not contain that scope. Recovery retains the subscription user scopes and
 does not grant organization API-key creation or switch to paid API billing.
 
+Native Claude Code requests keep their validated client version and billing
+entrypoint on the native Claude provider. A real VS Code 2.1.319 request for
+`claude-fable-5-2` exposed the prior downgrade to 2.1.220: upstream rejected the
+model because it requires at least 2.1.290. The correction preserves a strictly
+parsed, matching native User-Agent/billing pair, including newer billing lines
+without CCH. Older CCH-bearing requests are re-signed after routing changes.
+Absent, duplicate, malformed or inconsistent pairs keep the existing pinned
+fallback. Other providers and compatible relays retain their defaults. Client
+authentication is never forwarded as upstream authentication. Acceptance must
+repeat the request through the actual VS Code extension with the same model;
+changing models would conceal this regression.
+
 ## Persistent client and operational verification
 
 `scripts/ops/claude-continuity-client.mjs` accepts the Claude binary followed by
@@ -125,7 +137,7 @@ It reads `~/.omniroute/claude-continuity-client.json` (owner-only, mode 0600):
 {
   "base_url": "http://127.0.0.1:20128",
   "gateway_key": "REPLACE_WITH_DEDICATED_KEY_LOCALLY",
-  "allowed_connections": ["APPROVED_ID_1", "APPROVED_ID_2"]
+  "allowed_connections": ["APPROVED_ID_1", "APPROVED_ID_2", "APPROVED_ID_3"]
 }
 ```
 
@@ -163,22 +175,29 @@ the specific reversible configuration changes.
 ## Operational evidence and final authorized pool (2026-11-15)
 
 The account holder explicitly excluded Financeiro (`78dc4b41...`) from failover.
-The production traffic key and private client configuration therefore authorize
-only the following original connections, in their unchanged priority order:
+The account holder subsequently requested adding `gigiosanches@gmail.com`. The
+production traffic key and private client configuration now authorize only the
+following connections, in configured priority order:
 
 | Account prefix | Priority | Continuity policy      |
 | -------------- | -------- | ---------------------- |
 | `6726837b...`  | 1        | First eligible account |
 | `598035c1...`  | 2        | Next eligible account  |
+| `bd7bc37c...`  | 4        | Third eligible account |
 
-Both were recovered through the official OAuth flow under their original IDs.
-Financeiro was not recovered, reactivated, deleted, or used for inference. Its
-historical row remains outside this client's authorization.
+The original first two accounts were recovered under their existing IDs. Gigio
+was provisioned through the same official OAuth flow as a new connection. Its
+identity was verified before persistence; its refresh grant is stored privately
+and never shared with canary processes. Global priority 3 still belongs to the
+excluded, inactive Financeiro record, so Gigio has global priority 4 and is third
+among authorized candidates. No existing account was silently relabeled.
+Financeiro was not recovered, reactivated, deleted, or used for inference.
 
-The persistently installed Mac build is `1e791d7`, from reviewed source commit
+The first persistent continuity build was `1e791d7`, from reviewed source commit
 `1e791d754a991f533f747739a5f1721caf3284b5`, integrated by
-`d0005c076dee5ceeee904b0409d00f5744d3e6d3`. The documentation update does not
-change that executable build. One LaunchAgent supervises one loopback listener.
+`d0005c076dee5ceeee904b0409d00f5744d3e6d3`. Later executable build IDs and VS Code
+request results are recorded in the private mission checkpoint after installation.
+One LaunchAgent supervises one loopback listener.
 The private environment preserves the original encryption, gateway and JWT
 secrets. Migration 163 remains applied and SQLite integrity checks pass.
 
@@ -197,9 +216,14 @@ refresh tokens in the clone:
 - An explicit fixed account did not switch to its healthy sibling.
 
 The original production credential pairs and priority order were unchanged by
-these canaries. The final two-account policy was exercised again after the
-Financeiro exclusion. An explicit excluded-account pin on the live gateway
-returned unavailable with zero upstream attempts.
+these canaries. The two-account policy was exercised again after the Financeiro exclusion. After
+the owner requested Gigio, a further real canary used the final three-account
+allowlist: A and B received invalid access credentials only in the disposable
+clone, real upstream authentication failed, and Gigio answered successfully after
+three account attempts. `claude-haiku-5-5` and context marker `JCMAC-731` were
+preserved. All production credential pairs and priorities remained unchanged. An
+explicit Financeiro pin on the live gateway had already been rejected with zero
+upstream attempts; Financeiro remains absent from the expanded allowlist.
 
 The VS Code machine setting `claudeCode.claudeProcessWrapper` now points to the
 installed `~/.local/bin/claude-continuity`. Existing native processes were
