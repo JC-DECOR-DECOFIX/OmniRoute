@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { spawn } from "node:child_process";
@@ -67,7 +67,7 @@ function main() {
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   try {
     main();
   } catch {

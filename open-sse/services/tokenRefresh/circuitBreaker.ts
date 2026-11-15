@@ -152,6 +152,12 @@ export async function refreshWithRetry(
         );
         return result;
       }
+      if (result?.error && result.retryable === false) {
+        // A rejected request is neither a successful rotation nor evidence
+        // that this provider is down. Preserve failure history and let the
+        // connection scheduler apply its bounded recovery/backoff policy.
+        return result;
+      }
       if (result) {
         recordSuccess(provider);
         return result;

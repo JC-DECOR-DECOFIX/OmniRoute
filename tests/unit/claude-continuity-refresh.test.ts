@@ -186,3 +186,22 @@ test("a late authentication failure cannot deactivate a new access token with th
   assert.equal(latest.isActive, true);
   assert.equal(latest.accessToken, "new-access");
 });
+
+test("a rejected non-retryable refresh does not reset failures as a successful rotation", async () => {
+  const provider = "claude-rejected-request-fixture";
+  await tokens.refreshWithRetry(async () => null, 1, null, provider);
+  assert.equal(tokens.getCircuitBreakerStatus()[provider].failures, 1);
+  let attempts = 0;
+  const result = await tokens.refreshWithRetry(
+    async () => {
+      attempts++;
+      return { error: "refresh_request_rejected", retryable: false };
+    },
+    3,
+    null,
+    provider
+  );
+  assert.equal(result.error, "refresh_request_rejected");
+  assert.equal(attempts, 1);
+  assert.equal(tokens.getCircuitBreakerStatus()[provider]?.failures, 1);
+});
