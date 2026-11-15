@@ -1725,7 +1725,8 @@ async function handleSingleModelChat(
               reason
             );
           const recovery =
-            credentials?.expiredStatus === "banned"
+            (credentials?.expiredStatus === "banned" && !lastError) ||
+            /(?:account|conta).{0,24}(?:banned|suspended|banid[ao]|suspens[ao])/i.test(reason)
               ? "Verify the Claude account restriction with Anthropic support before retrying."
               : status === 429
                 ? "Wait for the account usage reset or cooldown, then retry the same model."
