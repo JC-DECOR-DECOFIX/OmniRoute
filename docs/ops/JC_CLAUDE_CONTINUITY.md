@@ -50,6 +50,11 @@ environment file to enable the policy. The default remains off for upstream
 compatibility. Claude requests retain their model, messages and tools. They
 cannot use emergency provider fallback or intra-family model substitution.
 The live Claude strategy was verified as `priority` and session affinity as `0` ms.
+For native Claude Code model IDs without a provider prefix, explicitly enable the
+existing `preferClaudeCodeForUnprefixedClaudeModels` setting. Together with the
+continuity flag, that preference stays on the subscription route even when all
+Claude accounts are inactive, so the client receives account recovery guidance.
+Explicit provider prefixes retain their meaning; no model ID is substituted.
 The normal authorized account selector uses configured priorities, excludes
 terminal states, applies cooldowns, and clears recoverable errors only after
 successful use. Cooldown-aware request restarts are disabled in this mode;

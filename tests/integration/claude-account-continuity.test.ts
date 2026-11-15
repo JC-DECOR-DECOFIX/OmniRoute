@@ -401,6 +401,18 @@ for (const failure of [
     message: "Permission denied for the requested model",
     recovery: /permissions and access to the requested model/,
   },
+  {
+    message: "Please contact support about the banned model",
+    recovery: /permissions and access to the requested model/,
+  },
+  {
+    message: "Your account is banned",
+    recovery: /restriction with Anthropic support/,
+  },
+  {
+    message: "Sua conta foi suspensa",
+    recovery: /restriction with Anthropic support/,
+  },
 ]) {
   test(`upstream 403 recovery distinguishes ${failure.message}`, async () => {
     const { key } = await pool();
@@ -479,4 +491,66 @@ test("an account restriction stays terminal and requests provider support", asyn
   assert.equal(attempts, 0);
   assert.match(error.continuity.recovery, /restriction with Anthropic support/);
   assert.doesNotMatch(error.continuity.recovery, /Re-authenticate/);
+});
+
+test("native Claude Code model uses the restricted subscription pool without changing the model", async () => {
+  const { key } = await pool();
+  await h.settingsDb.updateSettings({ preferClaudeCodeForUnprefixedClaudeModels: true });
+  await h.apiKeysDb.updateApiKeyPermissions(key.id, {
+    modelAccessMode: "restricted",
+    allowedModels: ["claude/*"],
+  });
+  const nativeModel = "claude-haiku-5-5";
+  const attempts: string[] = [];
+  globalThis.fetch = async (_url, init) => {
+    attempts.push(h.toPlainHeaders(init?.headers)["x-api-key"]);
+    assert.equal(JSON.parse(String(init?.body)).model, nativeModel);
+    return attempts.length === 1
+      ? new Response(JSON.stringify({ error: { message: "invalid account credentials" } }), {
+          status: 401,
+        })
+      : h.buildClaudeResponse("native valid B", nativeModel);
+  };
+  const response = await call(key.key, { ...body(), model: nativeModel });
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /native valid B/);
+  assert.deepEqual(attempts, ["synthetic-1", "synthetic-2"]);
+});
+
+test("native model with all Claude accounts inactive reports recovery even while Codex is active", async () => {
+  const { connections, key } = await pool();
+  await h.settingsDb.updateSettings({ preferClaudeCodeForUnprefixedClaudeModels: true });
+  await h.apiKeysDb.updateApiKeyPermissions(key.id, {
+    modelAccessMode: "restricted",
+    allowedModels: ["claude/*"],
+  });
+  const db = await import("../../src/lib/db/providers.ts");
+  for (const connection of connections) {
+    await db.updateProviderConnection(connection.id, { isActive: false, testStatus: "expired" });
+  }
+  await h.seedConnection("codex");
+  globalThis.fetch = async () => {
+    assert.fail("Unavailable subscription accounts must not dispatch another provider");
+  };
+  const nativeModel = "claude-haiku-5-5";
+  const response = await call(key.key, { ...body(), model: nativeModel });
+  assert.equal(response.status, 401);
+  const error = await response.json();
+  assert.equal(error.continuity.requested_model, nativeModel);
+  assert.equal(error.continuity.provider, "claude");
+  assert.equal(error.continuity.attempts, 0);
+  assert.match(error.continuity.recovery, /Re-authenticate/);
+
+  const { getModelInfo } = await import("../../src/sse/services/model.ts");
+  const explicit = await getModelInfo(`anthropic/${nativeModel}`);
+  assert.equal(explicit.provider, "anthropic");
+  assert.equal(explicit.model, nativeModel);
+  process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "false";
+  try {
+    assert.notEqual((await getModelInfo(nativeModel)).provider, "claude");
+  } finally {
+    process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "true";
+  }
+  await h.settingsDb.updateSettings({ preferClaudeCodeForUnprefixedClaudeModels: false });
+  assert.notEqual((await getModelInfo(nativeModel)).provider, "claude");
 });
