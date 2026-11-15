@@ -165,6 +165,7 @@ export type ProviderConfig = {
 };
 
 export type ProviderCredentials = {
+  refreshPersistenceHandled?: boolean;
   accessToken?: string;
   refreshToken?: string;
   apiKey?: string;
@@ -737,12 +738,12 @@ export class BaseExecutor {
         let proactivePersistRan = false;
         const proactiveOnPersist = onCredentialsRefreshed
           ? async (refreshResult: Record<string, unknown>) => {
+              await onCredentialsRefreshed(refreshResult as Partial<ProviderCredentials>);
               proactivePersistRan = true;
               activeCredentials = {
                 ...credentials,
                 ...(refreshResult as Partial<ProviderCredentials>),
               };
-              await onCredentialsRefreshed(refreshResult as Partial<ProviderCredentials>);
             }
           : null;
 
@@ -782,7 +783,7 @@ export class BaseExecutor {
           // here, STOP — flipping it here re-introduces the multi-account
           // Codex regression. Discuss with the operator before touching.
           // ─────────────────────────────────────────────────────────────────────
-          if (isUnrecoverableRefreshError(refreshed)) {
+          if (isUnrecoverableRefreshError(refreshed) || "error" in refreshed) {
             const refreshCode = (refreshed as Record<string, unknown>).code;
             log?.warn?.(
               "TOKEN",
@@ -797,7 +798,7 @@ export class BaseExecutor {
               ...credentials,
               ...refreshed,
             };
-            if (onCredentialsRefreshed) {
+            if (onCredentialsRefreshed && !refreshed.refreshPersistenceHandled) {
               await onCredentialsRefreshed(refreshed);
             }
           }

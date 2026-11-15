@@ -26,6 +26,7 @@ export async function refreshClaudeOAuthToken(refreshToken, log, proxyConfig: un
           "anthropic-beta": "oauth-2025-04-20",
         },
         body: params.toString(),
+        signal: AbortSignal.timeout(25_000),
       })
     );
 
@@ -37,10 +38,21 @@ export async function refreshClaudeOAuthToken(refreshToken, log, proxyConfig: un
       const { rawText, code } = await readRefreshErrorBody(response);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Claude OAuth token", {
         status: response.status,
-        error: rawText.slice(0, 300),
+        code: code || "unclassified_refresh_error",
       });
-      if (code === "invalid_grant" || code === "invalid_request") {
-        return { error: "unrecoverable_refresh_error", code };
+      if (code === "invalid_grant") {
+        return {
+          error: "unrecoverable_refresh_error",
+          code,
+          reason: /refresh token expired/i.test(rawText)
+            ? "refresh_token_expired"
+            : "refresh_token_rejected",
+        };
+      }
+      // A malformed/rejected request does not prove that a credential was
+      // consumed. Stop request-time retries; the scheduler applies its backoff.
+      if (code === "invalid_request") {
+        return { error: "refresh_request_rejected", code, retryable: false };
       }
       return null;
     }

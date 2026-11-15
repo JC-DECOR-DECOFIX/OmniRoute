@@ -590,6 +590,13 @@ function resolveSilentCloseOutcome(input: {
 
   if (!input.clientTerminalSeen) {
     if (input.clientResponseFormat === FORMATS.CLAUDE && input.contentWatcher.sawContent()) {
+      if (process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true") {
+        return {
+          kind: "error",
+          reason:
+            "Upstream stream interrupted after partial output. Resume explicitly from the preserved conversation context; do not replay completed tools or external effects.",
+        };
+      }
       // #7699 — upstream dropped after content reached the client on a Claude
       // stream. Keep the partial response: emit a clean max_tokens completion
       // instead of an error frame so Anthropic SDK / Claude Code don't report

@@ -1633,3 +1633,10 @@ Used by `open-sse/services/combo.ts` and `src/lib/quota/quotaScheduler.ts` for p
 | Variable                          | Default  | Source File                       | Description                                                                                                      |
 | --------------------------------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `OMNIROUTE_QUOTA_AWARE_ROUTING`   | `0`      | `open-sse/services/combo.ts`      | When `1`, skip connections whose per-window token budget (`rateLimitOverrides.tpm`, table `provider_quota_state`) cannot afford the estimated request cost before dispatch. Fail-open when no budget configured. |
+
+### JC Mac Claude account continuity
+
+| Variable | Default | Source File | Description |
+| --- | --- | --- | --- |
+| `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY` | `false` | `src/sse/handlers/chat.ts`, `open-sse/handlers/chatCore.ts`, `open-sse/utils/streamReadiness.ts`, `open-sse/utils/streamHandler.ts` | Opt-in Claude account continuity: keep provider/model, bound account attempts, buffer until useful output, report partial-stream recovery explicitly. |
+| `CLAUDE_CONTINUITY_CONFIG` | `~/.omniroute/claude-continuity-client.json` | `scripts/ops/claude-continuity-client.mjs` | Owner-only client configuration containing the loopback URL and dedicated scoped gateway credential; never print its contents. |

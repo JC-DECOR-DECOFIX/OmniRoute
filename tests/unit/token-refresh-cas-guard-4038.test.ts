@@ -61,7 +61,12 @@ test("#4038 CAS guard SKIPS the persist when a concurrent writer rotated the ref
 
   assert.equal(persisted, false, "persist MUST be skipped when the row was rotated concurrently");
   assert.equal(getCasGuardStats().skipped, 1, "the skip must be counted");
-  assert.ok(result?.accessToken, "caller still receives the freshly-issued access token");
+  assert.equal(
+    result?.error,
+    "refresh_state_changed",
+    "a deleted or missing connection cannot return a late credential"
+  );
+  assert.equal(result?.accessToken, undefined);
 });
 
 test("#4038 CAS guard PERSISTS when the row is unchanged (no concurrent rotation)", async () => {

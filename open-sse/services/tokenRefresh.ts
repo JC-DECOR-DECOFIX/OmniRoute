@@ -29,6 +29,7 @@ import {
 } from "./tokenRefresh/rotationMap.ts";
 import {
   runWithCasGuard,
+  RefreshCredentialConflictError,
   getActiveCasGuard,
   getCasGuardStats,
   _resetCasGuardStats,
@@ -539,11 +540,24 @@ export async function getAccessToken(
         // #4038: skip the persist if a concurrent writer already rotated this row past the
         // refresh_token we presented (compare-and-swap) — overwriting would revert it.
         if (await casGuardShouldSkipPersist(log)) {
-          return result;
+          return resolveRefreshConflict(connectionId);
         }
         try {
-          await effectiveOnPersist(result);
+          await runWithCasGuard(
+            {
+              connectionId,
+              expectedRefreshToken: credentials.refreshToken || null,
+              ...(typeof credentials.accessToken === "string"
+                ? { expectedAccessToken: credentials.accessToken }
+                : {}),
+              reread: async () => credentials.refreshToken,
+            },
+            () => effectiveOnPersist(result)
+          );
         } catch (persistErr) {
+          if (persistErr instanceof RefreshCredentialConflictError) {
+            return resolveRefreshConflict(connectionId);
+          }
           const { sanitizeErrorMessage } = await import("../utils/error.ts");
           log?.error?.(
             "TOKEN_REFRESH",
@@ -607,6 +621,26 @@ export async function getAccessToken(
 
   refreshPromiseCache.set(cacheKey, refreshPromise);
   return refreshPromise;
+}
+
+/** A stale response must neither overwrite newer tokens nor trigger a second persist. */
+async function resolveRefreshConflict(connectionId: string) {
+  const { getProviderConnectionById } = await import("@/lib/db/providers");
+  const current = await getProviderConnectionById(connectionId);
+  if (
+    !current?.accessToken ||
+    current.isActive === false ||
+    !current.expiresAt ||
+    Date.parse(current.expiresAt) <= Date.now()
+  ) {
+    return { error: "refresh_state_changed", retryable: false };
+  }
+  return {
+    accessToken: current.accessToken,
+    refreshToken: current.refreshToken,
+    expiresAt: current.expiresAt,
+    refreshPersistenceHandled: true,
+  };
 }
 
 /**

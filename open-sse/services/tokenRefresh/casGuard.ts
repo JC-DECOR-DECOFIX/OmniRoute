@@ -24,7 +24,17 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { wasRefreshTokenRotated } from "../refreshSerializer.ts";
 import type { RefreshLogger } from "./shared.ts";
 
+export class RefreshCredentialConflictError extends Error {
+  constructor() {
+    super("Refresh credentials changed while the response was in flight");
+    this.name = "RefreshCredentialConflictError";
+  }
+}
+
 type CasGuard = {
+  /** Enables the atomic DB fence for every write inside the persist callback. */
+  connectionId?: string;
+  expectedAccessToken?: string | null;
   /** The refresh_token the caller presented for this refresh (CAS version token). */
   expectedRefreshToken: string | null;
   /** Re-reads the CURRENT persisted refresh_token for this connection (decrypted). */

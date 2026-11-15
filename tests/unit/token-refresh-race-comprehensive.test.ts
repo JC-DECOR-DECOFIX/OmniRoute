@@ -128,7 +128,7 @@ test("Fix E: chatCore.ts moves credentials mutation INSIDE the mutex closure via
   const src = await read("open-sse/handlers/chatCore.ts");
   // The persistFn closure must do BOTH the Object.assign AND the user callback
   const persistFnMatch = src.match(
-    /const\s+persistFn\s*=[\s\S]{0,800}Object\.assign\(credentials,[\s\S]{0,300}onCredentialsRefreshed/
+    /const\s+persistFn\s*=[\s\S]{0,800}await onCredentialsRefreshed\(refreshResult\)[\s\S]{0,400}Object\.assign\(credentials,/
   );
   assert.ok(
     persistFnMatch,

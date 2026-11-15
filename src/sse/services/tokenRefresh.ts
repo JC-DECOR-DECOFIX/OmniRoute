@@ -1,5 +1,6 @@
 // Re-export from open-sse with local logger
 import * as log from "../utils/logger";
+import { getActiveCasGuard } from "@omniroute/open-sse/services/tokenRefresh/casGuard.ts";
 import {
   updateProviderConnection,
   resolveProxyForConnection,
@@ -190,6 +191,9 @@ export async function updateProviderCredentials(connectionId: string, newCredent
     });
     return !!result;
   } catch (error) {
+    // The refresh owner must observe a fenced-out or failed write. Swallowing
+    // it would return unpersisted credentials as a successful rotation.
+    if (getActiveCasGuard()) throw error;
     log.error("TOKEN_REFRESH", "Error updating credentials in localDb", {
       connectionId,
       error: (error as any).message,
