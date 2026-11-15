@@ -1,3 +1,7 @@
+---
+title: Claude account continuity on the JC Mac
+---
+
 # Claude account continuity on the JC Mac
 
 This maintained branch starts from upstream OmniRoute v3.8.50, commit
