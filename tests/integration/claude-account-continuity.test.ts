@@ -552,9 +552,11 @@ test("native model with all Claude accounts inactive reports recovery even while
   const explicit = await getModelInfo(`anthropic/${nativeModel}`);
   assert.equal(explicit.provider, "anthropic");
   assert.equal(explicit.model, nativeModel);
-  process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "false";
   try {
-    assert.notEqual((await getModelInfo(nativeModel)).provider, "claude");
+    for (const disabledValue of ["false", "1", "yes", "on", "TRUE"]) {
+      process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = disabledValue;
+      assert.notEqual((await getModelInfo(nativeModel)).provider, "claude", disabledValue);
+    }
   } finally {
     process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "true";
   }

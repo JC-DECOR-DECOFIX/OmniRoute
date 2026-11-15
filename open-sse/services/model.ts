@@ -417,7 +417,7 @@ function shouldPreferClaudeCodeForUnprefixedClaudeModel(
 
   // An explicitly configured subscription-only route must still reach its
   // account-recovery response when every Claude account is currently inactive.
-  if (isTruthyEnv(process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY)) return true;
+  if (process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true") return true;
 
   // If DB/provider state is unavailable in a lightweight runtime, honor the
   // explicit operator flag and let the normal credential path report any missing
