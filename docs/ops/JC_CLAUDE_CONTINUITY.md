@@ -272,6 +272,7 @@ network endpoint is used. It covers, in configured priority order:
 | 429 on all three                          | HTTP 429, wait guidance; the next request carries `Retry-After`     |
 | Expired access credential                 | Renewed before dispatch, one renewal request                        |
 | Renewal endpoint unreachable/5xx/429      | Temporary cooldown; next account answers; same account renews later |
+| Renewal endpoint answers 401/403/400      | Account stays terminal, as for a rejected grant                     |
 | Stream with pings only                    | Next account answers before any output reaches the client           |
 | Connection reset                          | One retry on the same account, then the next account                |
 | Next turn after a switch                  | Full `tool_use`/`tool_result` history reaches the new account       |
@@ -279,23 +280,32 @@ network endpoint is used. It covers, in configured priority order:
 Two defects made a temporary condition permanent and are corrected, both only
 under `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY=true`:
 
-- **Unreachable renewal became a terminal account.** An upstream 401 whose renewal
-  could not be reached (network error, timeout, 5xx or 429 from the token endpoint,
-  or the per-provider renewal circuit breaker, which opens for 30 minutes after five
-  failed renewals) persisted `testStatus: "expired"`. Account selection excludes
-  that status and the health-check sweep skips it, so an account with a valid grant
-  stayed out of the pool until a manual login. `isClaudeRenewalPending()`
-  (`src/sse/services/claudeRenewalState.ts`) now recognizes this case: the stored
-  access credential is unchanged, the account is still active and still holds its
-  grant. The account receives the ordinary temporary cooldown and the client is told
-  to retry, never to re-authenticate. A rejected grant, or a renewed credential that
-  upstream still rejects, remains terminal as before.
+- **A renewal outage became a terminal account.** An upstream 401 whose renewal
+  could not get a definite answer persisted `testStatus: "expired"`. Account
+  selection excludes that status and the health-check sweep skips it, so an account
+  with a valid grant stayed out of the pool until a manual login. An outage is a
+  transport error or timeout, a 5xx or 429 from the token endpoint, or the
+  per-provider renewal circuit breaker, which opens for 30 minutes after five failed
+  renewals. The renewal code now records that outcome for the request
+  (`open-sse/services/tokenRefresh/renewalOutcome.ts`), and
+  `isClaudeRenewalPending()` (`src/sse/services/claudeRenewalState.ts`) additionally
+  requires the stored account to be untouched: still active, still holding its grant,
+  with the access credential that was dispatched. Such an account receives the
+  ordinary temporary cooldown. When every account is in that state the response is
+  HTTP 503 with `upstream_accounts_unavailable` and no instruction to
+  re-authenticate, and the outage does not count against the provider circuit
+  breaker. Everything else stays terminal as before: a rejected grant, any other
+  definite answer from the token endpoint (for example 401 `invalid_client`, 403
+  `access_denied`, 400 `invalid_request`), a renewed credential that upstream still
+  rejects, and a request for which no renewal was attempted.
 - **A subscription 429 could deactivate the account.** A 429 body containing wording
-  such as "usage limit reached" was classified as exhausted credits, which wrote
+  such as "usage limit reached" was classified as an exhausted quota, which wrote
   `testStatus: "credits_exhausted"` with `isActive: false`. The recovery tick later
-  cleared the status but not the inactive flag, so the account never returned. A
-  Claude 429 now always takes the temporary cooldown path, identical to the native
-  "This request would exceed your account's rate limit" response.
+  cleared the status but not the inactive flag, so the account never returned. That
+  write is now skipped for a Claude 429, which takes the same temporary cooldown as
+  the native "This request would exceed your account's rate limit" response. A 429
+  whose body reports an exhausted credit balance is still classified as
+  `credits_exhausted` by the account layer.
 
 Behaviors measured and deliberately left unchanged:
 

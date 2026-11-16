@@ -17,7 +17,17 @@ const refreshBreaker = await import("../../open-sse/services/tokenRefresh/circui
 const model = "claude-haiku-5-5";
 const HOUR = 3_600_000;
 test.beforeEach(async () => {
-  await h.resetStorage();
+  // The previous request's fire-and-forget logging can still be writing into the
+  // data directory while it is removed.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await h.resetStorage();
+      break;
+    } catch (error) {
+      if (attempt >= 5 || (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
   h.BaseExecutor.RETRY_CONFIG.delayMs = 5;
   quotaCache.__clearForTests();
   refreshBreaker.__resetCircuitBreakerForTests();
@@ -425,6 +435,73 @@ test("expiration: a renewal outage on every account asks to retry, never to re-a
     assert.equal(row.refreshToken, `refresh-${index + 1}`);
   }
 });
+
+test("expiration: a renewal outage never opens the provider breaker or blocks recovery", async () => {
+  const past = new Date(Date.now() - HOUR).toISOString();
+  const { key, connections } = await pool({ 1: past, 2: past, 3: past });
+  let renewalAvailable = false;
+  const seen = install({
+    messages: (account) =>
+      account.startsWith("access-")
+        ? upstreamError(401, "authentication_error", "OAuth token has expired")
+        : ok(`answer ${account}`),
+    token: (refreshToken) =>
+      renewalAvailable
+        ? tokenOk(refreshToken)
+        : upstreamError(503, "api_error", "synthetic renewal outage"),
+  });
+  await (await call(key.key)).text();
+  // More requests than any provider breaker threshold while the outage lasts.
+  for (let request = 0; request < 16; request++) {
+    const waiting = await call(
+      key.key,
+      body(false, [{ role: "user", content: `wait ${request}` }])
+    );
+    const error = await waiting.json();
+    assert.equal(error.error.code, "upstream_accounts_unavailable");
+    assert.doesNotMatch(error.error.message, /circuit breaker|Re-authenticate/);
+  }
+  assert.ok(seen.tokens().length > 0);
+
+  renewalAvailable = true;
+  for (const connection of connections)
+    await db.updateProviderConnection(connection.id, {
+      rateLimitedUntil: new Date(Date.now() - 1000).toISOString(),
+    });
+  const recovered = await call(key.key, body(false, [{ role: "user", content: "recovered" }]));
+  assert.equal(recovered.status, 200);
+  assert.match(await recovered.text(), /answer rotated-refresh-1/);
+});
+
+for (const answer of [
+  { status: 401, code: "invalid_client", renewals: 3 },
+  { status: 403, code: "access_denied", renewals: 3 },
+  { status: 400, code: "unsupported_grant_type", renewals: 3 },
+  { status: 400, code: "invalid_request", renewals: 1 },
+]) {
+  test(`expiration: a definite ${answer.status} ${answer.code} from the renewal endpoint stays terminal`, async () => {
+    const { key, connections } = await pool();
+    const seen = install({
+      messages: (account) =>
+        account === "access-1"
+          ? upstreamError(401, "authentication_error", "OAuth token has expired")
+          : ok(`answer ${account}`),
+      token: () =>
+        new Response(JSON.stringify({ error: answer.code }), {
+          status: answer.status,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    const response = await call(key.key);
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /answer access-2/);
+    assert.equal(seen.tokens().length, answer.renewals);
+    const a = await state(connections[0].id);
+    assert.equal(a.testStatus, "expired");
+    assert.equal(a.cooling, false);
+    assert.equal(a.refreshToken, "refresh-1");
+  });
+}
 
 test("expiration: an open renewal circuit breaker keeps the account recoverable", async () => {
   const { key, connections } = await pool();

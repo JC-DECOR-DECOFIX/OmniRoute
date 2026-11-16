@@ -70,6 +70,7 @@ import {
   CLAUDE_RENEWAL_PENDING_REASON,
   isClaudeRenewalPending,
 } from "../services/claudeRenewalState";
+import { withRenewalOutcome } from "@omniroute/open-sse/services/tokenRefresh/renewalOutcome.ts";
 import { createHookContext, runHooks, initPreRequestRegistry } from "@/lib/middleware/registry";
 import { rejectPeerRequest } from "@/shared/resilience/peerRouting";
 import { deleteHandoff, getHandoff } from "@/lib/db/contextHandoffs";
@@ -1680,12 +1681,17 @@ async function handleSingleModelChat(
           typeof lastError === "string" &&
           (lastError.includes("RATE_LIMIT_QUEUE_TIMEOUT") ||
             lastError.includes("RATE_LIMIT_QUEUE_WEDGED"));
+        // A renewal outage is not an inference outage: the pool recovers by itself.
+        const isRenewalPending = String(lastError || credentials?.lastError || "").includes(
+          CLAUDE_RENEWAL_PENDING_REASON
+        );
         if (
           !forceLiveComboTest &&
           credentials?.allRateLimited &&
           isProviderBreakerFailureStatus(breakerFailureStatus) &&
           !isNetworkError &&
           !isQueueTimeout &&
+          !isRenewalPending &&
           // Probe-origin dispatches must not degrade the provider breaker —
           // routing state untouched (#9817).
           !(await shouldIsolateProbeFailures())
@@ -1926,11 +1932,12 @@ async function handleSingleModelChat(
       const appliedProxySink: { proxy: unknown } = { proxy: null };
       const proxyStartTime = Date.now();
       const dispatchedAccessToken = refreshedCredentials?.accessToken;
+      const renewalOutcome = { unreachable: false };
       // 4. Execute chat via core after breaker gate checks (with optional TLS tracking)
       if (telemetry) telemetry.startPhase("connect");
       let execution: Awaited<ReturnType<typeof dispatchChatWithAffinityEviction>>;
       try {
-        execution = await dispatchChatWithAffinityEviction(
+        execution = await withRenewalOutcome(renewalOutcome, dispatchChatWithAffinityEviction)(
           {
             bypassCircuitBreaker: forceLiveComboTest || hasForcedConnection,
             breaker,
@@ -2440,7 +2447,11 @@ async function handleSingleModelChat(
         claudeAccountContinuityOnly &&
         is401 &&
         !skipConnectionDisable &&
-        (await isClaudeRenewalPending(credentials.connectionId, dispatchedAccessToken));
+        (await isClaudeRenewalPending(
+          credentials.connectionId,
+          dispatchedAccessToken,
+          renewalOutcome
+        ));
       const failedStatus = renewalPending ? HTTP_STATUS.SERVICE_UNAVAILABLE : result.status;
       const failedError = renewalPending ? CLAUDE_RENEWAL_PENDING_REASON : result.error;
 
