@@ -4266,6 +4266,14 @@ export async function handleChatCore({
                 console.warn(
                   `[provider] Node ${errorConnectionId} Kimi request window exhausted (${statusCode}) — retrying after ${kimiRateLimitResetAt}`
                 );
+              } else if (
+                provider === "claude" &&
+                statusCode === HTTP_STATUS.RATE_LIMITED &&
+                process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true"
+              ) {
+                // A subscription 429 is a usage window, never exhausted credits. The
+                // account layer applies its cooldown; a terminal state here would
+                // deactivate the account with no automatic way back into the pool.
               } else if (isModelScope() && errorConnectionId) {
                 const lockFn = provider === "antigravity" ? lockExactModel : lockModel;
                 lockFn(provider, errorConnectionId, model, "quota_exhausted", quotaCooldownMs);

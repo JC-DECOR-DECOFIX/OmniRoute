@@ -59,6 +59,11 @@ export function getCircuitBreakerStatus(): Record<string, CircuitBreakerStatusEn
   return result;
 }
 
+/** Test-only: forget every provider's failure streak and open window. */
+export function __resetCircuitBreakerForTests() {
+  for (const provider of Object.keys(_circuitBreaker)) delete _circuitBreaker[provider];
+}
+
 /**
  * Record a successful refresh — resets circuit breaker for provider.
  */

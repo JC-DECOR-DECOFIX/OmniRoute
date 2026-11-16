@@ -255,3 +255,57 @@ are under `~/.omniroute/mission-backups/20261115T124526/`. Additional real infer
 and canary reports are in the adjacent `continuity-live-inference-*` and
 `continuity-real-canary-*` directories. These files contain no printed tokens or
 keys; private configuration and SQLite backups remain owner-only.
+
+## OAuth failover matrix and temporary-state corrections (2026-11-16)
+
+The earlier integration suite seeds API-key connections. The three authorized
+accounts are OAuth subscriptions, whose renewal path is separate, so
+`tests/integration/claude-oauth-failover-matrix.test.ts` repeats the pool with
+three synthetic OAuth accounts and a mocked upstream. No real account, grant or
+network endpoint is used. It covers, in configured priority order:
+
+| Failure                                   | Verified result                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------- |
+| 401, renewal succeeds                     | Same account answers with the rotated pair after one renewal        |
+| 401, grant rejected on 1, 2 or 3 accounts | Only those accounts become inactive; next account answers; 502      |
+| 429 on one account                        | Cooldown on that account only; next account answers; later reuse    |
+| 429 on all three                          | HTTP 429, wait guidance; the next request carries `Retry-After`     |
+| Expired access credential                 | Renewed before dispatch, one renewal request                        |
+| Renewal endpoint unreachable/5xx/429      | Temporary cooldown; next account answers; same account renews later |
+| Stream with pings only                    | Next account answers before any output reaches the client           |
+| Connection reset                          | One retry on the same account, then the next account                |
+| Next turn after a switch                  | Full `tool_use`/`tool_result` history reaches the new account       |
+
+Two defects made a temporary condition permanent and are corrected, both only
+under `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY=true`:
+
+- **Unreachable renewal became a terminal account.** An upstream 401 whose renewal
+  could not be reached (network error, timeout, 5xx or 429 from the token endpoint,
+  or the per-provider renewal circuit breaker, which opens for 30 minutes after five
+  failed renewals) persisted `testStatus: "expired"`. Account selection excludes
+  that status and the health-check sweep skips it, so an account with a valid grant
+  stayed out of the pool until a manual login. `isClaudeRenewalPending()`
+  (`src/sse/services/claudeRenewalState.ts`) now recognizes this case: the stored
+  access credential is unchanged, the account is still active and still holds its
+  grant. The account receives the ordinary temporary cooldown and the client is told
+  to retry, never to re-authenticate. A rejected grant, or a renewed credential that
+  upstream still rejects, remains terminal as before.
+- **A subscription 429 could deactivate the account.** A 429 body containing wording
+  such as "usage limit reached" was classified as exhausted credits, which wrote
+  `testStatus: "credits_exhausted"` with `isActive: false`. The recovery tick later
+  cleared the status but not the inactive flag, so the account never returned. A
+  Claude 429 now always takes the temporary cooldown path, identical to the native
+  "This request would exceed your account's rate limit" response.
+
+Behaviors measured and deliberately left unchanged:
+
+- The gateway's own response deadline (`FETCH_TIMEOUT_MS`, 600 seconds by default)
+  is not an account fault. It retries the same account once and then returns 504
+  without cooling the account or replaying the request on a sibling.
+- A 429 is retried twice on the same account, two seconds apart, before the next
+  account is tried.
+- A subscription limit applies a local one-hour cooldown to that account.
+
+Natural renewals of all three authorized accounts through the official flow were
+observed in the production log on 2026-11-16 after the previous deployment; no
+credential was changed, revoked or renewed by this work.
