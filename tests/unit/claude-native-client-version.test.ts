@@ -8,10 +8,47 @@ const agent = "claude-cli/2.1.319 (external, sdk-cli)";
 const billing = "x-anthropic-billing-header: cc_version=2.1.319.c15; cc_entrypoint=sdk-cli;";
 const headers = { "User-Agent": agent, "x-app": "cli" };
 const system = [{ type: "text", text: billing }];
-// Captured from the signed 2.1.325 binary with the GUI's observed entrypoint.
+// Isolated signed binary with the GUI entrypoint, without the extension's SDK suffix.
 const vscodeAgent = "claude-cli/2.1.325 (external, claude-vscode)";
 const vscodeBilling =
   "x-anthropic-billing-header: cc_version=2.1.325.486; cc_entrypoint=claude-vscode;";
+// Observed on an actual VS Code GUI POST, recording only identity metadata.
+const vscodeSdkAgent = "claude-cli/2.1.325 (external, claude-vscode, agent-sdk/0.3.325)";
+const vscodeSdkBilling =
+  "x-anthropic-billing-header: cc_version=2.1.325.6bf; cc_entrypoint=claude-vscode;";
+
+test("actual VS Code SDK suffix is bounded and still requires coherent native billing", () => {
+  const body = { system: [{ type: "text", text: vscodeSdkBilling }] };
+  assert.deepEqual(
+    resolveNativeClaudeCodeIdentity("claude", { "user-agent": vscodeSdkAgent }, body),
+    { userAgent: vscodeSdkAgent, billingLine: vscodeSdkBilling }
+  );
+  for (const badAgent of [
+    vscodeSdkAgent.replace("0.3.325", "0.3.next"),
+    vscodeSdkAgent.replace("0.3.325", "0.3.325.1"),
+    vscodeSdkAgent.replace("0.3.325", "0.3.12345"),
+    vscodeSdkAgent.replace("agent-sdk", "unrelated-sdk"),
+    vscodeSdkAgent.replace(")", ", extra)"),
+    vscodeSdkAgent.replace("claude-vscode", "sdk-cli"),
+  ]) {
+    assert.equal(resolveNativeClaudeCodeIdentity("claude", { "user-agent": badAgent }, body), null);
+  }
+  for (const text of [
+    vscodeSdkBilling.replace("2.1.325", "2.1.324"),
+    vscodeSdkBilling.replace("claude-vscode", "sdk-cli"),
+  ]) {
+    assert.equal(
+      resolveNativeClaudeCodeIdentity(
+        "claude",
+        { "user-agent": vscodeSdkAgent },
+        {
+          system: [{ type: "text", text }],
+        }
+      ),
+      null
+    );
+  }
+});
 
 test("VS Code native identity requires the same measured entrypoint in UA and billing", () => {
   assert.deepEqual(
@@ -151,6 +188,7 @@ test("older native billing CCH is invalidated before re-signing", () => {
 for (const [clientAgent, clientBilling] of [
   [agent, billing],
   [vscodeAgent, vscodeBilling],
+  [vscodeSdkAgent, vscodeSdkBilling],
 ]) {
   test(`executor keeps Fable version, selected account and tool context: ${clientAgent}`, async () => {
     const originalFetch = globalThis.fetch;
