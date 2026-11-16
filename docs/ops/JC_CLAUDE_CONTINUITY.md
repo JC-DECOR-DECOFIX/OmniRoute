@@ -182,6 +182,15 @@ the specific reversible configuration changes.
 
 ## Operational evidence and final authorized pool (2026-11-15)
 
+An actual GUI POST subsequently showed the complete native User-Agent includes
+`, agent-sdk/0.3.325` after `claude-vscode`. The isolated binary entrypoint probe
+did not include that SDK environment and was not a complete GUI wire fixture.
+The parser accepts only a bounded numeric SDK version on the measured VS Code
+entrypoint, still requiring matching CLI version and entrypoint in billing.
+The full executor regression now covers this actual GUI identity as well as
+the plain native and SDK CLI forms. Positive GUI acceptance remains a separate
+operational check after installation.
+
 The account holder explicitly excluded Financeiro (`78dc4b41...`) from failover.
 The account holder subsequently requested adding `gigiosanches@gmail.com`. The
 production traffic key and private client configuration now authorize only the

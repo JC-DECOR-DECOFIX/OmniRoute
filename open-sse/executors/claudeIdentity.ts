@@ -37,10 +37,12 @@ export function resolveNativeClaudeCodeIdentity(
   if (agents.length !== 1) return null;
   const userAgent = agents[0][1];
   const ua =
-    /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli|claude-vscode)\)$/.exec(
+    /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli|claude-vscode)(?:, agent-sdk\/(\d{1,4}\.\d{1,4}\.\d{1,4}))?\)$/.exec(
       userAgent
     );
-  if (!ua) return null;
+  // The VS Code extension adds its SDK version; reject unmeasured entrypoints
+  // and arbitrary suffixes while retaining the native version/billing checks.
+  if (!ua || (ua[3] && ua[2] !== "claude-vscode")) return null;
   const lines = body.system.flatMap((block: unknown) => {
     if (!block || typeof block !== "object") return [];
     const text = (block as Record<string, unknown>).text;
