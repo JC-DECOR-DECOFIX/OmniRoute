@@ -8,6 +8,53 @@ const agent = "claude-cli/2.1.319 (external, sdk-cli)";
 const billing = "x-anthropic-billing-header: cc_version=2.1.319.c15; cc_entrypoint=sdk-cli;";
 const headers = { "User-Agent": agent, "x-app": "cli" };
 const system = [{ type: "text", text: billing }];
+// Captured from the signed 2.1.325 binary with the GUI's observed entrypoint.
+const vscodeAgent = "claude-cli/2.1.325 (external, claude-vscode)";
+const vscodeBilling =
+  "x-anthropic-billing-header: cc_version=2.1.325.486; cc_entrypoint=claude-vscode;";
+
+test("VS Code native identity requires the same measured entrypoint in UA and billing", () => {
+  assert.deepEqual(
+    resolveNativeClaudeCodeIdentity(
+      "claude",
+      { "user-agent": vscodeAgent },
+      {
+        system: [{ type: "text", text: vscodeBilling }],
+      }
+    ),
+    { userAgent: vscodeAgent, billingLine: vscodeBilling }
+  );
+  for (const bad of [
+    vscodeBilling.replace("cc_entrypoint=claude-vscode", "cc_entrypoint=sdk-cli"),
+    vscodeBilling.replace("cc_version=2.1.325", "cc_version=2.1.324"),
+    vscodeBilling.replaceAll("claude-vscode", "claude-vscode-other"),
+  ]) {
+    assert.equal(
+      resolveNativeClaudeCodeIdentity(
+        "claude",
+        { "user-agent": vscodeAgent },
+        {
+          system: [{ type: "text", text: bad }],
+        }
+      ),
+      null
+    );
+  }
+  assert.equal(
+    resolveNativeClaudeCodeIdentity(
+      "claude",
+      {
+        "user-agent": vscodeAgent.replace("claude-vscode", "claude-vscode-other"),
+      },
+      {
+        system: [
+          { type: "text", text: vscodeBilling.replace("claude-vscode", "claude-vscode-other") },
+        ],
+      }
+    ),
+    null
+  );
+});
 
 test("CCH signing changes only billing and remains stable across retries", async () => {
   const messages = [{ role: "user", content: "Preserve literal cch=abcde; exactly." }];
@@ -101,67 +148,81 @@ test("older native billing CCH is invalidated before re-signing", () => {
   assert.equal(identity?.billingLine, old.replace("abcde", "00000"));
 });
 
-test("executor keeps Fable client's real version, selected account and tool context on wire", async () => {
-  const originalFetch = globalThis.fetch;
-  const captured: { headers: Headers; body: Record<string, unknown> }[] = [];
-  globalThis.fetch = async (_url, init) => {
-    captured.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
-    return new Response(
-      JSON.stringify({ id: "msg_test", content: [{ type: "text", text: "ok" }] }),
-      {
-        headers: { "Content-Type": "application/json" },
-      }
-    );
-  };
-  const messages = [
-    { role: "user", content: "Read the fixture and preserve cch=abcde; exactly." },
-    {
-      role: "assistant",
-      content: [
-        { type: "tool_use", id: "tool_fixture", name: "Read", input: { file_path: "/fixture" } },
-      ],
-    },
-    {
-      role: "user",
-      content: [
+for (const [clientAgent, clientBilling] of [
+  [agent, billing],
+  [vscodeAgent, vscodeBilling],
+]) {
+  test(`executor keeps Fable version, selected account and tool context: ${clientAgent}`, async () => {
+    const originalFetch = globalThis.fetch;
+    const captured: { headers: Headers; body: Record<string, unknown> }[] = [];
+    globalThis.fetch = async (_url, init) => {
+      captured.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+      return new Response(
+        JSON.stringify({ id: "msg_test", content: [{ type: "text", text: "ok" }] }),
         {
-          type: "tool_result",
-          tool_use_id: "tool_fixture",
-          content: "context-preserved cch=abcde;",
-        },
-      ],
-    },
-  ];
-  try {
-    await new DefaultExecutor("claude").execute({
-      model: "claude-fable-5-2",
-      stream: false,
-      body: {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    };
+    const messages = [
+      { role: "user", content: "Read the fixture and preserve cch=abcde; exactly." },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tool_fixture", name: "Read", input: { file_path: "/fixture" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool_fixture",
+            content: "context-preserved cch=abcde;",
+          },
+        ],
+      },
+    ];
+    try {
+      await new DefaultExecutor("claude").execute({
         model: "claude-fable-5-2",
-        system: [...system, { type: "text", text: "Keep fixture context." }],
-        messages,
-        max_tokens: 32,
-      },
-      credentials: {
-        accessToken: "sk-ant-oat-synthetic-test-only",
-        providerSpecificData: {
-          accountUUID: "550e8400-e29b-41d4-a716-446655440000",
-          cliUserID: "a".repeat(64),
+        stream: false,
+        body: {
+          model: "claude-fable-5-2",
+          system: [
+            { type: "text", text: clientBilling },
+            { type: "text", text: "Keep fixture context." },
+          ],
+          messages,
+          max_tokens: 32,
         },
-      },
-      clientHeaders: { ...headers, Authorization: "Bearer client-gateway-secret" },
-    });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-  assert.equal(captured.length, 1);
-  const wire = captured[0];
-  assert.equal(wire.headers.get("user-agent"), agent);
-  assert.equal(wire.headers.get("authorization"), "Bearer sk-ant-oat-synthetic-test-only");
-  assert.equal(wire.body.model, "claude-fable-5-2");
-  assert.equal((wire.body.system as { text: string }[])[0].text, billing);
-  assert.ok(
-    (wire.body.system as { text: string }[]).some((block) => block.text === "Keep fixture context.")
-  );
-  assert.deepEqual(wire.body.messages, messages);
-});
+        credentials: {
+          accessToken: "sk-ant-oat-synthetic-test-only",
+          providerSpecificData: {
+            accountUUID: "550e8400-e29b-41d4-a716-446655440000",
+            cliUserID: "a".repeat(64),
+          },
+        },
+        clientHeaders: {
+          ...headers,
+          "User-Agent": clientAgent,
+          Authorization: "Bearer client-gateway-secret",
+        },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.equal(captured.length, 1);
+    const wire = captured[0];
+    assert.equal(wire.headers.get("user-agent"), clientAgent);
+    assert.equal(wire.headers.get("authorization"), "Bearer sk-ant-oat-synthetic-test-only");
+    assert.equal(wire.body.model, "claude-fable-5-2");
+    assert.equal((wire.body.system as { text: string }[])[0].text, clientBilling);
+    assert.ok(
+      (wire.body.system as { text: string }[]).some(
+        (block) => block.text === "Keep fixture context."
+      )
+    );
+    assert.deepEqual(wire.body.messages, messages);
+  });
+}
