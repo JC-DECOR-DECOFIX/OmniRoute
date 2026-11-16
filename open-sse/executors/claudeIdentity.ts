@@ -36,9 +36,10 @@ export function resolveNativeClaudeCodeIdentity(
   );
   if (agents.length !== 1) return null;
   const userAgent = agents[0][1];
-  const ua = /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli)\)$/.exec(
-    userAgent
-  );
+  const ua =
+    /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli|claude-vscode)\)$/.exec(
+      userAgent
+    );
   if (!ua) return null;
   const lines = body.system.flatMap((block: unknown) => {
     if (!block || typeof block !== "object") return [];
@@ -47,7 +48,7 @@ export function resolveNativeClaudeCodeIdentity(
   });
   if (lines.length !== 1) return null;
   const billing =
-    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli);(?: cch=[a-f0-9]{5};)?$/.exec(
+    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli|claude-vscode);(?: cch=[a-f0-9]{5};)?$/.exec(
       lines[0]
     );
   if (!billing || billing[1] !== ua[1] || billing[3] !== ua[2]) return null;

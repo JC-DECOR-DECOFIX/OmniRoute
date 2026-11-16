@@ -127,6 +127,14 @@ authentication is never forwarded as upstream authentication. Acceptance must
 repeat the request through the actual VS Code extension with the same model;
 changing models would conceal this regression.
 
+The native entrypoint allowlist includes `cli`, `sdk-cli` and `claude-vscode`.
+The installed 2.1.325 VS Code GUI sets `CLAUDE_CODE_ENTRYPOINT=claude-vscode`;
+the signed binary emits that value in both User-Agent and billing. Restricting
+the parser to the first two entrypoints passed a bundled CLI test but left the
+actual GUI on the old fallback identity. Regression tests exercise the measured
+VS Code pair through the executor, preserve tool history and reject unknown or
+mismatched entrypoints. Operational acceptance must include the GUI submission.
+
 ## Persistent client and operational verification
 
 `scripts/ops/claude-continuity-client.mjs` accepts the Claude binary followed by
