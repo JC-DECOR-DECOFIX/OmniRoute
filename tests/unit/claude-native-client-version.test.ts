@@ -269,6 +269,19 @@ for (const [clientAgent, clientBilling] of [
 // request repeats the parent's User-Agent and marks its billing line.
 const subagentBilling =
   "x-anthropic-billing-header: cc_version=2.1.325.a35; cc_entrypoint=claude-vscode; cc_is_subagent=true;";
+// The same capture, auto permission mode: the betas the client negotiates for its own body.
+const negotiatedBetas = [
+  "claude-code-20250219",
+  "interleaved-thinking-2025-05-14",
+  "context-management-2025-06-27",
+  "per-turn-control-2026-07-01",
+  "mid-conversation-tool-changes-2026-07-01",
+  "thinking-token-count-2026-05-13",
+  "effort-2025-11-24",
+  "dangerous-tool-use-2026-09-03",
+  "afk-mode-2026-01-31",
+];
+
 test("a subagent's billing line keeps the native identity, and only in its measured form", () => {
   const resolve = (text: string) =>
     resolveNativeClaudeCodeIdentity(
@@ -366,3 +379,45 @@ for (const model of ["claude-opus-5-5", "claude-fable-5-2"]) {
     assert.equal(wire.body.model, model);
   });
 }
+
+test("a verified native client keeps the betas it negotiated under the continuity policy", async () => {
+  const wire = await nativeWire({
+    billingLine: vscodeSdkBilling,
+    model: "claude-fable-5-2",
+    beta: [...negotiatedBetas, "not a token", "x"].join(","),
+    continuity: true,
+  });
+  for (const token of negotiatedBetas) assert.ok(wire.beta.includes(token), token);
+  // The gateway authenticates upstream with the subscription grant.
+  assert.ok(wire.beta.includes("oauth-2025-04-20"));
+  assert.ok(!wire.beta.includes("not a token"));
+  assert.ok(!wire.beta.includes("x"));
+  assert.equal(new Set(wire.beta).size, wire.beta.length, "no beta is sent twice");
+});
+
+test("negotiated betas stay on the allowlist without the policy or without a native identity", async () => {
+  const beta = negotiatedBetas.join(",");
+  const dropped = [
+    "per-turn-control-2026-07-01",
+    "mid-conversation-tool-changes-2026-07-01",
+    "dangerous-tool-use-2026-09-03",
+    "afk-mode-2026-01-31",
+  ];
+  const withoutPolicy = await nativeWire({
+    billingLine: vscodeSdkBilling,
+    model: "claude-fable-5-2",
+    beta,
+  });
+  const opaqueClient = await nativeWire({
+    billingLine: vscodeSdkBilling,
+    model: "claude-fable-5-2",
+    beta,
+    continuity: true,
+    userAgent: "claude-cli/2.1.325 (external, unmeasured-entrypoint)",
+  });
+  for (const wire of [withoutPolicy, opaqueClient]) {
+    for (const token of dropped) assert.ok(!wire.beta.includes(token), token);
+    // Already forwarded for every client.
+    assert.ok(wire.beta.includes("effort-2025-11-24"));
+  }
+});

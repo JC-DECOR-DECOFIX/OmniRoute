@@ -66,6 +66,24 @@ export const FORWARDABLE_CLIENT_BETAS = Object.freeze([
 ]);
 
 /**
+ * Every well-formed token of a client's `anthropic-beta` header, for use as the `allow` list of
+ * `mergeClientAnthropicBeta` when the request comes from a verified native Claude Code client.
+ *
+ * Such a request is forwarded with the client's own body, which already contains the fields
+ * its betas unlock (message-level `output_config` with `per-turn-control`, `safeguards` with
+ * `dangerous-tool-use`). Dropping those betas while keeping the body makes upstream reject the
+ * request, and the client then retries without the feature. The allowlist above stays in force
+ * for every other client.
+ */
+export function clientNegotiatedBetas(clientBeta: string | null | undefined): string[] {
+  if (typeof clientBeta !== "string") return [];
+  return clientBeta
+    .split(",")
+    .map((token) => token.trim())
+    .filter((token) => /^[a-z0-9][a-z0-9-]{2,63}$/i.test(token));
+}
+
+/**
  * Union an `anthropic-beta` comma-list with the allowlisted client-negotiated
  * betas, preserving base order and appending only NEW tokens (deduped,
  * case-insensitive). The client beta is added only if it is on `allow`, so this
