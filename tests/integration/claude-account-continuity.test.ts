@@ -284,6 +284,66 @@ test("tool_use and tool_result survive failover without executing a tool", async
   assert.equal(result.stop_reason, "tool_use");
 });
 
+test("cache breakpoints reach the next account exactly as they reached the first", async () => {
+  const { key } = await pool();
+  const marker = { type: "ephemeral" };
+  // Two cached system blocks and a marked mid-conversation system note: the gateway
+  // lifts the note into `system` and re-anchors its breakpoint on the preceding turn.
+  const requestBody = {
+    ...body(),
+    system: [
+      { type: "text", text: "base prompt", cache_control: marker },
+      { type: "text", text: "project prompt", cache_control: marker },
+    ],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "turn 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "reply 1" }] },
+      {
+        role: "system",
+        content: [{ type: "text", text: "mid-conversation note", cache_control: marker }],
+      },
+      { role: "user", content: [{ type: "text", text: "turn 2" }] },
+    ],
+  };
+  const marked = (blocks: unknown) =>
+    Array.isArray(blocks) ? blocks.filter((block) => block?.cache_control != null).length : 0;
+  const sent: Array<{ breakpoints: number; messages: unknown; system: unknown }> = [];
+  globalThis.fetch = async (_url, init) => {
+    const upstream = JSON.parse(String(init?.body));
+    const breakpoints =
+      marked(upstream.system) +
+      upstream.messages.reduce(
+        (count: number, message: { content?: unknown }) => count + marked(message.content),
+        0
+      );
+    sent.push({ breakpoints, messages: upstream.messages, system: upstream.system });
+    // Anthropic rejects a fifth breakpoint; the first account is simply unavailable.
+    if (breakpoints > 4)
+      return new Response(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: `A maximum of 4 blocks with cache_control may be provided. Found ${breakpoints}.`,
+          },
+        }),
+        { status: 400 }
+      );
+    if (sent.length === 1)
+      return new Response(JSON.stringify({ error: { message: "account unavailable" } }), {
+        status: 401,
+      });
+    return h.buildClaudeResponse("valid B", model);
+  };
+  const response = await call(key.key, requestBody);
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  assert.match(text, /valid B/);
+  assert.equal(sent.length, 2);
+  assert.ok(sent[0].breakpoints <= 4);
+  assert.deepEqual(sent[1], sent[0]);
+});
+
 test("temporary cooldown recovers eligibility after expiry and a successful request", async () => {
   const { key, connections } = await pool();
   const db = await import("../../src/lib/db/providers.ts");

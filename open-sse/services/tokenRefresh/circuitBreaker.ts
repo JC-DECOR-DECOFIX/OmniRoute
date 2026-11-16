@@ -10,6 +10,7 @@
 // deactivate the account instead of looping every 60s.
 import type { RefreshLogger } from "./shared.ts";
 import { isUnrecoverableRefreshError } from "./shared.ts";
+import { noteRenewalAttempt } from "./renewalOutcome.ts";
 
 // ─── Circuit Breaker State ──────────────────────────────────────────────────
 const _circuitBreaker: Record<string, { failures: number; blockedUntil: number }> = {};
@@ -57,6 +58,11 @@ export function getCircuitBreakerStatus(): Record<string, CircuitBreakerStatusEn
     };
   }
   return result;
+}
+
+/** Test-only: forget every provider's failure streak and open window. */
+export function __resetCircuitBreakerForTests() {
+  for (const provider of Object.keys(_circuitBreaker)) delete _circuitBreaker[provider];
 }
 
 /**
@@ -133,6 +139,7 @@ export async function refreshWithRetry(
   // Circuit breaker check
   if (isProviderBlocked(provider)) {
     log?.warn?.("TOKEN_REFRESH", `⚡ Circuit breaker active for ${provider}, skipping refresh`);
+    noteRenewalAttempt(true);
     return null;
   }
 

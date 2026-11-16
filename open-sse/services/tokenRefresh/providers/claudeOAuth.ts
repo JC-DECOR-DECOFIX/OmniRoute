@@ -4,6 +4,7 @@
 import { PROVIDERS, OAUTH_ENDPOINTS } from "../../../config/constants.ts";
 import { runWithProxyContext } from "../../../utils/proxyFetch.ts";
 import { buildFormParams, readRefreshErrorBody } from "../shared.ts";
+import { noteRenewalAttempt } from "../renewalOutcome.ts";
 
 /**
  * Specialized refresh for Claude OAuth tokens
@@ -31,6 +32,8 @@ export async function refreshClaudeOAuthToken(refreshToken, log, proxyConfig: un
     );
 
     if (!response.ok) {
+      // Only an overloaded or failing endpoint is an outage; any other answer is definite.
+      noteRenewalAttempt(response.status === 429 || response.status >= 500);
       // Read + classify the body ONCE, shape-agnostic. A proxy/MITM can deliver
       // the invalid_grant 400 as a JSON string, a double-encoded string, a
       // nested {error:{code}}, or raw text — all must yield the sentinel so the
@@ -57,6 +60,7 @@ export async function refreshClaudeOAuthToken(refreshToken, log, proxyConfig: un
       return null;
     }
 
+    noteRenewalAttempt(false);
     const tokens = await response.json();
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Claude OAuth token", {
@@ -71,6 +75,7 @@ export async function refreshClaudeOAuthToken(refreshToken, log, proxyConfig: un
       expiresIn: tokens.expires_in,
     };
   } catch (error) {
+    noteRenewalAttempt(true);
     log?.error?.("TOKEN_REFRESH", `Network error refreshing Claude token: ${error.message}`);
     return null;
   }

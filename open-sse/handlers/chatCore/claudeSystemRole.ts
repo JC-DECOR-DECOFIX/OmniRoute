@@ -70,12 +70,18 @@ function isCacheBreakpointTarget(block: unknown): block is Record<string, unknow
  * target in `system[]`, would put a 5m breakpoint before a 1h one; Anthropic requires the longer
  * TTL first, so the hoisted marker is dropped instead.
  *
+ * The target is replaced inside `preceding` by a marked copy, never written in place. The messages
+ * belong to the client's request, which is dispatched again unchanged when an account fails over
+ * or a response is retried; a marker written into it would be counted a second time on that next
+ * attempt, alongside the hoisted block's own, and exceed Anthropic's limit of four breakpoints.
+ * The caller must therefore send `preceding` upstream instead of its original message list.
+ *
  * @returns `"moved"` or `"dropped"` — the caller must remove the marker from the hoisted block;
  *          `"kept"` — the marker stays on it
  */
 export function relocateHoistedCacheBoundary(
   marker: unknown,
-  preceding: ReadonlyArray<{ content?: unknown }>
+  preceding: Array<{ content?: unknown }>
 ): HoistedCacheBoundary {
   for (let i = preceding.length - 1; i >= 0; i--) {
     const content = preceding[i]?.content;
@@ -84,7 +90,9 @@ export function relocateHoistedCacheBoundary(
       const block = content[j];
       if (!isCacheBreakpointTarget(block)) continue;
       if (block.cache_control == null) {
-        block.cache_control = marker;
+        const marked = content.slice();
+        marked[j] = { ...block, cache_control: marker };
+        preceding[i] = { ...preceding[i], content: marked };
         return "moved";
       }
       // Occupied: overwriting would discard the client's own marker, and stepping further back
@@ -161,7 +169,8 @@ export function extractSystemRoleMessages(payload: Record<string, unknown>): voi
       payload.system = extraBlocks;
     }
   }
-  payload.messages = messages.filter((m) => !isSystemRole(m.role));
+  // `preceding` is every non-system message in order, with relocation targets replaced by copies.
+  payload.messages = preceding;
 }
 
 /**
@@ -216,11 +225,7 @@ export function relocateDirectiveOnlyMessages(payload: Record<string, unknown>):
   let insertAfter = -1;
   for (let i = runEnd; i < messages.length; i++) {
     const candidate = messages[i];
-    if (
-      candidate != null &&
-      typeof candidate === "object" &&
-      !isSystemRole(candidate.role)
-    ) {
+    if (candidate != null && typeof candidate === "object" && !isSystemRole(candidate.role)) {
       insertAfter = i;
       break;
     }
