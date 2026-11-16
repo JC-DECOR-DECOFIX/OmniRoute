@@ -15,7 +15,10 @@ function layout(payload: Record<string, unknown>): { sys: number; msg: number } 
   const marked = (blocks: unknown): number =>
     Array.isArray(blocks)
       ? blocks.filter(
-          (b) => b !== null && typeof b === "object" && (b as Record<string, unknown>).cache_control != null
+          (b) =>
+            b !== null &&
+            typeof b === "object" &&
+            (b as Record<string, unknown>).cache_control != null
         ).length
       : 0;
   const messages = (Array.isArray(payload.messages) ? payload.messages : []) as Array<{
@@ -181,11 +184,15 @@ test("two consecutive marked system messages compete for the same target", () =>
       { role: "user", content: [{ type: "text", text: "turn 1" }] },
       {
         role: "system",
-        content: [{ type: "text", text: "note a", cache_control: { type: "ephemeral", ttl: "5m" } }],
+        content: [
+          { type: "text", text: "note a", cache_control: { type: "ephemeral", ttl: "5m" } },
+        ],
       },
       {
         role: "system",
-        content: [{ type: "text", text: "note b", cache_control: { type: "ephemeral", ttl: "1h" } }],
+        content: [
+          { type: "text", text: "note b", cache_control: { type: "ephemeral", ttl: "1h" } },
+        ],
       },
       { role: "user", content: [{ type: "text", text: "turn 2" }] },
     ],
@@ -377,9 +384,7 @@ test("a marker relocated onto an inlined document survives its conversion to tex
     messages: [
       {
         role: "user",
-        content: [
-          { type: "document", name: "notes.txt", document: {}, content: "document body" },
-        ],
+        content: [{ type: "document", name: "notes.txt", document: {}, content: "document body" }],
       },
       {
         role: "system",
@@ -407,3 +412,44 @@ test("#9436 holds on the native Claude path through normalizeClaudeUpstreamMessa
   assert.ok(!messages.some((m) => m.role === "system"));
   assert.deepEqual(layout(payload), { sys: 1, msg: 1 });
 });
+
+// ── Repeated dispatch of one client request ──────────────────────────────────
+// An account failover or a retried response dispatches the same client request again. The
+// request is copied shallowly per attempt, so its messages are shared between attempts.
+
+for (const [name, hoist] of [
+  ["extractSystemRoleMessages", extractSystemRoleMessages],
+  ["extractSystemMessagesToBody", extractSystemMessagesToBody],
+] as const) {
+  test(`${name}: hoisting leaves the client's own messages untouched`, () => {
+    const client = claudeCodeTurn("systemNote");
+    const original = structuredClone(client);
+
+    hoist({ ...client });
+
+    assert.deepEqual(client, original);
+  });
+
+  test(`${name}: a second attempt sends the breakpoints the first one sent`, () => {
+    const client = claudeCodeTurn("systemNote");
+    // Two cached system blocks plus the note: one below Anthropic's limit of four.
+    (client.system as unknown[]).push({
+      type: "text",
+      text: "project prompt",
+      cache_control: { type: "ephemeral" },
+    });
+
+    const attempts = [1, 2, 3].map(() => {
+      const upstream = { ...client };
+      hoist(upstream);
+      return upstream;
+    });
+
+    for (const upstream of attempts) {
+      // Before the fix the second attempt reported { sys: 3, msg: 1 }: the relocated marker had
+      // been written into the client's message while the note still carried its own.
+      assert.deepEqual(layout(upstream), { sys: 2, msg: 1 });
+      assert.deepEqual(upstream, attempts[0]);
+    }
+  });
+}

@@ -751,3 +751,152 @@ test("reconnection: the next turn carries the whole conversation to the account 
   assert.equal(seen.messages().at(-1), "access-2");
   assert.deepEqual(received[1], history);
 });
+
+// ── Request integrity across attempts ────────────────────────────────────────
+
+/**
+ * A Claude Code shaped turn: two cached system blocks and a marked mid-conversation
+ * system note, which the gateway lifts into `system` for models that reject the role.
+ */
+function cachedTurn(stream = false) {
+  const marker = { type: "ephemeral" };
+  return {
+    ...body(stream, [
+      { role: "user", content: [{ type: "text", text: "turn 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "reply 1" }] },
+      {
+        role: "system",
+        content: [{ type: "text", text: "mid-conversation note", cache_control: marker }],
+      },
+      { role: "user", content: [{ type: "text", text: "turn 2" }] },
+    ]),
+    system: [
+      { type: "text", text: "base prompt", cache_control: marker },
+      { type: "text", text: "project prompt", cache_control: marker },
+    ],
+  };
+}
+
+type Sent = { account: string; breakpoints: number; messages: unknown; system: unknown };
+
+/** Records what each attempt sent and answers like Anthropic when the limit is exceeded. */
+function recording(answer: Upstream["messages"]) {
+  const sent: Sent[] = [];
+  const marked = (blocks: unknown) =>
+    Array.isArray(blocks)
+      ? blocks.filter((block) => (block as Record<string, unknown>)?.cache_control != null).length
+      : 0;
+  const seen = install({
+    messages: (account, init, nth) => {
+      const request = JSON.parse(String(init.body));
+      const breakpoints =
+        marked(request.system) +
+        marked(request.tools) +
+        (request.messages as Array<{ content?: unknown }>).reduce(
+          (count, message) => count + marked(message.content),
+          0
+        );
+      sent.push({ account, breakpoints, messages: request.messages, system: request.system });
+      if (breakpoints > 4) {
+        return upstreamError(
+          400,
+          "invalid_request_error",
+          `A maximum of 4 blocks with cache_control may be provided. Found ${breakpoints}.`
+        );
+      }
+      return answer(account, init, nth);
+    },
+  });
+  return { sent, seen };
+}
+
+function assertSameRequest(sent: Sent[]) {
+  assert.ok(sent.length > 1, "more than one attempt is expected");
+  for (const attempt of sent) {
+    assert.equal(
+      attempt.breakpoints,
+      sent[0].breakpoints,
+      `breakpoints sent to ${attempt.account}`
+    );
+    assert.deepEqual(attempt.messages, sent[0].messages);
+    assert.deepEqual(attempt.system, sent[0].system);
+  }
+  assert.ok(sent[0].breakpoints <= 4);
+}
+
+test("integrity: the account that takes over after a limit receives the request A received", async () => {
+  const { key } = await pool();
+  const { sent, seen } = recording((account) =>
+    account === "access-1"
+      ? upstreamError(429, "rate_limit_error", "Usage limit reached", { "retry-after": "600" })
+      : ok(`answer ${account}`)
+  );
+  const response = await call(key.key, cachedTurn());
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  assert.match(text, /answer access-2/);
+  assert.deepEqual(order(seen.messages()), ["access-1", "access-2"]);
+  assertSameRequest(sent);
+});
+
+test("integrity: a stalled stream on A does not change the request B receives", async () => {
+  const { key } = await pool();
+  const { sent, seen } = recording((account, init) => {
+    if (account !== "access-1") return sse("valid B");
+    const signal = init.signal as AbortSignal | undefined;
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval>;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          const ping = () => {
+            try {
+              controller.enqueue(encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'));
+            } catch {
+              clearInterval(timer);
+            }
+          };
+          ping();
+          timer = setInterval(ping, 100);
+          signal?.addEventListener("abort", () => clearInterval(timer), { once: true });
+        },
+        cancel() {
+          clearInterval(timer);
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } }
+    );
+  });
+  const response = await call(key.key, cachedTurn(true));
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  assert.match(text, /valid B/);
+  assert.deepEqual(seen.messages(), ["access-1", "access-2"]);
+  assertSameRequest(sent);
+});
+
+test("integrity: the gateway's own retry on the same account resends the same request", async () => {
+  const { key } = await pool();
+  const { sent, seen } = recording((account, _init, nth) => {
+    if (account === "access-1" && nth === 1) throw connectionReset();
+    return ok(`answer ${account}`);
+  });
+  const response = await call(key.key, cachedTurn());
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  assert.match(text, /answer access-1/);
+  assert.deepEqual(new Set(seen.messages()), new Set(["access-1"]));
+  assertSameRequest(sent);
+});
+
+test("integrity: every account in turn receives the request unchanged when all are limited", async () => {
+  const { key } = await pool();
+  const { sent, seen } = recording(() =>
+    upstreamError(429, "rate_limit_error", "Usage limit reached", { "retry-after": "600" })
+  );
+  const response = await call(key.key, cachedTurn());
+  await response.text();
+  assert.equal(response.status, 429);
+  assert.deepEqual(order(seen.messages()), ["access-1", "access-2", "access-3"]);
+  assertSameRequest(sent);
+});

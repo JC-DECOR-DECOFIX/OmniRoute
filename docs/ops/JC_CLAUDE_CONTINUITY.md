@@ -276,6 +276,7 @@ network endpoint is used. It covers, in configured priority order:
 | Stream with pings only                    | Next account answers before any output reaches the client           |
 | Connection reset                          | One retry on the same account, then the next account                |
 | Next turn after a switch                  | Full `tool_use`/`tool_result` history reaches the new account       |
+| Second attempt of one request             | Same messages, system blocks and cache breakpoints as the first     |
 
 Two defects made a temporary condition permanent and are corrected, both only
 under `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY=true`:
@@ -307,6 +308,23 @@ under `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY=true`:
   the native "This request would exceed your account's rate limit" response. A 429
   whose body reports an exhausted credit balance is still classified as
   `credits_exhausted` by the account layer.
+
+A third defect was observed in production on 2026-11-16 (16:09–16:16 UTC). It is
+not specific to the continuity policy and is corrected without the flag:
+
+- **A second attempt sent one cache breakpoint too many.** Each attempt works on a
+  shallow copy of the client's request, so its messages are shared between attempts.
+  When a marked system-role note is lifted out of `messages` into `system`, its
+  breakpoint is re-anchored on the preceding turn. That marker was written into the
+  shared message while the note in the client's request kept its own. The first
+  attempt was correct; every later one — the next account after a stalled stream, or
+  the gateway's own retry of a response that did not start — counted both and was
+  rejected with HTTP 400 for carrying five `cache_control` blocks where four are
+  allowed. Two conversations failed on every attempt for about three minutes each;
+  the account that took over answered within seconds, but with that rejection. The
+  marked target is now replaced by a copy in the list sent upstream
+  (`relocateHoistedCacheBoundary` in `open-sse/handlers/chatCore/claudeSystemRole.ts`),
+  so every attempt starts from the same client request.
 
 Behaviors measured and deliberately left unchanged:
 
