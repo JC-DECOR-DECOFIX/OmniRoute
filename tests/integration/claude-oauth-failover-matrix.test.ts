@@ -436,6 +436,80 @@ test("expiration: a renewal outage on every account asks to retry, never to re-a
   }
 });
 
+test("expiration: concurrent requests sharing one renewal outage all leave the account recoverable", async () => {
+  const { connections } = await pool();
+  // One authorized account, so every concurrent request awaits the same renewal.
+  const only = await h.seedApiKey({ name: "only-A", allowedConnections: [connections[0].id] });
+  const seen = install({
+    messages: () => upstreamError(401, "authentication_error", "OAuth token has expired"),
+    token: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return upstreamError(503, "api_error", "synthetic renewal outage");
+    },
+  });
+  const responses = await Promise.all(
+    [1, 2, 3].map((turn) =>
+      call(only.key, body(false, [{ role: "user", content: `concurrent ${turn}` }]))
+    )
+  );
+  for (const response of responses) {
+    const error = await response.json();
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(error.error.message, /Re-authenticate/);
+  }
+  // Fewer renewal requests than three independent requests would make proves sharing.
+  assert.ok(seen.tokens().length < 9, `renewals: ${seen.tokens().length}`);
+  const a = await state(connections[0].id);
+  assert.equal(a.isActive, true);
+  assert.notEqual(a.testStatus, "expired");
+  assert.equal(a.cooling, true);
+  assert.equal(a.refreshToken, "refresh-1");
+});
+
+test("expiration: a request that joins an in-flight renewal receives its outcome", async () => {
+  const { connections } = await pool({ 1: new Date(Date.now() - HOUR).toISOString() });
+  const { getAccessToken } = await import("../../open-sse/services/tokenRefresh.ts");
+  const { withRenewalOutcome } =
+    await import("../../open-sse/services/tokenRefresh/renewalOutcome.ts");
+  let answer = () => upstreamError(503, "api_error", "synthetic renewal outage");
+  const seen = install({
+    messages: () => ok("unused"),
+    token: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return answer();
+    },
+  });
+  const credentials = {
+    connectionId: connections[0].id,
+    accessToken: `access-${tag}-1`,
+    refreshToken: `refresh-${tag}-1`,
+    expiresAt: new Date(Date.now() - HOUR).toISOString(),
+  };
+  const renewTwice = async (initial: boolean) => {
+    const owner = { unreachable: initial };
+    const joiner = { unreachable: initial };
+    const first = withRenewalOutcome(owner, getAccessToken)("claude", { ...credentials }, null);
+    const second = withRenewalOutcome(joiner, getAccessToken)("claude", { ...credentials }, null);
+    await Promise.all([first, second]);
+    return { owner, joiner };
+  };
+
+  // An outage reaches both requests although only one renewal request was made.
+  const outage = await renewTwice(false);
+  assert.deepEqual(seen.tokens(), ["refresh-1"]);
+  assert.deepEqual(outage, { owner: { unreachable: true }, joiner: { unreachable: true } });
+
+  // So does a definite rejection: neither request may treat it as temporary.
+  answer = () =>
+    new Response(JSON.stringify({ error: "invalid_client" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  const rejected = await renewTwice(true);
+  assert.equal(seen.tokens().length, 2);
+  assert.deepEqual(rejected, { owner: { unreachable: false }, joiner: { unreachable: false } });
+});
+
 test("expiration: a renewal outage never opens the provider breaker or blocks recovery", async () => {
   const past = new Date(Date.now() - HOUR).toISOString();
   const { key, connections } = await pool({ 1: past, 2: past, 3: past });

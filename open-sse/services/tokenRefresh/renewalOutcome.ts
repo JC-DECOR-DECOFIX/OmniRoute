@@ -23,3 +23,19 @@ export function noteRenewalAttempt(unreachable: boolean): void {
   const outcome = scope.getStore();
   if (outcome) outcome.unreachable = unreachable;
 }
+
+/**
+ * One renewal can be awaited by several requests. The renewal runs in its own
+ * scope, and each request that awaits it receives the shared outcome.
+ */
+export function runInRenewalScope<T>(shared: RenewalOutcome, renewal: () => T): T {
+  return scope.run(shared, renewal);
+}
+
+export function deliverRenewalOutcome<T>(shared: RenewalOutcome, awaited: Promise<T>): Promise<T> {
+  const caller = scope.getStore();
+  if (!caller) return awaited;
+  return awaited.finally(() => {
+    caller.unreachable = shared.unreachable;
+  });
+}

@@ -45,6 +45,7 @@ import { refreshClineToken } from "./tokenRefresh/providers/cline.ts";
 import { refreshKimiCodingToken } from "./tokenRefresh/providers/kimiCoding.ts";
 import { refreshGitLabDuoToken } from "./tokenRefresh/providers/gitlabDuo.ts";
 import { refreshClaudeOAuthToken } from "./tokenRefresh/providers/claudeOAuth.ts";
+import { deliverRenewalOutcome, runInRenewalScope } from "./tokenRefresh/renewalOutcome.ts";
 import { refreshGoogleToken } from "./tokenRefresh/providers/google.ts";
 import { ensureAntigravityProjectAssigned } from "./antigravityProjectBootstrap.ts";
 import { persistDiscoveredAntigravityProjectId } from "./antigravityProjectPersist.ts";
@@ -523,16 +524,14 @@ export async function getAccessToken(
         connectionId,
         waiters: existing.waiters,
       });
-      return existing.promise;
+      // A request that joins this renewal must learn its outcome too.
+      return deliverRenewalOutcome(existing.outcome, existing.promise);
     }
 
-    const entry = { promise: null, waiters: 0 };
+    const entry = { promise: null, waiters: 0, outcome: { unreachable: false } };
     entry.promise = (async () => {
-      const result = await _getAccessTokenWithStalenessCheck(
-        provider,
-        credentials,
-        log,
-        proxyConfig
+      const result = await runInRenewalScope(entry.outcome, () =>
+        _getAccessTokenWithStalenessCheck(provider, credentials, log, proxyConfig)
       );
       // Invoke onPersist INSIDE the mutex so [network call + DB write] are one atomic step.
       // This prevents a concurrent waiter from reading stale credentials before the DB is updated.
@@ -571,7 +570,7 @@ export async function getAccessToken(
       connectionRefreshMutex.delete(connectionId);
     });
     connectionRefreshMutex.set(connectionId, entry);
-    return entry.promise;
+    return deliverRenewalOutcome(entry.outcome, entry.promise);
   }
 
   // ── Layer 2: token-hash fallback (no connectionId) ─────────────────────────

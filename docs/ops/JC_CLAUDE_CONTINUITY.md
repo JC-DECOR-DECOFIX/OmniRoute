@@ -287,7 +287,8 @@ under `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY=true`:
   transport error or timeout, a 5xx or 429 from the token endpoint, or the
   per-provider renewal circuit breaker, which opens for 30 minutes after five failed
   renewals. The renewal code now records that outcome for the request
-  (`open-sse/services/tokenRefresh/renewalOutcome.ts`), and
+  (`open-sse/services/tokenRefresh/renewalOutcome.ts`), including a request that
+  joins another request's in-flight renewal for the same account, and
   `isClaudeRenewalPending()` (`src/sse/services/claudeRenewalState.ts`) additionally
   requires the stored account to be untouched: still active, still holding its grant,
   with the access credential that was dispatched. Such an account receives the
