@@ -264,3 +264,105 @@ for (const [clientAgent, clientBilling] of [
     assert.deepEqual(wire.body.messages, messages);
   });
 }
+
+// Measured on the VS Code 2.1.325 binary against a loopback capture server: a subagent
+// request repeats the parent's User-Agent and marks its billing line.
+const subagentBilling =
+  "x-anthropic-billing-header: cc_version=2.1.325.a35; cc_entrypoint=claude-vscode; cc_is_subagent=true;";
+test("a subagent's billing line keeps the native identity, and only in its measured form", () => {
+  const resolve = (text: string) =>
+    resolveNativeClaudeCodeIdentity(
+      "claude",
+      { "user-agent": vscodeSdkAgent },
+      { system: [{ type: "text", text }] }
+    );
+  assert.deepEqual(resolve(subagentBilling), {
+    userAgent: vscodeSdkAgent,
+    billingLine: subagentBilling,
+  });
+  for (const bad of [
+    subagentBilling.replace("cc_is_subagent=true;", "cc_is_subagent=false;"),
+    subagentBilling.replace("cc_is_subagent=true;", "cc_is_subagent=true; cc_other=1;"),
+    subagentBilling.replace("cc_is_subagent=true;", "cc_is_subagent=true"),
+    subagentBilling.replace(
+      "cc_entrypoint=claude-vscode; cc_is_subagent=true;",
+      "cc_is_subagent=true; cc_entrypoint=claude-vscode;"
+    ),
+    subagentBilling.replace("2.1.325", "2.1.324"),
+  ]) {
+    assert.equal(resolve(bad), null, bad);
+  }
+});
+
+async function nativeWire(options: {
+  billingLine: string;
+  model: string;
+  userAgent?: string;
+  beta?: string;
+  continuity?: boolean;
+}) {
+  const originalFetch = globalThis.fetch;
+  const originalFlag = process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY;
+  let wire: { headers: Headers; body: Record<string, unknown> } | undefined;
+  globalThis.fetch = async (_url, init) => {
+    wire = { headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) };
+    return new Response(
+      JSON.stringify({ id: "msg_test", content: [{ type: "text", text: "ok" }] }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  };
+  if (options.continuity) process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "true";
+  else delete process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY;
+  try {
+    await new DefaultExecutor("claude").execute({
+      model: options.model,
+      stream: false,
+      body: {
+        model: options.model,
+        system: [
+          { type: "text", text: options.billingLine },
+          { type: "text", text: "Keep fixture context." },
+        ],
+        tools: [{ name: "Read", description: "Read", input_schema: { type: "object" } }],
+        messages: [{ role: "user", content: "fixture" }],
+        max_tokens: 32,
+      },
+      credentials: {
+        accessToken: "sk-ant-oat-synthetic-test-only",
+        providerSpecificData: {
+          accountUUID: "550e8400-e29b-41d4-a716-446655440000",
+          cliUserID: "a".repeat(64),
+        },
+      },
+      clientHeaders: {
+        "x-app": "cli",
+        "User-Agent": options.userAgent ?? vscodeSdkAgent,
+        Authorization: "Bearer client-gateway-secret",
+        ...(options.beta ? { "anthropic-beta": options.beta } : {}),
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalFlag === undefined) delete process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY;
+    else process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = originalFlag;
+  }
+  assert.ok(wire, "one upstream request is expected");
+  const beta = (wire.headers.get("anthropic-beta") ?? "").split(",").map((token) => token.trim());
+  return { ...wire, beta };
+}
+
+for (const model of ["claude-opus-5-5", "claude-fable-5-2"]) {
+  test(`executor keeps a subagent on its native client version: ${model}`, async () => {
+    const wire = await nativeWire({ billingLine: subagentBilling, model });
+    // Before the fix this was the pinned fallback client, which upstream refuses for this model.
+    assert.equal(wire.headers.get("user-agent"), vscodeSdkAgent);
+    const billingLines = (wire.body.system as { text: string }[]).filter((block) =>
+      block.text.startsWith("x-anthropic-billing-header:")
+    );
+    assert.deepEqual(
+      billingLines.map((block) => block.text),
+      [subagentBilling]
+    );
+    assert.equal(wire.body.model, model);
+  });
+}

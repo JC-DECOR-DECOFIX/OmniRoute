@@ -49,8 +49,11 @@ export function resolveNativeClaudeCodeIdentity(
     return typeof text === "string" && text.startsWith("x-anthropic-billing-header:") ? [text] : [];
   });
   if (lines.length !== 1) return null;
+  // A subagent request carries the same identity plus `cc_is_subagent=true;` (measured on the
+  // VS Code 2.1.325 binary). Without it here the subagent fell back to the pinned version,
+  // which upstream refuses for models that require a newer client.
   const billing =
-    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli|claude-vscode);(?: cch=[a-f0-9]{5};)?$/.exec(
+    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli|claude-vscode);(?: cch=[a-f0-9]{5};)?(?: cc_is_subagent=true;)?$/.exec(
       lines[0]
     );
   if (!billing || billing[1] !== ua[1] || billing[3] !== ua[2]) return null;
