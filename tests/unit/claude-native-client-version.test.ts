@@ -280,6 +280,11 @@ const negotiatedBetas = [
   "effort-2025-11-24",
   "dangerous-tool-use-2026-09-03",
   "afk-mode-2026-01-31",
+  // Rejected upstream on 2026-11-16/17 when dropped: `tool_addition` blocks need inline-tools,
+  // and thinking.display "highlights" needs thinking-display-updates.
+  "inline-tools-2026-09-15",
+  "thinking-display-updates-2026-08-18",
+  "advanced-tool-use-2025-11-20",
 ];
 
 test("a subagent's billing line keeps the native identity, and only in its measured form", () => {

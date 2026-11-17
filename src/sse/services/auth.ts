@@ -145,6 +145,7 @@ import {
   planNextFromDeckSync,
 } from "@/shared/utils/shuffleDeck";
 import { shouldIsolateProbeFailures } from "@/shared/utils/probeOrigin";
+import { isClaudeModelScopedRateLimit } from "@omniroute/open-sse/services/quotaTextCooldowns.ts";
 import {
   applyExclusiveConnectionLeasePolicy,
   invalidateManagedConnectionLease,
@@ -3114,8 +3115,12 @@ export async function markAccountUnavailable(
       backoffLevel: newBackoffLevel ?? backoffLevel,
     };
     const persistUnavailableState = options.persistUnavailableState !== false;
+    // A Claude 429 limited to the model it was sent for: lock that model on this account
+    // and keep the account serving every other model (see isClaudeModelScopedRateLimit).
+    const modelScopedLimit =
+      Boolean(model) && isClaudeModelScopedRateLimit(provider, status, errorText);
 
-    if (!persistUnavailableState) {
+    if (!persistUnavailableState || modelScopedLimit) {
       // Combo-managed transient failure (e.g. 429): keep the connection clean in
       // the DB, but record an in-memory model lockout so credential selection
       // skips this exact provider+connection+model while it cools down — other

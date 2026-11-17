@@ -251,10 +251,46 @@ for (const failed of [1, 2, 3]) {
 
 // ── 429 ──────────────────────────────────────────────────────────────────────
 
-for (const wording of [
-  "This request would exceed your account's rate limit. Please try again later.",
-  "Usage limit reached for your Claude subscription",
-]) {
+const RATE_LIMIT_WORDING =
+  "This request would exceed your account's rate limit. Please try again later.";
+
+// Measured 2026-11-17 on the three production accounts: after this 429 on Fable the same
+// accounts kept answering Opus within minutes, while Fable stayed limited. Cooling the whole
+// account for an hour took every model of every session down.
+test("429: the account rate-limit wording limits only that model; the account keeps serving others", async () => {
+  const { key, connections } = await pool();
+  const other = "claude-sonnet-5-5";
+  const seen = install({
+    messages: (account, init) =>
+      account === "access-1" && JSON.parse(String(init.body)).model === model
+        ? upstreamError(429, "rate_limit_error", RATE_LIMIT_WORDING)
+        : ok(`answer ${account}`),
+  });
+  const first = await call(key.key);
+  assert.equal(first.status, 200);
+  assert.match(await first.text(), /answer access-2/);
+  const a = await state(connections[0].id);
+  assert.equal(a.isActive, true);
+  assert.equal(a.cooling, false, "the account itself is not cooled");
+  assert.notEqual(a.testStatus, "expired");
+
+  // Another model on the same account is still served by it, first in priority order.
+  const before = seen.messages().length;
+  const otherModel = await call(key.key, { ...body(), model: `claude/${other}` });
+  assert.equal(otherModel.status, 200);
+  assert.match(await otherModel.text(), /answer access-1/);
+  assert.deepEqual(seen.messages().slice(before), ["access-1"]);
+
+  // The limited model does not touch account 1 again while it waits.
+  const again = seen.messages().length;
+  const second = await call(key.key, body(false, [{ role: "user", content: "second turn" }]));
+  assert.equal(second.status, 200);
+  await second.text();
+  assert.deepEqual(seen.messages().slice(again), ["access-2"]);
+  assert.deepEqual(seen.tokens(), []);
+});
+
+for (const wording of ["Usage limit reached for your Claude subscription"]) {
   test(`429: "${wording.slice(0, 24)}…" cools only that account, keeps its grant and recovers later`, async () => {
     const { key, connections } = await pool();
     let limited = true;
@@ -318,12 +354,11 @@ test("429: all three accounts limited reports a temporary wait, never re-authent
   for (const connection of connections) {
     const row = await state(connection.id);
     assert.equal(row.isActive, true);
-    assert.equal(row.cooling, true);
     assert.notEqual(row.testStatus, "expired");
   }
   assert.deepEqual(seen.tokens(), []);
 
-  // While the pool cools no upstream call is made and the wait is announced.
+  // While the model waits no upstream call is made for it and the wait is announced.
   const dispatched = seen.messages().length;
   const waiting = await call(key.key, body(false, [{ role: "user", content: "retry" }]));
   const waitingError = await waiting.json();
