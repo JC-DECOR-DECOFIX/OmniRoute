@@ -39,8 +39,28 @@ export function isSubscriptionQuotaText(lower: string, provider?: string | null)
     // Native Claude OAuth uses this otherwise-generic 429 wording for an
     // exhausted subscription window. Keep it provider-scoped: other upstreams
     // can use the same phrase for a short RPM throttle.
-    (provider === "claude" &&
-      lower.includes("this request would exceed your account's rate limit"))
+    (provider === "claude" && lower.includes("this request would exceed your account's rate limit"))
+  );
+}
+
+/**
+ * Native Claude OAuth's "would exceed your account's rate limit" 429 is scoped to the model it
+ * was sent for. Measured 2026-11-17 on three subscription accounts: after this 429 on one model
+ * the same accounts kept answering another model within minutes, while the first one stayed
+ * limited. It must lock that model on that account, not cool the whole account (which stopped
+ * every model of every session for an hour). "Usage limit reached" keeps the account scope.
+ */
+export function isClaudeModelScopedRateLimit(
+  provider: string | null | undefined,
+  status: number | null | undefined,
+  errorText: string | null | undefined
+): boolean {
+  return (
+    provider === "claude" &&
+    status === 429 &&
+    String(errorText ?? "")
+      .toLowerCase()
+      .includes("this request would exceed your account's rate limit")
   );
 }
 
@@ -120,7 +140,8 @@ export function buildWeeklyQuotaFallback(errorStr: string): QuotaTextFallback | 
     cooldownMs,
     reason: RateLimitReason.QUOTA_EXHAUSTED,
     usedUpstreamRetryHint: typeof parsedResetMs === "number" && parsedResetMs > 0,
-    quotaResetHintMs: typeof parsedResetMs === "number" && parsedResetMs > 0 ? parsedResetMs : undefined,
+    quotaResetHintMs:
+      typeof parsedResetMs === "number" && parsedResetMs > 0 ? parsedResetMs : undefined,
   };
 }
 

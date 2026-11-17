@@ -13,6 +13,7 @@ const { runAuthzPipeline } = await import("../../src/server/authz/pipeline.ts");
 const db = await import("../../src/lib/db/providers.ts");
 const quotaCache = await import("../../src/domain/quotaCache.ts");
 const refreshBreaker = await import("../../open-sse/services/tokenRefresh/circuitBreaker.ts");
+const accountFallback = await import("../../open-sse/services/accountFallback.ts");
 
 const model = "claude-haiku-5-5";
 const HOUR = 3_600_000;
@@ -251,10 +252,88 @@ for (const failed of [1, 2, 3]) {
 
 // ── 429 ──────────────────────────────────────────────────────────────────────
 
-for (const wording of [
-  "This request would exceed your account's rate limit. Please try again later.",
-  "Usage limit reached for your Claude subscription",
-]) {
+const RATE_LIMIT_WORDING =
+  "This request would exceed your account's rate limit. Please try again later.";
+
+// Measured 2026-11-17 on the three production accounts: after this 429 on Fable the same
+// accounts kept answering Opus within minutes, while Fable stayed limited. Cooling the whole
+// account for an hour took every model of every session down.
+test("429: the account rate-limit wording limits only that model; the account keeps serving others", async () => {
+  const { key, connections } = await pool();
+  const other = "claude-sonnet-5-5";
+  const seen = install({
+    messages: (account, init) =>
+      account === "access-1" && JSON.parse(String(init.body)).model === model
+        ? upstreamError(429, "rate_limit_error", RATE_LIMIT_WORDING)
+        : ok(`answer ${account}`),
+  });
+  const first = await call(key.key);
+  assert.equal(first.status, 200);
+  assert.match(await first.text(), /answer access-2/);
+  const a = await state(connections[0].id);
+  assert.equal(a.isActive, true);
+  assert.equal(a.cooling, false, "the account itself is not cooled");
+  assert.notEqual(a.testStatus, "expired");
+
+  // Another model on the same account is still served by it, first in priority order.
+  const before = seen.messages().length;
+  const otherModel = await call(key.key, { ...body(), model: `claude/${other}` });
+  assert.equal(otherModel.status, 200);
+  assert.match(await otherModel.text(), /answer access-1/);
+  assert.deepEqual(seen.messages().slice(before), ["access-1"]);
+
+  // The limited model does not touch account 1 again while it waits.
+  const again = seen.messages().length;
+  const second = await call(key.key, body(false, [{ role: "user", content: "second turn" }]));
+  assert.equal(second.status, 200);
+  await second.text();
+  assert.deepEqual(seen.messages().slice(again), ["access-2"]);
+  assert.deepEqual(seen.tokens(), []);
+});
+
+test("429: the model wait is the 429's own cooldown, not the account's next usage-window reset", async () => {
+  const { key, connections } = await pool();
+  // The account still has headroom, but its windows reset in 4h and in 5 days.
+  quotaCache.setQuotaCache(connections[0].id, "claude", {
+    five_hour: { remainingPercentage: 40, resetAt: new Date(Date.now() + 4 * HOUR).toISOString() },
+    seven_day: {
+      remainingPercentage: 70,
+      resetAt: new Date(Date.now() + 120 * HOUR).toISOString(),
+    },
+  });
+  install({
+    messages: (account) =>
+      account === "access-1"
+        ? upstreamError(429, "rate_limit_error", RATE_LIMIT_WORDING)
+        : ok(`answer ${account}`),
+  });
+  const response = await call(key.key);
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /answer access-2/);
+  const lock = accountFallback.getModelLockoutInfo("claude", connections[0].id, model);
+  assert.ok(lock && lock.remainingMs > 0, "the model is locked on account 1");
+  assert.ok(lock.remainingMs <= HOUR + 5_000, `locked for ${lock.remainingMs}ms, at most 1h`);
+});
+
+test("429: disableCooling keeps the account and the model eligible after the rate-limit wording", async () => {
+  const { key, connections } = await pool();
+  await db.updateProviderConnection(connections[0].id, {
+    providerSpecificData: { disableCooling: true },
+  });
+  install({
+    messages: (account) =>
+      account === "access-1"
+        ? upstreamError(429, "rate_limit_error", RATE_LIMIT_WORDING)
+        : ok(`answer ${account}`),
+  });
+  const response = await call(key.key);
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal((await state(connections[0].id)).cooling, false);
+  assert.equal(accountFallback.getModelLockoutInfo("claude", connections[0].id, model), null);
+});
+
+for (const wording of ["Usage limit reached for your Claude subscription"]) {
   test(`429: "${wording.slice(0, 24)}…" cools only that account, keeps its grant and recovers later`, async () => {
     const { key, connections } = await pool();
     let limited = true;
@@ -318,12 +397,11 @@ test("429: all three accounts limited reports a temporary wait, never re-authent
   for (const connection of connections) {
     const row = await state(connection.id);
     assert.equal(row.isActive, true);
-    assert.equal(row.cooling, true);
     assert.notEqual(row.testStatus, "expired");
   }
   assert.deepEqual(seen.tokens(), []);
 
-  // While the pool cools no upstream call is made and the wait is announced.
+  // While the model waits no upstream call is made for it and the wait is announced.
   const dispatched = seen.messages().length;
   const waiting = await call(key.key, body(false, [{ role: "user", content: "retry" }]));
   const waitingError = await waiting.json();

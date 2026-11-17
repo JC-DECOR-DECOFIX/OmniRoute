@@ -7,6 +7,7 @@ import {
 import {
   CLAUDE_CLI_BILLING_VERSION,
   CLAUDE_CLI_STAINLESS_RUNTIME_VERSION,
+  clientNegotiatedBetas,
   mergeClientAnthropicBeta,
   normalizeAnthropicHeaderVariants,
 } from "../config/anthropicHeaders.ts";
@@ -1238,7 +1239,11 @@ export class BaseExecutor {
               "anthropic-beta": mergeClientAnthropicBeta(
                 selectBetaFlags(tb, null, clientAnthropicBeta),
                 clientAnthropicBeta,
-                undefined,
+                // A verified native client keeps the betas it negotiated for the body it
+                // sent; everyone else stays on the allowlist.
+                nativeIdentity && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true"
+                  ? clientNegotiatedBetas(clientAnthropicBeta)
+                  : undefined,
                 // Gate the client-negotiated context-1m beta on the RESOLVED target:
                 // combo/fallback can route a request negotiated for a [1m] sibling onto a
                 // model that does not qualify (e.g. Haiku), which Anthropic rejects (#10119).

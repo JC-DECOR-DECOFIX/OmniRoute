@@ -145,6 +145,7 @@ import {
   planNextFromDeckSync,
 } from "@/shared/utils/shuffleDeck";
 import { shouldIsolateProbeFailures } from "@/shared/utils/probeOrigin";
+import { isClaudeModelScopedRateLimit } from "@omniroute/open-sse/services/quotaTextCooldowns.ts";
 import {
   applyExclusiveConnectionLeasePolicy,
   invalidateManagedConnectionLease,
@@ -2984,9 +2985,16 @@ export async function markAccountUnavailable(
       providerErrorType,
       provider
     );
+    // A Claude 429 limited to the model it was sent for: lock that model on this account
+    // and keep the account serving every other model (see isClaudeModelScopedRateLimit).
+    // Its wait is the 429's own cooldown, never the account's next usage-window reset
+    // (up to 5h, or a week), which describes the whole account rather than this limit.
+    const modelScopedLimit =
+      Boolean(model) && isClaudeModelScopedRateLimit(provider, status, errorText);
     const cachedQuotaResetAt =
-      providerErrorType === PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED ||
-      reason === RateLimitReason.QUOTA_EXHAUSTED
+      !modelScopedLimit &&
+      (providerErrorType === PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED ||
+        reason === RateLimitReason.QUOTA_EXHAUSTED)
         ? getCachedQuotaResetAt(connectionId)
         : null;
     const cachedQuotaResetMs = parseFutureDateMs(cachedQuotaResetAt);
@@ -3115,7 +3123,8 @@ export async function markAccountUnavailable(
     };
     const persistUnavailableState = options.persistUnavailableState !== false;
 
-    if (!persistUnavailableState) {
+    // disableCooling (#2997) opts the connection out of this lock as well.
+    if (!persistUnavailableState || (modelScopedLimit && !disableCooling)) {
       // Combo-managed transient failure (e.g. 429): keep the connection clean in
       // the DB, but record an in-memory model lockout so credential selection
       // skips this exact provider+connection+model while it cools down — other

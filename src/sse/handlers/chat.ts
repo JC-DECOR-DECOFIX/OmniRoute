@@ -133,7 +133,10 @@ import { getComboFailureLogError } from "./comboFailureLogging";
 
 // Pipeline integration — wired modules
 import { classify429FromError, type FailureKind } from "@/shared/utils/classify429";
-import { isSubscriptionQuotaText } from "@omniroute/open-sse/services/quotaTextCooldowns.ts";
+import {
+  isClaudeModelScopedRateLimit,
+  isSubscriptionQuotaText,
+} from "@omniroute/open-sse/services/quotaTextCooldowns.ts";
 import { resolveUseUpstream429BreakerHints } from "@/shared/utils/providerHints";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
 import { shouldIsolateProbeFailures } from "@/shared/utils/probeOrigin";
@@ -2385,6 +2388,8 @@ async function handleSingleModelChat(
         if (
           result.status === 429 &&
           shouldMarkAccountExhaustedFrom429(provider, model, passthroughModels, failureKind) &&
+          // A model-scoped Claude limit must not mark the whole account exhausted.
+          !isClaudeModelScopedRateLimit(provider, result.status, errorStr) &&
           // T-PROBE: a probe must not poison the 5min quotaCache for real
           // traffic (#9817).
           !(await shouldIsolateProbeFailures())
