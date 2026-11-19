@@ -30,7 +30,8 @@ const DEFAULT_PORT = 20141;
 const DEFAULT_HEARTBEAT_MS = 60_000;
 const PUBLISH_TIMEOUT_MS = 10_000;
 const KV_READ_TIMEOUT_MS = 10_000;
-const MAX_RESPONSE_BYTES = 256 * 1024;
+// A data-store value is at most 256 KiB; its entry wraps it in a little more.
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 const REFRESH_DEFAULTS = {
   baseUrl: "http://127.0.0.1:20128",
@@ -331,7 +332,13 @@ export function exchange({ client = http, url, options, body, deadlineMs, label 
     };
     const timer = setTimeout(() => fail("timeout", "timed out"), deadlineMs);
     const direct = { ...options, agent: client === https ? DIRECT_HTTPS : DIRECT_HTTP };
-    req = url ? client.request(url, direct) : client.request(direct);
+    try {
+      req = url ? client.request(url, direct) : client.request(direct);
+    } catch (error) {
+      // Invalid options throw before a request exists; they end the same way as a failed one.
+      failed(error);
+      return;
+    }
     req.on("response", (res) => {
       const chunks = [];
       let size = 0;
@@ -646,7 +653,12 @@ export function createRefresher({
     const results = [];
     for (const [index, connectionId] of connections.entries()) {
       if (index > 0) await sleep(spacingMs);
-      results.push(await callGateway({ token: credential, connectionId, timeoutMs }));
+      const result = await callGateway({ token: credential, connectionId, timeoutMs });
+      results.push(result);
+      // Giving up on the answer does not stop Omni Route's own read, which may still be renewing
+      // that account's credentials. No other account is read in this round; the minimum interval,
+      // counted from the start, leaves it time to finish before the next one.
+      if (result.kind === "timeout") break;
     }
     observer.poll();
     const report = observer.payload();
@@ -657,12 +669,21 @@ export function createRefresher({
       return {
         shortId: connectionId.slice(0, 8),
         updated,
-        reason: updated ? null : sanitizeReason(refreshReason(results[index])),
+        reason: updated
+          ? null
+          : index < results.length
+            ? sanitizeReason(refreshReason(results[index]))
+            : "não consultada: rodada interrompida por tempo esgotado",
       };
     });
     const count = accounts.filter((a) => a.updated).length;
     const status = count === accounts.length ? "done" : count > 0 ? "partial" : "failed";
-    const error = status === "failed" ? commonError(results) : null;
+    const error =
+      status !== "failed"
+        ? null
+        : results.length < connections.length
+          ? "gateway_timeout"
+          : commonError(results);
     lastRefreshEndMs = now();
     last = { ...last, status, finishedAt: iso(lastRefreshEndMs), accounts, error };
     log(
@@ -721,7 +742,82 @@ export function createRefresher({
     running = drain(request);
   }
 
-  return { offer, state, idle: () => running ?? Promise.resolve() };
+  /**
+   * Takes back the state this service last published, before its first publish after a start,
+   * so a restart neither answers a request again nor reopens the interval. The published report
+   * lives in a store its viewers can write, so only well-formed values are kept and the interval
+   * is never pushed further than one interval from now. A refresh that was running when the
+   * service stopped is reported as failed and not repeated.
+   */
+  function restore(previous) {
+    const at = now();
+    const prior = previous?.last;
+    const version = typeof prior?.requestVersion === "string" ? prior.requestVersion : null;
+    if (version === null || !UUID_RE.test(version)) return;
+    // A UUIDv7 carries its write time; a version from the future could hide every request.
+    if (Number.parseInt(version.slice(0, 8) + version.slice(9, 13), 16) > at) return;
+    const time = (value) => {
+      const ms = typeof value === "string" ? Date.parse(value) : NaN;
+      return Number.isFinite(ms) && ms <= at + minIntervalMs ? ms : null;
+    };
+    const status = ["running", "done", "partial", "failed", "throttled"].includes(prior.status)
+      ? prior.status
+      : null;
+    if (status === null) return;
+    lastSeen = version;
+    primed = true;
+    const nextMs = time(previous.nextAllowedAt);
+    nextAllowedAtMs = nextMs !== null && nextMs > at ? nextMs : null;
+    const startedAtMs = time(prior.startedAt);
+    const finishedAtMs = time(prior.finishedAt);
+    const accounts = Array.isArray(prior.accounts)
+      ? prior.accounts
+          .filter(
+            (a) =>
+              typeof a?.shortId === "string" &&
+              /^[A-Za-z0-9-]{1,8}$/.test(a.shortId) &&
+              typeof a.updated === "boolean"
+          )
+          .slice(0, 64)
+          .map((a) => ({
+            shortId: a.shortId,
+            updated: a.updated,
+            reason: a.updated ? null : sanitizeReason(a.reason),
+          }))
+      : [];
+    const error =
+      typeof prior.error === "string" &&
+      /^(not_configured|gateway_unreachable|gateway_auth_failed|gateway_timeout|gateway_http_\d{3})$/.test(
+        prior.error
+      )
+        ? prior.error
+        : null;
+    last = {
+      requestVersion: version,
+      requestedAt: iso(time(prior.requestedAt)),
+      status,
+      startedAt: iso(startedAtMs),
+      finishedAt: iso(finishedAtMs),
+      accounts,
+      error,
+    };
+    if (startedAtMs !== null) lastRefreshEndMs = finishedAtMs ?? at;
+    if (status === "running") {
+      last = { ...last, status: "failed", finishedAt: iso(at), error: null };
+      lastRefreshEndMs = at;
+      log("refresh interrupted by a restart");
+    }
+  }
+
+  return { offer, state, restore, idle: () => running ?? Promise.resolve() };
+}
+
+/**
+ * Node prints request options, headers included, on stderr when NODE_DEBUG names its network
+ * modules. With any NODE_DEBUG set, the gateway credential is not used at all.
+ */
+export function debugLogsRequests(env = process.env) {
+  return typeof env.NODE_DEBUG === "string" && env.NODE_DEBUG.trim() !== "";
 }
 
 function log(message) {
@@ -777,7 +873,10 @@ async function main(configPath) {
       observer,
       connections: config.authorizedConnections,
       // Read for each refresh, so a token created or rotated later is picked up.
-      readToken: () => readSecretFile(refresh.tokenFile),
+      readToken: () => {
+        if (debugLogsRequests()) throw new Error("NODE_DEBUG is set");
+        return readSecretFile(refresh.tokenFile);
+      },
       callGateway: ({ token, connectionId, timeoutMs }) =>
         gatewayUsageCall({ baseUrl: refresh.baseUrl, token, connectionId, timeoutMs }),
       minIntervalMs: refresh.minIntervalMs,
@@ -786,6 +885,19 @@ async function main(configPath) {
       onChange: flush,
       log,
     });
+    if (debugLogsRequests()) log("refresh disabled while NODE_DEBUG is set");
+    // The state published before a restart, read before this process publishes anything.
+    try {
+      const previous = await getKvEntry({
+        socketPath,
+        token: readSecretFile(tokenFile),
+        artifactId,
+        key: KV_KEY,
+      });
+      refresher.restore(previous?.deleted ? null : previous?.value?.refresh);
+    } catch (error) {
+      log(`refresh state not restored: ${error instanceof Error ? error.message : String(error)}`);
+    }
     let reading = false;
     let lastReadError = null;
     readRequest = async () => {

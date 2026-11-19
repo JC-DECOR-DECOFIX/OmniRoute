@@ -236,6 +236,23 @@ response body included. After the last call the database is read again, and an a
 updated when its quota `fetchedAt` is at or after the start of the refresh. Only the status code
 and the `_stale` marker of Omni Route's answer are used; its body is not logged or published.
 
+A timeout only ends the wait: the route does not cancel its own read, which may still be
+renewing that account's credentials. So a timeout ends the round, the accounts after it are not
+read (`não consultada: rodada interrompida por tempo esgotado`), and with no account updated the
+round fails with `gateway_timeout`. The minimum interval, counted from the start of the round,
+leaves the gateway at least `minIntervalMs - timeoutMs` (90 s by default) to finish before the
+next round. Omni Route also serializes credential renewals of Claude accounts in its own process.
+
+When the service starts, before it publishes anything, it reads its own last report from the
+artifact and takes back the refresh state: the request it last answered is not answered again,
+and the interval stays where it was. A refresh that was running when the service stopped is
+reported `failed` and not repeated. That report sits in a store the artifact's viewers can write,
+so only well-formed values are taken back: a request version from the future, an interval more
+than one interval ahead, or an unknown status is ignored, and texts are sanitized again.
+
+While `NODE_DEBUG` is set, Node may print request headers on stderr, so the gateway credential
+is not read at all and requests are answered `not_configured`.
+
 The gateway is called only after the `running` state has been written to the artifact. When that
 write fails, nothing is called, the request is answered `failed` with `error: null`, and it does
 not use the interval. Every write and read of the data store has a 10 s deadline for the whole

@@ -20,6 +20,7 @@ import {
   createPublishQueue,
   createRefresher,
   createUsageServer,
+  debugLogsRequests,
   exchange,
   gatewayUsageCall,
   loadConfig,
@@ -1330,7 +1331,7 @@ test("the gateway call keeps only the status and the stale marker", async (t) =>
     }
     if (req.url.endsWith("/busy")) return json(409, { error: secretBody });
     if (req.url.endsWith("/denied")) return json(401, { error: secretBody });
-    if (req.url.endsWith("/huge")) return json(200, { pad: "x".repeat(400_000) });
+    if (req.url.endsWith("/huge")) return json(200, { pad: "x".repeat(1_200_000) });
     if (req.url.endsWith("/cut")) {
       res.writeHead(200, { "content-type": "application/json", "content-length": "100" });
       res.write('{"quotas":');
@@ -1417,15 +1418,18 @@ async function freePort() {
   return port;
 }
 
-function startService(t, configPath) {
-  const child = spawn(process.execPath, [
-    fileURLToPath(new URL("server.mjs", SERVICE_DIR)),
-    configPath,
-  ]);
+function startService(t, configPath, env = process.env) {
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL("server.mjs", SERVICE_DIR)), configPath],
+    { env }
+  );
   let stdout = "";
+  let stderr = "";
   child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
   t.after(() => child.kill("SIGKILL"));
-  return { child, stdout: () => stdout };
+  return { child, stdout: () => stdout, stderr: () => stderr };
 }
 
 async function waitFor(predicate, ms = 8_000) {
@@ -1493,7 +1497,7 @@ test("the service reads refresh requests through the daemon and answers them", a
   const answered = () =>
     daemon.requests.find((r) => r.method === "PUT" && r.body.value.refresh?.last);
   await waitFor(answered);
-  const get = daemon.requests.find((r) => r.method === "GET");
+  const get = daemon.requests.find((r) => r.method === "GET" && r.url.endsWith("refresh-request"));
   assert.equal(get.url, "/v0/artifacts/art1/api/v1/kv/entry?key=omni-route%2Frefresh-request");
   assert.equal(get.authorization, "Bearer daemon-token");
   const { refresh } = answered().body.value;
@@ -1782,4 +1786,192 @@ test("a proxy configured for the process never receives a call or its credential
     proxied.map((r) => r.url),
     [`${baseUrl}/global`]
   );
+});
+
+// Regressions from the third independent review of PR #12.
+
+test("a timed-out account ends the round without reading the others", async () => {
+  const h = refreshHarness({ results: { [A]: { kind: "timeout" } } });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.deepEqual(
+    h.calls.map((c) => c.connectionId),
+    [A]
+  );
+  const { last } = h.refresher.state();
+  assert.equal(last.status, "failed");
+  assert.equal(last.error, "gateway_timeout");
+  assert.deepEqual(
+    last.accounts.map((a) => a.reason),
+    [
+      "tempo esgotado",
+      "não consultada: rodada interrompida por tempo esgotado",
+      "não consultada: rodada interrompida por tempo esgotado",
+    ]
+  );
+  const later = refreshHarness({ results: { [B]: { kind: "timeout" } } });
+  later.refresher.offer(null);
+  later.refresher.offer(later.entry(1));
+  await later.refresher.idle();
+  assert.equal(later.calls.length, 2);
+  assert.equal(later.refresher.state().last.status, "partial");
+});
+
+test("after a restart a request already answered is not answered again", async () => {
+  const first = refreshHarness();
+  first.refresher.offer(null);
+  first.refresher.offer(first.entry(1));
+  await first.refresher.idle();
+  const published = first.published.at(-1).refresh;
+
+  // The new process reads its own last report before publishing anything.
+  const h = refreshHarness();
+  h.advance(1_000);
+  h.refresher.restore(structuredClone(published));
+  assert.deepEqual(h.refresher.state(), published);
+  h.refresher.offer({ ...h.entry(1), updatedAt: NOW });
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  // A new request inside the restored interval is throttled.
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.refresher.state().last.status, "throttled");
+  assert.equal(h.refresher.state().nextAllowedAt, published.nextAllowedAt);
+});
+
+test("a refresh cut short by a restart is reported failed and not repeated", async () => {
+  const h = refreshHarness();
+  h.refresher.restore({
+    minIntervalMs: 120_000,
+    nextAllowedAt: new Date(NOW + 100_000).toISOString(),
+    last: {
+      requestVersion: version(1),
+      requestedAt: new Date(NOW - 20_000).toISOString(),
+      status: "running",
+      startedAt: new Date(NOW - 20_000).toISOString(),
+      finishedAt: null,
+      accounts: [],
+      error: null,
+    },
+  });
+  const { last } = h.refresher.state();
+  assert.equal(last.status, "failed");
+  assert.equal(last.finishedAt, new Date(NOW).toISOString());
+  assert.equal(h.logs.at(-1), "refresh interrupted by a restart");
+  h.refresher.offer({ ...h.entry(1), updatedAt: NOW - 20_000 });
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+});
+
+test("restored state that is not well formed is not trusted", async () => {
+  const restored = (previous) => {
+    const h = refreshHarness();
+    h.refresher.restore(previous);
+    return h;
+  };
+  const valid = {
+    nextAllowedAt: new Date(NOW + 60_000).toISOString(),
+    last: { requestVersion: version(1), status: "done", accounts: [] },
+  };
+  assert.equal(restored(valid).refresher.state().last.requestVersion, version(1));
+  // A version from the future would hide every request until then.
+  const future = "ffffffff-ffff-7000-8000-000000000000";
+  const h = restored({ ...valid, last: { ...valid.last, requestVersion: future } });
+  assert.equal(h.refresher.state().last, null);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  // An interval pushed far ahead is dropped; foreign fields and text are cleaned.
+  const odd = restored({
+    nextAllowedAt: "2999-01-01T00:00:00.000Z",
+    last: {
+      requestVersion: version(1),
+      status: "done",
+      accounts: [
+        { shortId: "<script>", updated: false },
+        { shortId: "aaaaaaaa", updated: false, reason: `x ${GATEWAY_TOKEN}`, extra: 1 },
+      ],
+      error: "pwned",
+      injected: true,
+    },
+  }).refresher.state();
+  assert.equal(odd.nextAllowedAt, null);
+  assert.deepEqual(odd.last.accounts, [
+    { shortId: "aaaaaaaa", updated: false, reason: "x [redacted]" },
+  ]);
+  assert.equal(odd.last.error, null);
+  assert.equal(Object.hasOwn(odd.last, "injected"), false);
+  for (const bad of [null, {}, { last: { requestVersion: "x", status: "done" } }]) {
+    assert.equal(restored(bad).refresher.state().last, null);
+  }
+  assert.equal(
+    restored({ last: { requestVersion: version(1), status: "weird" } }).refresher.state().last,
+    null
+  );
+});
+
+test("NODE_DEBUG disables the gateway credential", () => {
+  assert.equal(debugLogsRequests({}), false);
+  assert.equal(debugLogsRequests({ NODE_DEBUG: "" }), false);
+  assert.equal(debugLogsRequests({ NODE_DEBUG: "https" }), true);
+  assert.equal(debugLogsRequests({ NODE_DEBUG: "net,tls" }), true);
+});
+
+test("the service with NODE_DEBUG set never sends the gateway token", async (t) => {
+  const { dir, write } = privateDir(t);
+  const gateway = await fakeGateway(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const entry = {
+    key: REFRESH_REQUEST_KEY,
+    value: { schema: REFRESH_REQUEST_SCHEMA },
+    deleted: false,
+    version: version(9),
+    updatedAt: Date.now(),
+  };
+  const daemon = await fakeDaemon(t, dir, () => entry);
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      authorizedConnections: [A],
+      listen: { port: await freePort() },
+      happy: {
+        socketPath: daemon.socketPath,
+        tokenFile: write("happy", "daemon-token"),
+        artifactId: "art1",
+      },
+      refresh: {
+        baseUrl: gateway.baseUrl,
+        tokenFile: write("omniroute-access-token", GATEWAY_TOKEN),
+        requestPollMs: 500,
+      },
+    })
+  );
+  const service = startService(t, configPath, { ...process.env, NODE_DEBUG: "http,https,net" });
+  const answered = () =>
+    daemon.requests.find((r) => r.method === "PUT" && r.body.value.refresh?.last);
+  await waitFor(answered);
+  assert.equal(answered().body.value.refresh.last.error, "not_configured");
+  assert.equal(gateway.seen.length, 0);
+  assert.match(service.stdout(), /refresh disabled while NODE_DEBUG is set/);
+  assert.equal(service.stderr().includes(GATEWAY_TOKEN), false);
+  assert.equal(service.stdout().includes(GATEWAY_TOKEN), false);
+});
+
+test("an exchange whose request cannot be created fails like a network error", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    exchange({
+      options: { host: "127.0.0.1", path: "/", method: "GET", headers: { "bad\nname": "x" } },
+      deadlineMs: 60_000,
+      label: "omni route usage",
+    }),
+    (error) => error.kind === "network" && error.message.startsWith("omni route usage")
+  );
+  assert.ok(Date.now() - started < 1_000);
 });
