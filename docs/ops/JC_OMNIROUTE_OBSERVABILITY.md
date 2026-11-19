@@ -166,6 +166,98 @@ With a `happy` block in the configuration (`socketPath`, `tokenFile`, `artifactI
 per heartbeat (60 s). That is how the Happy desktop and phone apps can show it without any change
 to those apps. The block stays absent until the panel itself has been approved.
 
+### Manual refresh (the panel's "Atualizar" button)
+
+With a `refresh` block as well, the panel can ask for a new vendor reading of every authorized
+account. The service reads the key `omni-route/refresh-request` of the same artifact through the
+daemon socket every `requestPollMs` (2 s). The value is
+`{ "schema": "omni-route-refresh-request/v1" }`; other fields are ignored and the value is not
+trusted. A request is identified by the entry's `version` (a UUIDv7, newer than the last one
+seen), and its time is the entry's `updatedAt`. When the service starts, a request already in the
+store is answered only if it is at most 90 s old; an older one is marked seen.
+
+```json
+"refresh": {
+  "baseUrl": "http://127.0.0.1:20128",
+  "tokenFile": "/Users/giovanni/.omniroute/observability/omniroute-access-token",
+  "minIntervalMs": 120000,
+  "requestPollMs": 2000,
+  "timeoutMs": 30000,
+  "spacingMs": 1500
+}
+```
+
+`baseUrl` must be an `http(s)` loopback origin (`127.0.0.1`, `localhost`, `[::1]`) with no
+credentials, path or query; `tokenFile` is an absolute path; `minIntervalMs` is at least 60000,
+`requestPollMs` 500–10000, `timeoutMs` 5000–60000, `spacingMs` 0–10000. The block needs the `happy`
+block and a non-empty `authorizedConnections`.
+
+To read an account again, the service calls Omni Route's own endpoint
+`GET /api/usage/{connectionId}` (`src/app/api/usage/[connectionId]/route.ts`), the one the
+dashboard's quota page uses. It runs `fetchAndPersistProviderLimits(…, "manual")`, which reads
+`/api/oauth/usage` for that account and stores the reading in `providerLimitsCache` with a new
+`fetchedAt`. The call is authenticated with an Omni Route access token (`oma_…`) of scope `read`
+(a `GET` needs only `read`, `src/server/authz/accessScopes.ts`), sent as
+`Authorization: Bearer`. The token is created by the operator in the Omni Route dashboard and kept
+in `tokenFile`, mode 0600; it is read again for every refresh and never logged or published. While
+the file is missing or not owner-only, a request is answered with `error: "not_configured"` and
+nothing is called. The machine CLI token (`x-omniroute-cli-token`) is not used: in the installed
+build (3.8.50, `09966db`) the compiled middleware cannot read the machine id, so the server
+rejects every CLI token.
+
+The accounts are called one at a time, `spacingMs` apart, each with `timeoutMs`. After the last
+call the database is read again, and an account counts as updated when its quota `fetchedAt` is
+at or after the start of the refresh. Only the status code and the `_stale` markers of Omni
+Route's answer are used; its body is not logged or published.
+
+**Why at most one refresh every two minutes.** Omni Route already waits 180 s per token when
+`/api/oauth/usage` answers 429 (`open-sse/services/claudeUsageCooldown.ts`): Anthropic limits that
+endpoint on a scale of minutes. The automatic sync runs every 70 minutes with 1.5 s between
+accounts. Two minutes keeps the manual path at no more than three reads (one per account) every
+two minutes, about 90 an hour in the worst case, and the quota is a whole percentage that moves
+slowly. A request inside the interval does not call the gateway: the database is read again and
+the request is answered as `throttled`. Requests that arrive while a refresh runs are answered
+when it ends, as `throttled`. Only one refresh runs at a time.
+
+The result goes out in the published report (and in `GET /internal/omni-route/usage`) as
+`refresh`, and is published as soon as it changes:
+
+```json
+"refresh": {
+  "minIntervalMs": 120000,
+  "nextAllowedAt": "2026-11-19T19:43:00.000Z",
+  "last": {
+    "requestVersion": "019a…",
+    "requestedAt": "2026-11-19T19:41:00.000Z",
+    "status": "done",
+    "startedAt": "2026-11-19T19:41:00.200Z",
+    "finishedAt": "2026-11-19T19:41:05.400Z",
+    "accounts": [{ "shortId": "6726837b", "updated": true, "reason": null }],
+    "error": null
+  }
+}
+```
+
+| `status`    | Meaning                                                                                      |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| `running`   | Published before the first call; `startedAt` set, `finishedAt` null                          |
+| `done`      | Every authorized account has a new reading                                                   |
+| `partial`   | Some accounts have one; the others carry a short `reason`                                    |
+| `failed`    | None has; `error` holds the cause when all calls share it                                    |
+| `throttled` | Inside the interval; `startedAt` null, `accounts` empty, `nextAllowedAt` is when it opens up |
+
+`error` is `null` or one of `not_configured`, `gateway_unreachable`, `gateway_auth_failed` (401 or
+403 for every account), `gateway_timeout` or `gateway_http_<code>`. Per-account reasons are
+fixed Portuguese texts shown by the panel as they are: `em uso exclusivo` (409, the account holds
+an exclusive lease), `limite de consultas da Anthropic` (429, or a stale answer caused by one),
+`a Anthropic não devolveu a cota` (another stale answer), `credencial do painel recusada`
+(401/403), `conta não encontrada no Omni Route` (404), `Omni Route respondeu HTTP <code>`,
+`tempo esgotado`, `Omni Route inacessível`, and `leitura nova não encontrada no banco` (the call
+was accepted but the database shows no newer reading). Without a `refresh` block the report
+carries `"refresh": null` and the request key is never read. The log records only events:
+`refresh requested`, `refresh done 3/3`, `refresh partial 1/3`, `refresh throttled`,
+`refresh failed: <error>`.
+
 ## Installation on this Mac
 
 Deploy from a merged commit of `jc/macos-v3.8.50`, never from a working tree.
