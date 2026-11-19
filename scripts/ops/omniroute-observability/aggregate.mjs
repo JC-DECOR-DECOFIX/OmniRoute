@@ -31,9 +31,15 @@ const PLAN_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
 const EMAIL_RE = /^[^\s@"'<>]{1,64}@[A-Za-z0-9.-]{1,253}$/;
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 
-/** SQL condition matching ID_RE, so a row whose id has another shape never takes part. */
+/**
+ * SQL condition matching ID_RE over the whole stored value, so a row whose id has another shape
+ * never takes part in ordering, grouping or limits. SQLite's length() and GLOB stop at a NUL
+ * byte and accept blobs, so the value must be text and its bytes are measured and searched.
+ */
 function validIdSql(column) {
-  return `(${column} IS NOT NULL AND length(${column}) BETWEEN 1 AND 64
+  return `(typeof(${column}) = 'text'
+           AND length(CAST(${column} AS BLOB)) BETWEEN 1 AND 64
+           AND instr(CAST(${column} AS BLOB), x'00') = 0
            AND ${column} NOT GLOB '*[^A-Za-z0-9-]*')`;
 }
 const CONNECTION_OK = validIdSql("connection_id");
@@ -43,8 +49,13 @@ function iso(ms) {
   return ms === null || ms === undefined ? null : new Date(ms).toISOString();
 }
 
+// Omni Route writes ISO 8601 timestamps. Anything else is not a time: Date.parse alone accepts
+// strings such as "x 5" as dates.
+const ISO_TIME_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+
 function parseTime(value) {
-  if (typeof value !== "string" || !value) return null;
+  if (typeof value !== "string" || !ISO_TIME_RE.test(value)) return null;
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms : null;
 }
@@ -114,14 +125,16 @@ function latestSnapshot(db, connectionId, windowKey) {
       `SELECT remaining_percentage, next_reset_at, created_at FROM quota_snapshots
         WHERE provider = ? AND connection_id = ? AND window_key = ?
           AND typeof(remaining_percentage) IN ('integer', 'real')
-        ORDER BY created_at DESC, id DESC LIMIT 50`
+          AND typeof(created_at) = 'text'
+        ORDER BY created_at DESC, id DESC`
     )
-    .all(PROVIDER, connectionId, windowKey);
-  return (
-    rows.find(
-      (row) => percent(row.remaining_percentage) !== null && parseTime(row.created_at) !== null
-    ) ?? null
-  );
+    .iterate(PROVIDER, connectionId, windowKey);
+  for (const row of rows) {
+    if (percent(row.remaining_percentage) !== null && parseTime(row.created_at) !== null) {
+      return row;
+    }
+  }
+  return null;
 }
 
 /**
@@ -212,16 +225,24 @@ function accountQuota(db, connectionId, now) {
   };
 }
 
+// Statuses that Omni Route's account selection treats as terminal until an operator acts
+// (isTerminalConnectionStatus in src/sse/services/auth.ts).
+const TERMINAL_STATUSES = new Set(["expired", "banned", "credits_exhausted"]);
+
+/**
+ * The account's eligibility as the gateway's selector sees it: inactive, a terminal status, a
+ * cooldown that has not ended, or eligible. A cooldown that has ended no longer excludes the
+ * account even while its stored status still reads `unavailable`; that status is reported as
+ * `testStatus` beside the state.
+ */
 function accountState(row, now) {
+  const status = typeof row.test_status === "string" ? row.test_status.trim().toLowerCase() : "";
   const limitedUntil = parseTime(row.rate_limited_until);
   if (!row.is_active) return { state: "inactive", until: null };
-  if (row.test_status === "expired") return { state: "expired", until: null };
-  // Omni Route marks a temporary cooldown as `unavailable` with a future end; the end is what
-  // tells it apart from an account that is unavailable until an operator acts.
+  if (TERMINAL_STATUSES.has(status)) return { state: status, until: null };
   if (limitedUntil !== null && limitedUntil > now) {
     return { state: "cooldown", until: iso(limitedUntil) };
   }
-  if (row.test_status === "unavailable") return { state: "unavailable", until: null };
   return { state: "active", until: null };
 }
 
@@ -383,6 +404,7 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
       authorized: authorizedSet.has(row.id),
       state,
       stateUntil: until,
+      testStatus: matching(row.test_status, ERROR_TYPE_RE),
       inUse: activeIds.has(row.id),
       servedLatest: served?.connection_id === row.id,
       lastServedAt: lastServed.get(row.id) ?? null,

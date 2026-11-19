@@ -30,7 +30,7 @@ selects a credential column and no statement writes.
 
 Only `provider = 'claude'` rows are read, and only rows attributed to an account
 (a `connection_id` of letters, digits and dashes, at most 64 characters) take part in the account facts; rows and connections with any other id are left out. Every text value is checked against the
-shape it should have (model ids, error types, plan names, e-mails, ids, timestamps) and dropped
+shape it should have (model ids, error types, plan names, e-mails, ids, ISO 8601 timestamps) and dropped
 when it does not match. Error summaries are free text: they are passed through a redactor that
 replaces Bearer credentials, Anthropic keys, JWTs, `token=`/`api_key:`-style assignments and any
 other long opaque run of key-like characters, and are truncated to 160 characters. Redaction is
@@ -101,6 +101,21 @@ instead of a guessed one:
   `null` ("not reported"), never 0 %.
 - When the reading's reset time has passed, the window shows `state: "reset_pending_reading"` and
   `usedPercent: null` until Omni Route reads it again.
+
+## Account state
+
+`accounts[].state` follows the gateway's own account selection (`isTerminalConnectionStatus` and
+the cooldown check in `src/sse/services/auth.ts`):
+
+| State                                    | Meaning                                                                   |
+| ---------------------------------------- | ------------------------------------------------------------------------- |
+| `inactive`                               | `is_active` is off                                                        |
+| `expired`, `banned`, `credits_exhausted` | Terminal status; excluded until an operator acts                          |
+| `cooldown`                               | `rate_limited_until` is in the future; `stateUntil` is its end            |
+| `active`                                 | Eligible for selection, including after a cooldown that has already ended |
+
+The stored `test_status` is reported beside it as `testStatus`: an account can read `unavailable`
+there while its state is `active`, because an ended cooldown no longer excludes it.
 
 ## Staleness
 

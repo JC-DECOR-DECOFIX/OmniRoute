@@ -585,8 +585,11 @@ test("a temporary cooldown marked unavailable still reports its end", () => {
   const r = buildUsageReport(db, { now: NOW });
   assert.equal(account(r, B).state, "cooldown");
   assert.equal(account(r, B).stateUntil, at(-30));
-  assert.equal(account(r, C).state, "unavailable");
+  assert.equal(account(r, B).testStatus, "unavailable");
+  // Without a cooldown end the gateway's selector does not exclude it.
+  assert.equal(account(r, C).state, "active");
   assert.equal(account(r, C).stateUntil, null);
+  assert.equal(account(r, C).testStatus, "unavailable");
 });
 
 test("a poll leaves the database file unchanged", (t) => {
@@ -738,4 +741,59 @@ test("the observer turns stale on the first failed poll", () => {
   fail = false;
   observer.poll();
   assert.equal(observer.payload().observer.status, "fresh");
+});
+
+// Regressions from the third independent review of PR #9.
+
+test("ids with a NUL byte or stored as a blob never reach the report", () => {
+  const db = fixture();
+  const row = db.prepare(
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?)`
+  );
+  row.run("z1", at(0.2), 200, `${B}\u0000<script>`, null);
+  row.run("z2", at(0.15), 200, new Uint8Array([97, 98, 99]), null);
+  row.run("z3", at(10), 500, A, "corr-8");
+  row.run("z4", at(9.9), 200, `${C}\u0000x`, "corr-8");
+  const r = buildUsageReport(db, { now: NOW });
+  const json = JSON.stringify(r);
+  assert.equal(json.includes("<script>"), false);
+  assert.equal(json.includes("\\u0000"), false);
+  assert.equal(r.current.at, at(1));
+  for (const entry of r.inUse) assert.equal(typeof entry.connectionId, "string");
+  assert.deepEqual(r.inUse.map((entry) => entry.connectionId).sort(), [A, B].sort());
+  assert.equal(
+    r.switches.some((e) => e.correlationId === "corr-8"),
+    false
+  );
+});
+
+test("account state follows the gateway's selector", () => {
+  const db = fixture();
+  const set = db.prepare(
+    "UPDATE provider_connections SET test_status = ?, rate_limited_until = ? WHERE id = ?"
+  );
+  set.run("banned", null, A);
+  set.run(" Credits_Exhausted ", at(-30), B);
+  set.run("unavailable", at(5), C);
+  const r = buildUsageReport(db, { now: NOW });
+  assert.equal(account(r, A).state, "banned");
+  assert.equal(account(r, B).state, "credits_exhausted");
+  assert.equal(account(r, B).stateUntil, null);
+  // A cooldown that has ended no longer excludes the account.
+  assert.equal(account(r, C).state, "active");
+  assert.equal(account(r, C).testStatus, "unavailable");
+  assert.equal(account(r, X).state, "inactive");
+});
+
+test("many snapshots with unreadable times do not hide the last valid one", () => {
+  const db = fixture();
+  const snap = db.prepare(
+    `INSERT INTO quota_snapshots (provider, connection_id, window_key, remaining_percentage, next_reset_at, created_at)
+     VALUES ('claude', ?, 'session (5h)', 10, NULL, ?)`
+  );
+  // V8's Date.parse reads strings like these as dates in 2000 and 2001.
+  for (let i = 0; i < 60; i++) snap.run(B, `zz-not-a-time-${i}`);
+  snap.run(B, "x 5");
+  const b = account(buildUsageReport(db, { now: NOW }), B).quota;
+  assert.equal(b.windows.fiveHour.usedPercent, 65);
 });
