@@ -21,15 +21,15 @@ Every poll (15 s by default) opens the gateway database **read-only**, runs a fi
 `SELECT` statements and closes it. Each statement names its columns explicitly; no statement
 selects a credential column and no statement writes.
 
-| Source                                      | Columns or fields read                                                                                                                     | Used for                                                |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| `call_logs`                                 | `timestamp`, `status`, `provider`, `requested_model`, `model`, `connection_id`, `account`, `error_type`, `error_summary`, `correlation_id` | Current account, accounts in use, switches, last error  |
-| `provider_connections`                      | `id`, `email`, `name`, `display_name`, `priority`, `is_active`, `test_status`, `rate_limited_until`, `last_error_type`                     | Account list, state and cooldown end                    |
-| `key_value` namespace `providerLimitsCache` | `fetchedAt`, `plan`, `quotas["session (5h)"]`, `quotas["weekly (7d)"]` (`used`, `resetAt`)                                                 | Subscription quota and when it was read                 |
-| `quota_snapshots`                           | `remaining_percentage`, `next_reset_at`, `created_at` for `session (5h)` and `weekly (7d)`                                                 | A newer quota reading than the cache, when there is one |
+| Source                                      | Columns or fields read                                                                                                                                     | Used for                                                |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `call_logs`                                 | `timestamp`, `status`, `provider`, `requested_model`, `model`, `connection_id`, `account` (compared only), `error_type`, `error_summary`, `correlation_id` | Current account, accounts in use, switches, last error  |
+| `provider_connections`                      | `id`, `email`, `priority`, `is_active`, `test_status`, `rate_limited_until`                                                                                | Account list, state and cooldown end                    |
+| `key_value` namespace `providerLimitsCache` | `fetchedAt`, `plan`, `quotas["session (5h)"]`, `quotas["weekly (7d)"]` (`used`, `resetAt`)                                                                 | Subscription quota and when it was read                 |
+| `quota_snapshots`                           | `remaining_percentage`, `next_reset_at`, `created_at` for `session (5h)` and `weekly (7d)`                                                                 | A newer quota reading than the cache, when there is one |
 
 Only `provider = 'claude'` rows are read, and only rows attributed to an account
-(`connection_id` set) take part in the account facts. Every text value is checked against the
+(a `connection_id` of letters, digits and dashes, at most 64 characters) take part in the account facts; rows and connections with any other id are left out. Every text value is checked against the
 shape it should have (model ids, error types, plan names, e-mails, ids, timestamps) and dropped
 when it does not match. Error summaries are free text: they are passed through a redactor that
 replaces Bearer credentials, Anthropic keys, JWTs, `token=`/`api_key:`-style assignments and any
@@ -86,7 +86,7 @@ Omni Route stores that reading in two places:
 When a fetch fails, Omni Route keeps the previous good cache entry with its original `fetchedAt`
 (`mergeProviderLimitsCacheEntry`, `src/lib/usage/providerLimitsCache.ts`), so a failing vendor
 read shows up here as an aging reading, not as a new one. A cache entry without a quota table, or
-with no valid window, is not treated as a reading at all, and a missing percentage is never read
+with no valid window, is not treated as a reading at all; a window key that is present but holds no valid percentage says nothing about that window (only an absent key is an omission); invalid snapshot rows are skipped in favor of the newest valid one; and a missing percentage is never read
 as 0 % or 100 %.
 
 Because the five-minute rechecks that find no change leave no record, an account whose usage is
@@ -107,7 +107,7 @@ instead of a guessed one:
 Two independent signals are reported:
 
 - `observer.status` describes the observer itself: `fresh` while the last successful poll is at
-  most two poll intervals old, `stale` when polls are failing, `unavailable` before the first
+  most two poll intervals old and the latest poll succeeded, `stale` from the first failed poll on (or when no poll has succeeded for two intervals), `unavailable` before the first
   successful poll. The endpoint answers 503 until the first report exists. While polls fail, the
   last good report is kept as it was: its account, quota and reset states are history as of
   `observer.lastSuccessAt`, and consumers must present them that way. `observer.lastError` holds
@@ -159,7 +159,10 @@ Configuration `~/.omniroute/observability/config.json`, mode 0600:
 ```json
 {
   "dbPath": "/Users/giovanni/.omniroute/storage.sqlite",
-  "authorizedConnections": ["APPROVED_ID_1", "APPROVED_ID_2", "APPROVED_ID_3"],
+  "authorizedConnections": [
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002"
+  ],
   "gateway": { "build": "INSTALLED_BUILD_SHA" },
   "tokenFile": "/Users/giovanni/.omniroute/observability/token",
   "listen": { "port": 20141 },

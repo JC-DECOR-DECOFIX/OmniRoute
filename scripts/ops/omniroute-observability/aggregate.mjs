@@ -31,6 +31,14 @@ const PLAN_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
 const EMAIL_RE = /^[^\s@"'<>]{1,64}@[A-Za-z0-9.-]{1,253}$/;
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 
+/** SQL condition matching ID_RE, so a row whose id has another shape never takes part. */
+function validIdSql(column) {
+  return `(${column} IS NOT NULL AND length(${column}) BETWEEN 1 AND 64
+           AND ${column} NOT GLOB '*[^A-Za-z0-9-]*')`;
+}
+const CONNECTION_OK = validIdSql("connection_id");
+const C_CONNECTION_OK = validIdSql("c.connection_id");
+
 function iso(ms) {
   return ms === null || ms === undefined ? null : new Date(ms).toISOString();
 }
@@ -99,14 +107,21 @@ function completeCacheReading(cache) {
   return hasWindow ? { fetchedAtMs, quotas } : null;
 }
 
+/** The newest snapshot of a window that holds a valid reading; invalid rows are skipped. */
 function latestSnapshot(db, connectionId, windowKey) {
-  return db
+  const rows = db
     .prepare(
       `SELECT remaining_percentage, next_reset_at, created_at FROM quota_snapshots
         WHERE provider = ? AND connection_id = ? AND window_key = ?
-        ORDER BY created_at DESC, id DESC LIMIT 1`
+          AND typeof(remaining_percentage) IN ('integer', 'real')
+        ORDER BY created_at DESC, id DESC LIMIT 50`
     )
-    .get(PROVIDER, connectionId, windowKey);
+    .all(PROVIDER, connectionId, windowKey);
+  return (
+    rows.find(
+      (row) => percent(row.remaining_percentage) !== null && parseTime(row.created_at) !== null
+    ) ?? null
+  );
 }
 
 /**
@@ -115,6 +130,9 @@ function latestSnapshot(db, connectionId, windowKey) {
  * changes. The newer of the two is the latest confirmed reading of that window.
  */
 function windowReading(reading, snapshot, windowKey) {
+  // Omni Route writes a window only when the vendor reported it, so an absent key is an
+  // omission. A key that is present but holds no valid percentage says nothing about the window.
+  const omitted = reading !== null && !Object.hasOwn(reading.quotas, windowKey);
   const cached = reading?.quotas?.[windowKey];
   const cachedUsed = percent(cached?.used);
   const fromCache =
@@ -142,7 +160,7 @@ function windowReading(reading, snapshot, windowKey) {
   }
   // A complete reading newer than the snapshot that omitted this window means the vendor no
   // longer reports it, such as a five-hour window with no session open.
-  if (fromSnapshot && reading && reading.fetchedAtMs > fromSnapshot.capturedAtMs) {
+  if (fromSnapshot && omitted && reading.fetchedAtMs > fromSnapshot.capturedAtMs) {
     return null;
   }
   return fromCache ?? fromSnapshot;
@@ -212,7 +230,7 @@ function latestServed(db) {
     .prepare(
       `SELECT timestamp, requested_model, model, connection_id, account
          FROM call_logs
-        WHERE provider = ? AND status BETWEEN 200 AND 299 AND connection_id IS NOT NULL
+        WHERE provider = ? AND status BETWEEN 200 AND 299 AND ${CONNECTION_OK}
         ORDER BY timestamp DESC, rowid DESC LIMIT 1`
     )
     .get(PROVIDER);
@@ -224,7 +242,7 @@ function inUse(db, now) {
       `SELECT connection_id, COUNT(*) AS requests, MAX(timestamp) AS last_at
          FROM call_logs
         WHERE provider = ? AND status BETWEEN 200 AND 299 AND timestamp >= ?
-          AND connection_id IS NOT NULL
+          AND ${CONNECTION_OK}
         GROUP BY connection_id ORDER BY last_at DESC, connection_id`
     )
     .all(PROVIDER, iso(now - IN_USE_WINDOW_MS))
@@ -241,7 +259,7 @@ function lastServedByConnection(db) {
     .prepare(
       `SELECT connection_id, MAX(timestamp) AS last_at
          FROM call_logs
-        WHERE provider = ? AND status BETWEEN 200 AND 299 AND connection_id IS NOT NULL
+        WHERE provider = ? AND status BETWEEN 200 AND 299 AND ${CONNECTION_OK}
         GROUP BY connection_id`
     )
     .all(PROVIDER);
@@ -255,10 +273,10 @@ function lastErrorByConnection(db, now) {
          FROM call_logs c
          JOIN (SELECT connection_id, MAX(timestamp) AS ts FROM call_logs
                 WHERE provider = ? AND status >= 400 AND status != 499 AND timestamp >= ?
-                  AND connection_id IS NOT NULL
+                  AND ${CONNECTION_OK}
                 GROUP BY connection_id) l
            ON l.connection_id = c.connection_id AND l.ts = c.timestamp
-        WHERE c.provider = ?
+        WHERE c.provider = ? AND c.status >= 400 AND c.status != 499
         ORDER BY c.rowid`
     )
     .all(PROVIDER, iso(now - 24 * 60 * 60_000), PROVIDER);
@@ -289,11 +307,11 @@ function switches(db, now, emailOf) {
               c.requested_model, c.model, c.error_type, c.error_summary
          FROM call_logs c
          JOIN (SELECT correlation_id FROM call_logs
-                WHERE provider = ? AND correlation_id IS NOT NULL AND connection_id IS NOT NULL
+                WHERE provider = ? AND correlation_id IS NOT NULL AND ${CONNECTION_OK}
                   AND timestamp >= ?
                 GROUP BY correlation_id HAVING COUNT(DISTINCT connection_id) > 1) m
            ON m.correlation_id = c.correlation_id
-        WHERE c.provider = ? AND c.connection_id IS NOT NULL AND c.timestamp >= ?
+        WHERE c.provider = ? AND ${C_CONNECTION_OK} AND c.timestamp >= ?
         ORDER BY c.correlation_id, c.timestamp, c.rowid`
     )
     .all(PROVIDER, since, PROVIDER, since);
@@ -338,7 +356,8 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
       `SELECT id, email, priority, is_active, test_status, rate_limited_until
          FROM provider_connections WHERE provider = ? ORDER BY priority, id`
     )
-    .all(PROVIDER);
+    .all(PROVIDER)
+    .filter((row) => matching(row.id, ID_RE) !== null);
 
   // The account's e-mail comes from its OAuth connection; `call_logs.account` is only a label
   // that can be a name or a short id, so it is compared, never shown.

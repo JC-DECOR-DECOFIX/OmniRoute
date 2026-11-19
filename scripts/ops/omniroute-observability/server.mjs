@@ -80,6 +80,18 @@ function sameSecret(provided, expected) {
   return timingSafeEqual(a, b);
 }
 
+// Fixed SQLite result texts (sqlite3_errstr) that explain a failed read; nothing else is shown.
+const SQLITE_RESULTS = new Set([
+  "database is locked",
+  "database table is locked",
+  "unable to open database file",
+  "disk I/O error",
+  "database disk image is malformed",
+  "file is not a database",
+  "out of memory",
+  "SQL logic error",
+]);
+
 /**
  * What the report says about a failed read: the error's code and, for SQLite, its fixed result
  * text such as "database is locked". The message itself is never served, since it can quote
@@ -91,7 +103,7 @@ export function readFailure(error) {
       ? error.code
       : "read_failed";
   const detail =
-    typeof error?.errstr === "string" && /^[a-z ]{1,60}$/.test(error.errstr) ? error.errstr : null;
+    typeof error?.errstr === "string" && SQLITE_RESULTS.has(error.errstr) ? error.errstr : null;
   return detail ? `${code}: ${detail}` : code;
 }
 
@@ -115,7 +127,11 @@ export function createObserver({ read, pollMs = DEFAULT_POLL_MS, now = Date.now 
   function payload() {
     const at = now();
     const status =
-      lastSuccessAt === null ? "unavailable" : at - lastSuccessAt <= 2 * pollMs ? "fresh" : "stale";
+      lastSuccessAt === null
+        ? "unavailable"
+        : lastError === null && at - lastSuccessAt <= 2 * pollMs
+          ? "fresh"
+          : "stale";
     return {
       ...(report ?? { schema: "omni-route-usage/v1", generatedAt: null }),
       observer: {

@@ -455,6 +455,12 @@ test("a failed read is reported by code, never by its message", () => {
     readFailure(
       Object.assign(new Error("x"), { code: "ERR_SQLITE_ERROR", errstr: "disk I/O error" })
     ),
+    "ERR_SQLITE_ERROR: disk I/O error"
+  );
+  assert.equal(
+    readFailure(
+      Object.assign(new Error("x"), { code: "ERR_SQLITE_ERROR", errstr: "no such table x" })
+    ),
     "ERR_SQLITE_ERROR"
   );
   assert.equal(readFailure(Object.assign(new Error("x"), { code: "bad code; rm" })), "read_failed");
@@ -639,4 +645,97 @@ test("a port already in use ends the service with a non-zero exit", async (t) =>
   assert.match(stdout, /poll failed: (ERR_SQLITE_ERROR|read_failed)/);
   assert.match(stdout, /fatal: .*EADDRINUSE/);
   assert.equal(stdout.includes("local-token"), false);
+});
+
+// Regressions from the second independent review of PR #9.
+
+test("connection ids that do not have the id shape never reach the report", () => {
+  const db = fixture();
+  const odd = "evil id<script>";
+  db.prepare(
+    `INSERT INTO provider_connections (id, provider, email, priority, is_active, test_status)
+     VALUES (?, 'claude', 'odd@example.com', 9, 1, 'active')`
+  ).run(odd);
+  const row = db.prepare(
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?)`
+  );
+  row.run("i1", at(0.2), 200, odd, null);
+  row.run("i2", at(10), 500, A, "corr-7");
+  row.run("i3", at(9.9), 200, odd, "corr-7");
+  row.run("i4", at(0.3), 500, odd, null);
+  const r = buildUsageReport(db, { now: NOW });
+  assert.equal(JSON.stringify(r).includes("evil"), false);
+  assert.equal(r.current.connectionId, B);
+  assert.equal(r.accounts.length, 4);
+  assert.equal(
+    r.switches.some((e) => e.correlationId === "corr-7"),
+    false
+  );
+});
+
+test("a present but invalid window does not hide a valid snapshot", () => {
+  const db = fixture();
+  db.prepare("UPDATE key_value SET value = ? WHERE key = ?").run(
+    JSON.stringify({
+      fetchedAt: at(0),
+      quotas: {
+        "session (5h)": { used: null, resetAt: at(-60) },
+        "weekly (7d)": { used: 50, resetAt: at(-3000) },
+      },
+    }),
+    A
+  );
+  const a = account(buildUsageReport(db, { now: NOW }), A).quota;
+  assert.equal(a.windows.fiveHour.usedPercent, 90);
+  assert.equal(a.windows.fiveHour.source.endsWith("quota_snapshots"), true);
+  assert.equal(a.windows.weekly.usedPercent, 50);
+});
+
+test("a newer invalid snapshot does not hide the previous valid one", () => {
+  const db = fixture();
+  const snap = db.prepare(
+    `INSERT INTO quota_snapshots (provider, connection_id, window_key, remaining_percentage, next_reset_at, created_at)
+     VALUES ('claude', ?, 'session (5h)', ?, ?, ?)`
+  );
+  snap.run(B, null, at(-90), at(0.5));
+  snap.run(B, "n/a", at(-90), at(0.4));
+  snap.run(B, 20, at(-90), "not a time");
+  const b = account(buildUsageReport(db, { now: NOW }), B).quota;
+  assert.equal(b.windows.fiveHour.usedPercent, 65);
+  assert.equal(b.windows.fiveHour.capturedAt, at(1));
+});
+
+test("the last error ignores successes that share its timestamp", () => {
+  const db = fixture();
+  const row = db.prepare(
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, ?, ?, NULL)`
+  );
+  row.run("e1", at(3), 429, C, "rate_limited", "limit");
+  row.run("e2", at(3), 200, C, null, null);
+  const c = account(buildUsageReport(db, { now: NOW }), C);
+  assert.equal(c.lastError.status, 429);
+  assert.equal(c.lastError.type, "rate_limited");
+});
+
+test("the observer turns stale on the first failed poll", () => {
+  let clock = NOW;
+  let fail = false;
+  const observer = createObserver({
+    read: () => {
+      if (fail) throw new Error("boom");
+      return { schema: "omni-route-usage/v1", generatedAt: "x" };
+    },
+    pollMs: 15_000,
+    now: () => clock,
+  });
+  observer.poll();
+  assert.equal(observer.payload().observer.status, "fresh");
+  fail = true;
+  clock += 1_000;
+  observer.poll();
+  assert.equal(observer.payload().observer.status, "stale");
+  assert.equal(observer.payload().observer.lastError, "read_failed");
+  fail = false;
+  observer.poll();
+  assert.equal(observer.payload().observer.status, "fresh");
 });
