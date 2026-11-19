@@ -19,6 +19,7 @@ import {
   createPublishQueue,
   createRefresher,
   createUsageServer,
+  exchange,
   gatewayUsageCall,
   loadConfig,
   readFailure,
@@ -856,7 +857,12 @@ const version = (n) => `019a${String(n).padStart(4, "0")}-0000-7000-8000-0000000
  * A refresher over a fake gateway and a report whose quota times move when a call succeeds.
  * `results` maps a connection id to what its gateway call returns; the default succeeds.
  */
-function refreshHarness({ results = {}, token = GATEWAY_TOKEN, connections = [A, B, C] } = {}) {
+function refreshHarness({
+  results = {},
+  token = GATEWAY_TOKEN,
+  connections = [A, B, C],
+  failPublish = () => false,
+} = {}) {
   let clock = NOW;
   const fetchedAt = new Map(connections.map((id) => [id, NOW - 3_600_000]));
   const calls = [];
@@ -892,7 +898,7 @@ function refreshHarness({ results = {}, token = GATEWAY_TOKEN, connections = [A,
       calls.push({ token: sent, connectionId, timeoutMs, at: clock });
       if (gate) await gate.promise;
       clock += 500;
-      const result = results[connectionId] ?? { kind: "ok", stale: false, rateLimited: false };
+      const result = results[connectionId] ?? { kind: "ok", stale: false };
       if (result.kind === "ok" && !result.stale && !result.noWrite)
         fetchedAt.set(connectionId, clock);
       return result;
@@ -900,7 +906,11 @@ function refreshHarness({ results = {}, token = GATEWAY_TOKEN, connections = [A,
     minIntervalMs: 120_000,
     spacingMs: 1_500,
     timeoutMs: 30_000,
-    onChange: async () => published.push(structuredClone(observer.payload())),
+    onChange: async () => {
+      const payload = structuredClone(observer.payload());
+      if (failPublish(payload)) throw new Error("happy kv write returned HTTP 503");
+      published.push(payload);
+    },
     log: (message) => logs.push(message),
     now: () => clock,
     sleep: async (ms) => {
@@ -1006,7 +1016,7 @@ test("a refresh that updates some accounts is partial and says why for the other
   const h = refreshHarness({
     results: {
       [A]: { kind: "http", status: 409 },
-      [B]: { kind: "ok", stale: true, rateLimited: true },
+      [B]: { kind: "ok", stale: true },
     },
   });
   h.refresher.offer(null);
@@ -1017,7 +1027,11 @@ test("a refresh that updates some accounts is partial and says why for the other
   assert.equal(last.error, null);
   assert.deepEqual(last.accounts, [
     { shortId: "aaaaaaaa", updated: false, reason: "em uso exclusivo" },
-    { shortId: "bbbbbbbb", updated: false, reason: "limite de consultas da Anthropic" },
+    {
+      shortId: "bbbbbbbb",
+      updated: false,
+      reason: "a Anthropic não devolveu a cota (provável limite de consultas)",
+    },
     { shortId: "cccccccc", updated: true, reason: null },
   ]);
   assert.equal(h.logs.at(-1), "refresh partial 1/3");
@@ -1197,8 +1211,11 @@ test("a publish failure does not stop the queue", async () => {
     payload: () => ({}),
     onResult: (error, result) => errors.push(error?.message ?? result),
   });
-  await flush();
-  await flush();
+  // Each caller learns how its own publish went; the next one still runs.
+  const first = flush();
+  const second = flush();
+  await assert.rejects(first, /HTTP 503/);
+  assert.equal(await second, "written");
   assert.deepEqual(errors, ["happy kv write returned HTTP 503", "written"]);
 });
 
@@ -1243,6 +1260,14 @@ test("refresh configuration is validated", (t) => {
     [{ timeoutMs: 60_001 }, /timeoutMs/],
     [{ spacingMs: -1 }, /spacingMs/],
     [{ tokenFile: "token" }, /tokenFile/],
+    // An explicit null is not the default: it would remove the interval or the poll delay.
+    [{ minIntervalMs: null }, /minIntervalMs/],
+    [{ requestPollMs: null }, /requestPollMs/],
+    [{ timeoutMs: null }, /timeoutMs/],
+    [{ spacingMs: null }, /spacingMs/],
+    [{ baseUrl: null }, /baseUrl/],
+    [{ baseUrl: 20128 }, /baseUrl/],
+    [{ minIntervalMs: 120_000.5 }, /minIntervalMs/],
   ];
   for (const [change, error] of bad) {
     assert.throws(() => config({ ...base, refresh: { ...refresh, ...change } }), error);
@@ -1278,34 +1303,60 @@ async function fakeGateway(t, respond) {
   return { baseUrl: `http://127.0.0.1:${server.address().port}`, seen };
 }
 
-test("the gateway call keeps only the status and the stale markers", async (t) => {
+test("the gateway call keeps only the status and the stale marker", async (t) => {
   const secretBody = `upstream 429 rate limited ${SECRET} Bearer ${GATEWAY_TOKEN}`;
   const { baseUrl, seen } = await fakeGateway(t, (req, res) => {
     const json = (status, body) => {
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    if (req.url.endsWith("/ok")) return json(200, { quotas: {}, plan: "max" });
-    if (req.url.endsWith("/limited")) {
-      return json(200, { quotas: {}, _stale: true, _staleReason: secretBody });
+    if (req.url.endsWith("/ok")) {
+      return json(200, {
+        plan: "Claude Max 20x",
+        quotas: { "weekly (7d)": { used: 41, resetAt: "2026-11-23T06:00:00.000Z" } },
+      });
     }
-    if (req.url.endsWith("/stale")) {
-      return json(200, { _stale: true, _staleReason: "Anthropic returned 500" });
+    // What the installed build answers after a 429 from /api/oauth/usage: the legacy fallback's
+    // message becomes the stale reason, and the previous quotas are served.
+    if (req.url.endsWith("/limited")) {
+      return json(200, {
+        message: null,
+        quotas: { "weekly (7d)": { used: 40 } },
+        _stale: true,
+        _staleSince: "2026-11-19T18:00:00.000Z",
+        _staleReason: "Claude connected. Usage API requires admin permissions.",
+      });
     }
     if (req.url.endsWith("/busy")) return json(409, { error: secretBody });
     if (req.url.endsWith("/denied")) return json(401, { error: secretBody });
     if (req.url.endsWith("/huge")) return json(200, { pad: "x".repeat(400_000) });
+    if (req.url.endsWith("/cut")) {
+      res.writeHead(200, { "content-type": "application/json", "content-length": "100" });
+      res.write('{"quotas":');
+      setTimeout(() => res.socket.destroy(), 20);
+      return;
+    }
+    if (req.url.endsWith("/trickle")) {
+      // Headers and a byte every 50 ms, forever: no inactivity timeout would fire.
+      res.writeHead(200, { "content-type": "application/json" });
+      const timer = setInterval(() => res.write(" "), 50);
+      res.on("close", () => clearInterval(timer));
+      return;
+    }
     // "/slow" never answers.
   });
   const call = (connectionId, timeoutMs = 5_000) =>
     gatewayUsageCall({ baseUrl, token: GATEWAY_TOKEN, connectionId, timeoutMs });
-  assert.deepEqual(await call("ok"), { kind: "ok", stale: false, rateLimited: false });
-  assert.deepEqual(await call("limited"), { kind: "ok", stale: true, rateLimited: true });
-  assert.deepEqual(await call("stale"), { kind: "ok", stale: true, rateLimited: false });
+  assert.deepEqual(await call("ok"), { kind: "ok", stale: false });
+  assert.deepEqual(await call("limited"), { kind: "ok", stale: true });
   assert.deepEqual(await call("busy"), { kind: "http", status: 409 });
   assert.deepEqual(await call("denied"), { kind: "http", status: 401 });
   assert.deepEqual(await call("huge"), { kind: "network" });
+  assert.deepEqual(await call("cut"), { kind: "network" });
   assert.deepEqual(await call("slow", 200), { kind: "timeout" });
+  const started = Date.now();
+  assert.deepEqual(await call("trickle", 300), { kind: "timeout" });
+  assert.ok(Date.now() - started < 2_000, "the deadline covers the whole exchange");
   assert.equal(seen[0].url, "/api/usage/ok");
   assert.equal(seen[0].authorization, `Bearer ${GATEWAY_TOKEN}`);
   // A connection id cannot leave the usage path.
@@ -1466,7 +1517,7 @@ test("no gateway token appears in a published refresh or its log", async () => {
   const h = refreshHarness({
     results: {
       [A]: { kind: "http", status: 401 },
-      [B]: { kind: "ok", stale: true, rateLimited: true },
+      [B]: { kind: "ok", stale: true },
     },
   });
   h.refresher.offer(null);
@@ -1476,4 +1527,130 @@ test("no gateway token appears in a published refresh or its log", async () => {
   for (const needle of [GATEWAY_TOKEN, "oma_", "Bearer ", "sk-ant"]) {
     assert.equal(everything.includes(needle), false, needle);
   }
+});
+
+// Regressions from the independent review of PR #12.
+
+test("the gateway is not called when the running state cannot be published", async () => {
+  let storeDown = true;
+  const h = refreshHarness({
+    failPublish: (payload) => storeDown && payload.refresh.last?.status === "running",
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  const refresh = h.refresher.state();
+  assert.equal(refresh.nextAllowedAt, null, "the request does not use the interval");
+  assert.equal(refresh.last.status, "failed");
+  assert.equal(refresh.last.error, null);
+  assert.equal(refresh.last.startedAt, null);
+  assert.deepEqual(h.statuses(), ["failed"]);
+  assert.equal(h.logs.at(-1), "refresh failed: publish");
+  // Once the store takes writes again, the next request is served.
+  storeDown = false;
+  h.advance(5_000);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.deepEqual(h.statuses(), ["failed", "running", "done"]);
+  assert.equal(h.calls.length, 3);
+});
+
+test("a request seen during a refresh is throttled even when the interval ends meanwhile", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  const release = h.hold();
+  h.refresher.offer(h.entry(1));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.refresher.offer(h.entry(2));
+  // The first refresh takes longer than the whole interval.
+  h.advance(200_000);
+  release();
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3, "the gateway is read once");
+  assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
+  assert.equal(h.refresher.state().last.requestVersion, version(2));
+  // A request after that is a new refresh.
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 6);
+});
+
+test("an exchange fails on a rejected, interrupted or endless response", async (t) => {
+  const { dir } = privateDir(t);
+  const socketPath = join(dir, "k.sock");
+  const server = http.createServer((req, res) => {
+    if (req.url === "/rejected") {
+      res.writeHead(503);
+      return res.end("draining");
+    }
+    if (req.url === "/cut") {
+      res.writeHead(200, { "content-length": "50" });
+      res.write("{");
+      return setTimeout(() => res.socket.destroy(), 20);
+    }
+    if (req.url === "/endless") {
+      res.writeHead(200);
+      const timer = setInterval(() => res.write(" "), 50);
+      return res.on("close", () => clearInterval(timer));
+    }
+    res.writeHead(200);
+    res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const call = (path, deadlineMs = 2_000) =>
+    exchange({ options: { socketPath, path, method: "PUT" }, deadlineMs, label: "happy kv write" });
+  assert.deepEqual(await call("/ok"), { status: 200, text: "{}" });
+  assert.deepEqual(await call("/rejected"), { status: 503, text: "draining" });
+  await assert.rejects(call("/cut"), (error) => error.kind === "network");
+  await assert.rejects(
+    call("/endless", 300),
+    (error) => error.kind === "timeout" && error.message === "happy kv write timed out"
+  );
+  await assert.rejects(
+    exchange({
+      options: { socketPath: join(dir, "missing.sock"), path: "/", method: "GET" },
+      deadlineMs: 2_000,
+      label: "happy kv read",
+    }),
+    (error) => error.kind === "network" && !error.message.includes(dir)
+  );
+});
+
+test("the service keeps publishing after the daemon rejects a write", async (t) => {
+  const { dir, write } = privateDir(t);
+  const socketPath = join(dir, "d.sock");
+  const puts = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.method !== "PUT") return res.writeHead(404).end();
+      puts.push(Date.now());
+      res.writeHead(puts.length === 1 ? 503 : 200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      listen: { port: await freePort() },
+      pollIntervalMs: 1_000,
+      happy: { socketPath, tokenFile: write("happy", "daemon-token"), artifactId: "art1" },
+    })
+  );
+  const service = startService(t, configPath);
+  await waitFor(() => puts.length >= 2);
+  assert.match(service.stdout(), /happy publish failed: happy kv write returned HTTP 503/);
+  await waitFor(() => service.stdout().includes("happy publish recovered"));
 });

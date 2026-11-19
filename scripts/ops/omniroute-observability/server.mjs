@@ -105,10 +105,12 @@ function integerIn(value, min, max) {
  * this machine, and it needs the Happy block, through which requests arrive.
  */
 function validateRefresh(config) {
-  const refresh = config.refresh;
-  if (!refresh || typeof refresh !== "object" || Array.isArray(refresh)) {
+  if (!config.refresh || typeof config.refresh !== "object" || Array.isArray(config.refresh)) {
     throw new Error("config.refresh must be an object");
   }
+  // The settings are validated as the service will use them, defaults applied: an explicit
+  // null is not a default and is refused.
+  const refresh = { ...REFRESH_DEFAULTS, ...config.refresh };
   const happy = config.happy ?? {};
   if (
     typeof happy.artifactId !== "string" ||
@@ -122,7 +124,8 @@ function validateRefresh(config) {
   }
   let url;
   try {
-    url = new URL(refresh.baseUrl ?? REFRESH_DEFAULTS.baseUrl);
+    if (typeof refresh.baseUrl !== "string") throw new TypeError("not a string");
+    url = new URL(refresh.baseUrl);
   } catch {
     throw new Error("config.refresh.baseUrl must be a URL");
   }
@@ -149,7 +152,7 @@ function validateRefresh(config) {
     spacingMs: [0, 10_000],
   };
   for (const [name, [min, max]] of Object.entries(limits)) {
-    if (!integerIn(refresh[name] ?? REFRESH_DEFAULTS[name], min, max)) {
+    if (!integerIn(refresh[name], min, max)) {
       throw new Error(`config.refresh.${name} must be an integer from ${min} to ${max}`);
     }
   }
@@ -298,35 +301,76 @@ export function reportFingerprint(payload) {
     .digest("hex");
 }
 
-function putKv({ socketPath, token, artifactId, value, writeId }) {
-  const body = JSON.stringify({ value, writeId });
-  const path = `/v0/artifacts/${encodeURIComponent(artifactId)}/api/v1/kv/entry?key=${encodeURIComponent(KV_KEY)}`;
+/**
+ * One HTTP exchange with a deadline for the whole of it and a bounded response body. Resolves
+ * with the status and the body text. Rejects, with `kind` "timeout" or "network", when the
+ * deadline passes, the body is too large, or the connection fails or closes before the response
+ * ends. Error messages carry only the label and a system error code, never a path or a body.
+ */
+export function exchange({ client = http, url, options, body, deadlineMs, label }) {
   return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        socketPath,
-        path,
-        method: "PUT",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
-        },
-        timeout: PUBLISH_TIMEOUT_MS,
-      },
-      (res) => {
-        res.resume();
-        res.on("end", () =>
-          res.statusCode >= 200 && res.statusCode < 300
-            ? resolve(res.statusCode)
-            : reject(new Error(`happy kv write returned HTTP ${res.statusCode}`))
-        );
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error("happy kv write timed out")));
-    req.on("error", reject);
+    let settled = false;
+    let req = null;
+    const fail = (kind, detail) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      req?.destroy();
+      reject(Object.assign(new Error(`${label} ${detail}`), { kind }));
+    };
+    const failed = (error) => {
+      const code = typeof error?.code === "string" && /^E[A-Z_]{2,30}$/.test(error.code);
+      fail("network", code ? `failed: ${error.code}` : "failed");
+    };
+    const timer = setTimeout(() => fail("timeout", "timed out"), deadlineMs);
+    req = url ? client.request(url, options) : client.request(options);
+    req.on("response", (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) fail("network", "response too large");
+        else chunks.push(chunk);
+      });
+      res.on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString("utf8") });
+      });
+      res.on("error", failed);
+      res.on("close", () => {
+        if (!res.complete) fail("network", "response interrupted");
+      });
+    });
+    req.on("error", failed);
     req.end(body);
   });
+}
+
+function kvPath(artifactId, key) {
+  return `/v0/artifacts/${encodeURIComponent(artifactId)}/api/v1/kv/entry?key=${encodeURIComponent(key)}`;
+}
+
+async function putKv({ socketPath, token, artifactId, value, writeId }) {
+  const body = JSON.stringify({ value, writeId });
+  const { status } = await exchange({
+    options: {
+      socketPath,
+      path: kvPath(artifactId, KV_KEY),
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+      },
+    },
+    body,
+    deadlineMs: PUBLISH_TIMEOUT_MS,
+    label: "happy kv write",
+  });
+  if (status < 200 || status >= 300) throw new Error(`happy kv write returned HTTP ${status}`);
+  return status;
 }
 
 /** Publishes when the report changes, and at least once per heartbeat so viewers see liveness. */
@@ -355,119 +399,81 @@ export function createPublisher({ write, heartbeatMs = DEFAULT_HEARTBEAT_MS, now
 /**
  * Runs publishes one after another, each with the payload as it is when its turn comes, so a
  * refresh's "running" and its result are both written, in that order, even while a tick's
- * write is still in flight.
+ * write is still in flight. Each call's promise settles with its own publish, so a caller can
+ * tell whether its state went out; a failure does not stop the publishes queued after it.
  */
 export function createPublishQueue({ publish, payload, onResult = () => {} }) {
   let chain = Promise.resolve();
   return function flush() {
-    chain = chain.then(async () => {
+    const run = chain.then(async () => {
       try {
-        onResult(null, await publish(payload()));
+        const result = await publish(payload());
+        onResult(null, result);
+        return result;
       } catch (error) {
         onResult(error);
+        throw error;
       }
     });
-    return chain;
+    chain = run.catch(() => {});
+    return run;
   };
 }
 
-/** Reads a response body up to a bound; a longer one ends the request. */
-function readBody(res, limit, onDone) {
-  const chunks = [];
-  let size = 0;
-  res.on("data", (chunk) => {
-    size += chunk.length;
-    if (size > limit) {
-      res.destroy(new Error("response too large"));
-      return;
-    }
-    chunks.push(chunk);
-  });
-  res.on("end", () => onDone(Buffer.concat(chunks).toString("utf8")));
-}
-
 /** Reads one entry of the artifact's data store, or null when the key holds no value. */
-function getKvEntry({ socketPath, token, artifactId, key }) {
-  const path = `/v0/artifacts/${encodeURIComponent(artifactId)}/api/v1/kv/entry?key=${encodeURIComponent(key)}`;
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        socketPath,
-        path,
-        method: "GET",
-        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-        timeout: KV_READ_TIMEOUT_MS,
-      },
-      (res) => {
-        res.on("error", reject);
-        readBody(res, MAX_RESPONSE_BYTES, (text) => {
-          if (res.statusCode !== 200) {
-            reject(new Error(`happy kv read returned HTTP ${res.statusCode}`));
-            return;
-          }
-          try {
-            resolve(JSON.parse(text)?.entry ?? null);
-          } catch {
-            reject(new Error("happy kv read returned invalid JSON"));
-          }
-        });
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error("happy kv read timed out")));
-    req.on("error", reject);
-    req.end();
+async function getKvEntry({ socketPath, token, artifactId, key }) {
+  const { status, text } = await exchange({
+    options: {
+      socketPath,
+      path: kvPath(artifactId, key),
+      method: "GET",
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    },
+    deadlineMs: KV_READ_TIMEOUT_MS,
+    label: "happy kv read",
   });
+  if (status !== 200) throw new Error(`happy kv read returned HTTP ${status}`);
+  try {
+    return JSON.parse(text)?.entry ?? null;
+  } catch {
+    throw new Error("happy kv read returned invalid JSON");
+  }
 }
 
 /**
  * Asks Omni Route to read one account's quota from the vendor now (GET /api/usage/:id, which
- * persists the reading). Only the status and the `_stale` markers of the answer are kept; the
+ * persists the reading). Only the status and the `_stale` marker of the answer are kept; the
  * body is not returned, logged or published.
  */
-export function gatewayUsageCall({ baseUrl, token, connectionId, timeoutMs }) {
+export async function gatewayUsageCall({ baseUrl, token, connectionId, timeoutMs }) {
   const url = new URL(`/api/usage/${encodeURIComponent(connectionId)}`, baseUrl);
-  const client = url.protocol === "https:" ? https : http;
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const req = client.request(
+  let response;
+  try {
+    response = await exchange({
+      client: url.protocol === "https:" ? https : http,
       url,
-      {
+      options: {
         method: "GET",
         headers: { authorization: `Bearer ${token}`, accept: "application/json" },
       },
-      (res) => {
-        res.on("error", () => finish({ kind: "network" }));
-        readBody(res, MAX_RESPONSE_BYTES, (text) => {
-          const status = res.statusCode;
-          if (status < 200 || status >= 300) return finish({ kind: "http", status });
-          let body = null;
-          try {
-            body = JSON.parse(text);
-          } catch {
-            // A success without a readable body still says the call was accepted.
-          }
-          const stale = body?._stale === true;
-          const rateLimited =
-            stale &&
-            typeof body._staleReason === "string" &&
-            /\b429\b|rate.?limit|too many requests/i.test(body._staleReason);
-          finish({ kind: "ok", stale, rateLimited });
-        });
-      }
-    );
-    const timer = setTimeout(() => {
-      finish({ kind: "timeout" });
-      req.destroy();
-    }, timeoutMs);
-    req.on("error", () => finish({ kind: "network" }));
-    req.end();
-  });
+      deadlineMs: timeoutMs,
+      label: "omni route usage",
+    });
+  } catch (error) {
+    return { kind: error.kind === "timeout" ? "timeout" : "network" };
+  }
+  const { status, text } = response;
+  if (status < 200 || status >= 300) return { kind: "http", status };
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // A success without a readable body still says the call was accepted.
+  }
+  // Omni Route marks `_stale` when Anthropic answered without quotas and the previous reading
+  // was kept. Its `_staleReason` does not say why: after a 429 the build falls back to a legacy
+  // endpoint and reports that endpoint's message instead.
+  return { kind: "ok", stale: body?._stale === true };
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -477,8 +483,9 @@ function refreshReason(result) {
   if (!result) return "não consultada";
   switch (result.kind) {
     case "ok":
-      if (result.rateLimited) return "limite de consultas da Anthropic";
-      if (result.stale) return "a Anthropic não devolveu a cota";
+      // The installed build does not say why a stale answer came back; a 429 from Anthropic's
+      // usage endpoint, or Omni Route's 3-minute wait after one, is the usual cause.
+      if (result.stale) return "a Anthropic não devolveu a cota (provável limite de consultas)";
       return "leitura nova não encontrada no banco";
     case "timeout":
       return "tempo esgotado";
@@ -516,7 +523,10 @@ function commonError(results) {
 /**
  * Serves refresh requests from the panel. A request is a data-store entry whose version is newer
  * than the last one seen; it is served at most once per `minIntervalMs`, one refresh at a time.
- * Every change of state is published through `onChange` before the next step starts.
+ * Every change of state is published through `onChange`; the gateway is called only after the
+ * "running" state has been written, so the panel never misses a refresh that is under way.
+ * Requests seen while a refresh runs are answered as throttled when it ends, whatever the time:
+ * the panel shows only the newest request, so only the newest of them is answered.
  */
 export function createRefresher({
   observer,
@@ -547,8 +557,10 @@ export function createRefresher({
   async function publish() {
     try {
       await onChange();
+      return true;
     } catch {
-      // A failed publish is logged by the queue; the refresh goes on.
+      // The queue logs the failure; the state stays in memory for the next publish.
+      return false;
     }
   }
 
@@ -561,41 +573,32 @@ export function createRefresher({
     }
   }
 
-  async function serve(request) {
+  /** Answers one request; true when it called the gateway. */
+  async function serve(request, throttle) {
     const startedAtMs = now();
     const base = {
       requestVersion: request.version,
       requestedAt: iso(request.updatedAt),
     };
-    if (nextAllowedAtMs !== null && startedAtMs < nextAllowedAtMs) {
+    const answer = (fields) => {
+      last = { ...base, startedAt: null, finishedAt: iso(now()), accounts: [], ...fields };
+    };
+    if (throttle || (nextAllowedAtMs !== null && startedAtMs < nextAllowedAtMs)) {
       observer.poll();
-      last = {
-        ...base,
-        status: "throttled",
-        startedAt: null,
-        finishedAt: iso(now()),
-        accounts: [],
-        error: null,
-      };
+      answer({ status: "throttled", error: null });
       log("refresh throttled");
       await publish();
-      return;
+      return false;
     }
     const credential = token();
     if (credential === null) {
-      last = {
-        ...base,
-        status: "failed",
-        startedAt: null,
-        finishedAt: iso(now()),
-        accounts: [],
-        error: "not_configured",
-      };
+      answer({ status: "failed", error: "not_configured" });
       log("refresh failed: not_configured");
       await publish();
-      return;
+      return false;
     }
 
+    const previousNextAllowedAtMs = nextAllowedAtMs;
     nextAllowedAtMs = startedAtMs + minIntervalMs;
     last = {
       ...base,
@@ -605,7 +608,14 @@ export function createRefresher({
       accounts: [],
       error: null,
     };
-    await publish();
+    if (!(await publish())) {
+      // Nothing is read while the panel cannot be told; the request does not use the interval.
+      nextAllowedAtMs = previousNextAllowedAtMs;
+      answer({ status: "failed", error: null });
+      log("refresh failed: publish");
+      await publish();
+      return false;
+    }
 
     const results = [];
     for (const [index, connectionId] of connections.entries()) {
@@ -634,20 +644,23 @@ export function createRefresher({
         : `refresh ${status} ${count}/${accounts.length}`
     );
     await publish();
+    return true;
   }
 
   async function drain(request) {
     let next = request;
+    let refreshed = false;
     while (next) {
       pending = null;
       try {
-        await serve(next);
+        refreshed = (await serve(next, refreshed)) || refreshed;
       } catch {
         // An unexpected failure must not leave the refresh marked as running.
         if (last?.requestVersion === next.version && last.status === "running") {
           last = { ...last, status: "failed", finishedAt: iso(now()) };
           await publish();
         }
+        refreshed = true;
         log("refresh failed: internal");
       }
       next = pending;
@@ -777,7 +790,8 @@ async function main(configPath) {
     if (pollError !== lastPollError)
       log(pollError ? `poll failed: ${pollError}` : "poll recovered");
     lastPollError = pollError;
-    if (flush) await flush();
+    // A failed write is logged by the queue; the next tick or heartbeat tries again.
+    if (flush) await flush().catch(() => {});
   };
   await tick();
   const timer = setInterval(tick, pollMs);

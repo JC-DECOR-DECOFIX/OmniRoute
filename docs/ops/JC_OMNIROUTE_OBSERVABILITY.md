@@ -189,7 +189,7 @@ store is answered only if it is at most 90 s old; an older one is marked seen.
 
 `baseUrl` must be an `http(s)` loopback origin (`127.0.0.1`, `localhost`, `[::1]`) with no
 credentials, path or query; `tokenFile` is an absolute path; `minIntervalMs` is at least 60000,
-`requestPollMs` 500–10000, `timeoutMs` 5000–60000, `spacingMs` 0–10000. The block needs the `happy`
+`requestPollMs` 500–10000, `timeoutMs` 5000–60000, `spacingMs` 0–10000; an explicit `null` is refused. The block needs the `happy`
 block and a non-empty `authorizedConnections`.
 
 To read an account again, the service calls Omni Route's own endpoint
@@ -205,10 +205,33 @@ nothing is called. The machine CLI token (`x-omniroute-cli-token`) is not used: 
 build (3.8.50, `09966db`) the compiled middleware cannot read the machine id, so the server
 rejects every CLI token.
 
-The accounts are called one at a time, `spacingMs` apart, each with `timeoutMs`. After the last
-call the database is read again, and an account counts as updated when its quota `fetchedAt` is
-at or after the start of the refresh. Only the status code and the `_stale` markers of Omni
-Route's answer are used; its body is not logged or published.
+**What the gateway does on such a call.** The endpoint is Omni Route's, and what it changes is
+Omni Route's own behavior, not the observer's; the observer itself writes nothing. Before
+turning the block on, the operator must accept these effects of
+`fetchLiveProviderLimitsWithOptions` (`src/lib/usage/providerLimits.ts`) on the account read:
+
+- **It may renew the account's OAuth credentials.** The route passes `allowRotatingRefresh:
+true`, and Claude is a rotating-refresh provider (`anthropic-oauth` group,
+  `open-sse/services/refreshSerializer.ts`). When the access token is near expiry, or when the
+  usage read answers 401, Omni Route mints new tokens (serialized per group inside the gateway)
+  and stores them on the connection (`refreshAndUpdateCredentials`). The automatic 70-minute sync
+  (`syncAllProviderLimits`) never does this for Claude.
+- **It may clear a recovered account's transient error state** (`maybeClearRecoveredQuotaState`):
+  `testStatus`, error fields and an ended or quota-recovered cooldown. The automatic sync does the
+  same.
+
+The `refresh` block therefore stays absent until the operator has accepted those effects.
+
+The accounts are called one at a time, `spacingMs` apart; `timeoutMs` bounds each whole call,
+response body included. After the last call the database is read again, and an account counts as
+updated when its quota `fetchedAt` is at or after the start of the refresh. Only the status code
+and the `_stale` marker of Omni Route's answer are used; its body is not logged or published.
+
+The gateway is called only after the `running` state has been written to the artifact. When that
+write fails, nothing is called, the request is answered `failed` with `error: null`, and it does
+not use the interval. Every write and read of the data store has a 10 s deadline for the whole
+exchange, and a response that is cut off counts as a failure, so a stuck daemon cannot stall the
+publishing of later reports.
 
 **Why at most one refresh every two minutes.** Omni Route already waits 180 s per token when
 `/api/oauth/usage` answers 429 (`open-sse/services/claudeUsageCooldown.ts`): Anthropic limits that
@@ -216,8 +239,9 @@ endpoint on a scale of minutes. The automatic sync runs every 70 minutes with 1.
 accounts. Two minutes keeps the manual path at no more than three reads (one per account) every
 two minutes, about 90 an hour in the worst case, and the quota is a whole percentage that moves
 slowly. A request inside the interval does not call the gateway: the database is read again and
-the request is answered as `throttled`. Requests that arrive while a refresh runs are answered
-when it ends, as `throttled`. Only one refresh runs at a time.
+the request is answered as `throttled`. Requests seen while a refresh runs are answered as
+`throttled` when it ends, even if the interval ran out meanwhile; since `last` holds one request,
+only the newest of them is answered. Only one refresh runs at a time.
 
 The result goes out in the published report (and in `GET /internal/omni-route/usage`) as
 `refresh`, and is published as soon as it changes:
@@ -249,14 +273,17 @@ The result goes out in the published report (and in `GET /internal/omni-route/us
 `error` is `null` or one of `not_configured`, `gateway_unreachable`, `gateway_auth_failed` (401 or
 403 for every account), `gateway_timeout` or `gateway_http_<code>`. Per-account reasons are
 fixed Portuguese texts shown by the panel as they are: `em uso exclusivo` (409, the account holds
-an exclusive lease), `limite de consultas da Anthropic` (429, or a stale answer caused by one),
-`a Anthropic não devolveu a cota` (another stale answer), `credencial do painel recusada`
-(401/403), `conta não encontrada no Omni Route` (404), `Omni Route respondeu HTTP <code>`,
-`tempo esgotado`, `Omni Route inacessível`, and `leitura nova não encontrada no banco` (the call
-was accepted but the database shows no newer reading). Without a `refresh` block the report
-carries `"refresh": null` and the request key is never read. The log records only events:
-`refresh requested`, `refresh done 3/3`, `refresh partial 1/3`, `refresh throttled`,
-`refresh failed: <error>`.
+an exclusive lease), `limite de consultas da Anthropic` (a 429 from Omni Route itself),
+`a Anthropic não devolveu a cota (provável limite de consultas)` (a stale answer),
+`credencial do painel recusada` (401/403), `conta não encontrada no Omni Route` (404),
+`Omni Route respondeu HTTP <code>`, `tempo esgotado`, `Omni Route inacessível`, and
+`leitura nova não encontrada no banco` (the call was accepted but the database shows no newer
+reading). A stale answer cannot be told apart further: when `/api/oauth/usage` answers 429, the
+installed build falls back to a legacy endpoint and reports that endpoint's message
+(`open-sse/services/usage/claude.ts`), so the cause is given as probable. Without a `refresh`
+block the report carries `"refresh": null` and the request key is never read. The log records
+only events: `refresh requested`, `refresh done 3/3`, `refresh partial 1/3`,
+`refresh throttled`, `refresh failed: <error>`.
 
 ## Installation on this Mac
 
