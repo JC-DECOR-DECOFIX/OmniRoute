@@ -130,6 +130,11 @@ import {
 } from "./reasoningRouting";
 import { createVirtualAutoCombo, resolveAutoRoutingState } from "./autoRouting";
 import { getComboFailureLogError } from "./comboFailureLogging";
+import {
+  adaptRequestForFallbackModel,
+  withClaudeModelFallback,
+  type ClaudeModelFallback,
+} from "./claudeModelFallback.ts";
 
 // Pipeline integration — wired modules
 import { classify429FromError, type FailureKind } from "@/shared/utils/classify429";
@@ -1250,30 +1255,54 @@ async function handleChatImplementation(
       } catch {}
     }
   }
-  const response = await handleSingleModelChat(
-    body,
-    resolvedModelStr,
-    clientRawRequest,
-    request,
-    null,
-    apiKeyInfo,
-    telemetry,
-    {
-      sessionId,
-      sessionAffinityKey,
-      forceLiveComboTest: isComboLiveTest,
-      forcedConnectionId: requestedConnectionId,
-      correlationId: reqId,
-      conversationId,
-      routingComboId,
-      reasoningDecision,
-      reasoningIntent,
-      reasoningRequestTags: requestRoutingTags.tags,
-      managedLease,
-    },
-    null,
-    false
-  );
+  const singleModelOptions = {
+    sessionId,
+    sessionAffinityKey,
+    forceLiveComboTest: isComboLiveTest,
+    forcedConnectionId: requestedConnectionId,
+    correlationId: reqId,
+    conversationId,
+    routingComboId,
+    reasoningDecision,
+    reasoningIntent,
+    reasoningRequestTags: requestRoutingTags.tags,
+    managedLease,
+  };
+  const singleModel = (
+    requestBody: any,
+    model: string,
+    options: Parameters<typeof handleSingleModelChat>[7] = singleModelOptions
+  ) =>
+    handleSingleModelChat(
+      requestBody,
+      model,
+      clientRawRequest,
+      request,
+      null,
+      apiKeyInfo,
+      telemetry,
+      options,
+      null,
+      false
+    );
+  // Claude continuity pool rate-limited for this model: next model of the configured chain.
+  // Only for a key bound to an explicit account pool, checked with the key the policy used.
+  const keyPool = apiKeyInfo?.allowedConnections;
+  const response = await withClaudeModelFallback(await singleModel(body, resolvedModelStr), {
+    pinned:
+      Boolean(requestedConnectionId) ||
+      Boolean(managedLease) ||
+      isComboLiveTest ||
+      !policy.apiKey ||
+      !Array.isArray(keyPool) ||
+      keyPool.length === 0,
+    isModelAllowed: (fallbackModel) => isModelAllowedForKey(policy.apiKey, fallbackModel),
+    dispatch: (fallbackModel, modelFallback) =>
+      singleModel(adaptRequestForFallbackModel(body, modelFallback.to), fallbackModel, {
+        ...singleModelOptions,
+        modelFallback,
+      }),
+  });
   recordTelemetry(telemetry);
   return withModalityBridgeHeader(
     withConversationId(
@@ -1325,6 +1354,8 @@ async function handleSingleModelChat(
      * the signal used for the actual dispatch, not left unused.
      */
     modelAbortSignal?: AbortSignal | null;
+    /** Set when the continuity pool serves this request with a fallback model. */
+    modelFallback?: ClaudeModelFallback | null;
   } = {},
   comboStrategy: string | null = null,
   isCombo: boolean = false
@@ -1779,11 +1810,20 @@ async function handleSingleModelChat(
               (id) => `${id.slice(0, 8)}...`
             ),
             result: "unavailable",
+            ...(runtimeOptions.modelFallback
+              ? { model_fallback: runtimeOptions.modelFallback }
+              : {}),
             recovery,
             ...(responseHeaders.has("Retry-After")
               ? {
                   retry_after: Number(responseHeaders.get("Retry-After")),
                   retry_after_at: credentials.retryAfter,
+                }
+              : {}),
+            ...(credentials?.poolRateLimit?.allRateLimited
+              ? {
+                  pool_rate_limited: true,
+                  pool_eligible_at: credentials.poolRateLimit.eligibleAt,
                 }
               : {}),
           };
@@ -1974,6 +2014,9 @@ async function handleSingleModelChat(
             sessionAffinityKey: runtimeOptions.sessionAffinityKey ?? null,
             reasoningTransportFallback: runtimeOptions.reasoningTransportFallback ?? "drop",
             managedLease: runtimeOptions.managedLease ?? null,
+            requestedModel: runtimeOptions.modelFallback
+              ? `${provider}/${runtimeOptions.modelFallback.from}`
+              : null,
           },
           runtimeOptions
         );
@@ -2023,6 +2066,9 @@ async function handleSingleModelChat(
               initial: `${attempts[0].slice(0, 8)}...`,
               final: `${credentials.connectionId.slice(0, 8)}...`,
               attempts: attempts.length,
+              ...(runtimeOptions.modelFallback
+                ? { model_fallback: runtimeOptions.modelFallback }
+                : {}),
               result: requestBody.stream === true ? "stream-started" : "completed",
             })
           );

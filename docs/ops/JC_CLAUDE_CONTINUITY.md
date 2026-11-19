@@ -57,7 +57,9 @@ invalid XML comments and must be serialized as a valid plist when installing.
 Set `OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY=true` in this installation's private
 environment file to enable the policy. The default remains off for upstream
 compatibility. Claude requests retain their model, messages and tools. They
-cannot use emergency provider fallback or intra-family model substitution.
+cannot use emergency provider fallback or intra-family model substitution, with
+the single configured exception described in
+[Model fallback when the pool is rate-limited](#model-fallback-when-the-pool-is-rate-limited).
 The live Claude strategy was verified as `priority` and session affinity as `0` ms.
 For native Claude Code model IDs without a provider prefix, explicitly enable the
 existing `preferClaudeCodeForUnprefixedClaudeModels` setting. Together with the
@@ -74,6 +76,59 @@ The normal authorized account selector uses configured priorities, excludes
 terminal states, applies cooldowns, and clears recoverable errors only after
 successful use. Cooldown-aware request restarts are disabled in this mode;
 each selected account is excluded after failure for that request.
+
+### Model fallback when the pool is rate-limited
+
+Authorized by the owner on 2026-11-19 after every account hit Claude Fable 5.2's
+rate limit (`This request would exceed your account's rate limit`) while Opus 5.5
+kept answering on the same accounts: the cached cooldown then refused every Fable
+request at once with `attempts: 0`.
+
+When the pool answers `upstream_accounts_unavailable` for the requested model and
+every eligible account is unavailable for it only because of a rate limit or an
+exhausted quota (live or from the cached per-model cooldown),
+`src/sse/handlers/claudeModelFallback.ts` sends the same request once more for the
+next model of `OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN`. Unset, the chain is
+`claude-fable-5-2>claude-opus-5-5`; links are comma-separated `from>to[>next]`, and
+an empty value or `off` disables it. The fallback model goes through the same
+authorized pool, priority order and per-model cooldowns.
+
+- It never applies to an explicit `x-omniroute-connection` pin, a combo, a managed
+  lease, a combo live test, or a key whose model policy does not allow the target.
+- It applies only to a key bound to an explicit account pool (`allowedConnections`),
+  so a key without one never reaches an account it was not given.
+- The pool judges each account on its recorded state
+  (`src/sse/services/claudePoolRateLimit.ts`), not on the last status seen, and marks
+  the answer `continuity.pool_rate_limited: true` with `pool_eligible_at`, the first
+  instant an account is free again. One account down with a 503 while the others
+  answer 429 is not a pool-wide rate limit. Authentication (401/502), request (400),
+  billing (402), permission (403), 5xx, 529 and timeouts keep their own answer.
+- The pool answers before any output reaches the client, so the switch never splices
+  two responses. After partial output the existing recovery rule applies unchanged.
+- The request keeps its system, tools, `thinking` mode, `tool_use` and `tool_result`.
+  Thinking and redacted-thinking blocks are removed from assistant turns, as the
+  Claude Code CLI itself does when a conversation continues on another model (their
+  signatures belong to the model that produced them); upstream accepts a tool loop
+  whose assistant turn has no thinking block. `max_tokens` is capped to the target
+  model's maximum output. Effort and thinking mode are normalized for the dispatched
+  model by chatCore, as for any request.
+- The answer carries `X-OmniRoute-Effective-Model` and
+  `X-OmniRoute-Model-Fallback: <from>><to>; reason=accounts_rate_limited`; the
+  response `model` is the model that answered, also with the requested-model echo
+  setting on. Continuity log lines include `model_fallback: {from, to, reason}`, and
+  the call log keeps the client's model in `requested_model` next to the serving
+  `model`.
+- If the fallback model is also rate-limited on the whole pool, the client receives
+  the original 429 with `continuity.model_fallback.result: "unavailable"` and the
+  earliest `Retry-After` of the models tried, from each model's `pool_eligible_at`.
+  Any other failure of the fallback model returns the original 429 with
+  `result: "failed"` and the fallback's status.
+
+The per-model wait after this 429 stays the local one hour. On 2026-11-19 the Fable
+limit was still in force when that hour expired (a new 429 at 17:55 UTC on the first
+account), so a shorter wait would only add probes; the fallback bounds the cost of a
+probe to one request per account per hour. Honoring upstream reset hints would need
+the response headers to reach `markAccountUnavailable` and is not part of this change.
 
 The dedicated client's API key must have `allowedConnections` set to the explicitly
 approved IDs, only traffic scope, and Claude model/endpoint restrictions. Existing
