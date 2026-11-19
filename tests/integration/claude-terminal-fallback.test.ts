@@ -15,13 +15,16 @@ const FABLE = "claude-fable-5-2";
 process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY = "true";
 const h = await createChatPipelineHarness("claude-terminal");
 const { updateApiKeyPermissions } = await import("../../src/lib/db/apiKeys.ts");
-const { replaceSyncedAvailableModelsForConnection } = await import("../../src/lib/db/models.ts");
+const { replaceSyncedAvailableModelsForConnection, setModelAlias } =
+  await import("../../src/lib/db/models.ts");
 const { updateProviderConnection } = await import("../../src/lib/db/providers.ts");
 const { clearAllModelLockouts } = await import("../../open-sse/services/accountFallback.ts");
 const { runAuthzPipeline } = await import("../../src/server/authz/pipeline.ts");
 const { getCallLogs } = await import("../../src/lib/usage/callLogs.ts");
 const { markLocalRateLimitError, RATE_LIMIT_QUEUE_FULL_CODE } =
   await import("../../open-sse/services/rateLimitManager/errors.ts");
+const { markClaudeTerminalPool, withClaudeModelFallback } =
+  await import("../../src/sse/handlers/claudeModelFallback.ts");
 test.beforeEach(async () => {
   await h.resetStorage();
   process.env.OMNIROUTE_CLAUDE_TERMINAL_FALLBACK = TARGET;
@@ -320,6 +323,142 @@ test("Fable → Opus → Codex; a mixed Fable pool must still try eligible Opus 
     [...new Set(sent.map(({ model, account }) => `${model}:${account}`))],
     [`${FABLE}:A`, `${FABLE}:B`, `${FABLE}:C`, `${OPUS}:B`, `${OPUS}:C`, `${SOL}:Codex`]
   );
+});
+
+for (const model of ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2-20261101"]) {
+  test(`${model} stays on its own pool even when the Sol grant exists`, async () => {
+    const { key } = await pool();
+    const sent = mockUpstream(({ account }) =>
+      account === "Codex" ? codexSse() : upstreamError(429)
+    );
+    const response = await call(key.key, messages(model));
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("x-omniroute-model-fallback"), null);
+    assert.equal((await response.json()).continuity.attempts, 3);
+    assert.deepEqual(
+      sent.map((item) => item.model),
+      Array(9).fill(model)
+    );
+  });
+}
+
+test("terminal enrollment cannot walk a configured Sonnet or Haiku hop", async () => {
+  const { key } = await pool();
+  process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN = `${FABLE}>claude-sonnet-5-5>claude-haiku-5-5>${OPUS}`;
+  try {
+    const sent = mockUpstream(({ account }) =>
+      account === "Codex" ? codexSse() : upstreamError(429)
+    );
+    const response = await call(key.key, messages(FABLE));
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("x-omniroute-model-fallback"), null);
+    await response.text();
+    assert.deepEqual(
+      sent.map((item) => item.model),
+      Array(9).fill(FABLE)
+    );
+  } finally {
+    delete process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN;
+  }
+});
+
+test("native Opus with a context hint keeps eligibility through canonical resolution", async () => {
+  const { key } = await pool();
+  await h.settingsDb.updateSettings({ preferClaudeCodeForUnprefixedClaudeModels: true });
+  const sent = mockUpstream(({ account }) =>
+    account === "Codex" ? codexSse() : upstreamError(429)
+  );
+  const response = await call(key.key, messages(OPUS, { model: `${OPUS}[1m]` }));
+  assert.equal(response.headers.get("x-omniroute-effective-model"), SOL);
+  await response.text();
+  assert.deepEqual(
+    sent.map((item) => item.model),
+    [...Array(9).fill(OPUS), SOL]
+  );
+});
+
+test("a connection's different default model cannot exhaust Opus for a bare alias", async () => {
+  const { key, connections } = await pool(["claude/*", "canary-opus", TARGET]);
+  await setModelAlias("canary-opus", `claude/${OPUS}`);
+  await updateProviderConnection(connections[0].id, { defaultModel: "claude-sonnet-5-5" });
+  const sent = mockUpstream(({ account }) =>
+    account === "Codex" ? codexSse() : upstreamError(429)
+  );
+  const response = await call(key.key, messages(OPUS, { model: "canary-opus" }));
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get("x-omniroute-model-fallback"), null);
+  await response.text();
+  assert.deepEqual(
+    sent.map((item) => item.model),
+    [...Array(3).fill("claude-sonnet-5-5"), ...Array(6).fill(OPUS)]
+  );
+});
+
+test("an unenrolled key retains the existing configured Claude-only chain", async () => {
+  const { key } = await pool(["claude/*"]);
+  const sonnet = "claude-sonnet-5-5";
+  process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN = `${FABLE}>${sonnet}`;
+  try {
+    const sent = mockUpstream(({ model }) =>
+      model === sonnet ? claudeJson(model) : upstreamError(429)
+    );
+    const response = await call(key.key, messages(FABLE));
+    assert.equal(response.headers.get("x-omniroute-effective-model"), sonnet);
+    await response.text();
+    assert.deepEqual(
+      sent.map((item) => item.model),
+      [...Array(9).fill(FABLE), sonnet]
+    );
+  } finally {
+    delete process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN;
+  }
+});
+
+test("a Fable alias resolves before the mandatory Opus hop", async () => {
+  const { key } = await pool(["claude/*", "canary-fable", TARGET]);
+  await setModelAlias("canary-fable", `claude/${FABLE}`);
+  const sent = mockUpstream(({ account }) =>
+    account === "Codex" ? codexSse() : upstreamError(429)
+  );
+  const response = await call(key.key, messages(FABLE, { model: "canary-fable" }));
+  assert.equal(response.headers.get("x-omniroute-effective-model"), SOL);
+  await response.text();
+  assert.deepEqual(
+    sent.map((item) => item.model),
+    [...Array(9).fill(FABLE), ...Array(9).fill(OPUS), SOL]
+  );
+});
+
+test("attested Opus cannot compensate for an unattested Fable pool", async () => {
+  const poolAnswer = (model: string) =>
+    Response.json(
+      {
+        continuity: {
+          provider: "claude",
+          mode: "authorized-pool",
+          requested_model: model,
+          upstream_status: 429,
+          pool_rate_limited: true,
+        },
+      },
+      { status: 429, headers: { "x-omniroute-continuity-status": "accounts-unavailable" } }
+    );
+  const fable = poolAnswer(FABLE);
+  const opus = poolAnswer(OPUS);
+  markClaudeTerminalPool(opus, OPUS, "accounts_rate_limited");
+  const attempted: string[] = [];
+  const response = await withClaudeModelFallback(fable, {
+    terminal: true,
+    pinned: false,
+    isModelAllowed: async () => true,
+    dispatch: async (model) => {
+      attempted.push(model);
+      return model === `claude/${OPUS}` ? opus : codexSse();
+    },
+  });
+  assert.equal(response.status, 429);
+  await response.text();
+  assert.deepEqual(attempted, [`claude/${OPUS}`]);
 });
 
 test("rejected Codex returns the original Claude verdict", async () => {

@@ -10,8 +10,13 @@ mixed outage also walks the configured Claude model chain (Fable → Opus by def
 admission/limiter pressure, client errors, explicit pins, combo routing, managed leases,
 and aborts or streams already delivering output do not trigger the cross-provider hop.
 Local proxy failures, renewal interruptions and timeouts are not upstream account evidence.
-Fable cannot skip Opus: a disabled chain or a grant that denies Opus blocks the hop.
-A direct Opus request does not require a Fable attempt.
+Only requests resolved to the canonical Claude subscription IDs `claude-opus-5-5` and
+`claude-fable-5-2` can reach Sol. Existing aliases and context hints qualify only if they
+resolve to one of those exact IDs and the key already permits the alias. A connection
+default that changes the dispatched model cannot count as proof of exhaustion. Fable
+cannot skip Opus: a disabled or divergent chain, or a grant that denies Opus, blocks the
+terminal hop. A direct Opus request does not require a Fable attempt. Other models and
+keys not enrolled in terminal fallback keep the configured Claude-only routing behavior.
 An ambiguous account selection failure (including a provider breaker with no per-account
 verdict for this request) fails closed. If Codex rejects the request before it starts
 responding, the gateway keeps the original Claude error and reports the terminal status in

@@ -1,6 +1,7 @@
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { getRawProviderConnections } from "@/lib/db/providers";
 import { getModelLockoutInfo } from "@omniroute/open-sse/services/accountFallback.ts";
+import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
 
 const QUOTA_LOCKS = new Set(["quota_exhausted", "rate_limit_exceeded", "rate_limited"]);
 const TERMINAL_STATES = new Set(["credits_exhausted", "banned", "expired"]);
@@ -13,6 +14,7 @@ export function canExhaustClaudeAccount(status: number): boolean {
 /** Only real account evidence counts, not the last error or a null selector result. */
 export async function describeClaudeTerminalPool(
   model: string,
+  modelStr: string,
   allowedIds: string[],
   attempts: ReadonlyMap<string, number>,
   poolRateLimited: boolean
@@ -20,6 +22,7 @@ export async function describeClaudeTerminalPool(
   const rows = (
     await getRawProviderConnections({ provider: "claude" }, undefined, undefined, [
       "id",
+      "default_model",
       "is_active",
       "test_status",
       "error_code",
@@ -35,6 +38,8 @@ export async function describeClaudeTerminalPool(
   // An empty/misconfigured pool is not an outage. Do not turn revoked access into failover.
   if (rows.length === 0) return null;
   const statuses = rows.map((row) => {
+    const defaultModel = typeof row.defaultModel === "string" ? row.defaultModel : null;
+    if (resolveBareModelToConnectionDefault(modelStr, model, defaultModel) !== model) return 0;
     const attempted = attempts.get(String(row.id));
     if (attempted !== undefined) return attempted;
     if (TERMINAL_STATES.has(String(row.testStatus))) return 401;

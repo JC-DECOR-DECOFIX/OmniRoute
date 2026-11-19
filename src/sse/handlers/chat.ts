@@ -134,6 +134,7 @@ import { getComboFailureLogError } from "./comboFailureLogging";
 import {
   adaptRequestForFallbackModel,
   CLAUDE_TERMINAL_TARGET,
+  isClaudeTerminalSource,
   markClaudeTerminalPool,
   withClaudeModelFallback,
   type ClaudeModelFallback,
@@ -1534,6 +1535,11 @@ async function handleSingleModelChat(
   })();
   const claudeAccountContinuityOnly =
     provider === "claude" && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true";
+  const terminalPoolEnabled =
+    claudeAccountContinuityOnly &&
+    runtimeOptions.terminalFallbackEnabled &&
+    isClaudeTerminalSource(model) &&
+    (!runtimeOptions.modelFallback || runtimeOptions.modelFallback.to === model);
   const terminalDispatch = runtimeOptions.modelFallback?.provider === "codex";
   if (terminalDispatch && (provider !== "codex" || modelStr !== `${provider}/${model}`)) {
     return errorResponse(503, "Terminal fallback target is not the configured Codex model");
@@ -1924,7 +1930,7 @@ async function handleSingleModelChat(
             }
           );
           if (
-            runtimeOptions.terminalFallbackEnabled &&
+            terminalPoolEnabled &&
             !isCombo &&
             !comboName &&
             !hasForcedConnection &&
@@ -1934,11 +1940,12 @@ async function handleSingleModelChat(
           ) {
             const verdict = await describeClaudeTerminalPool(
               model,
+              modelStr,
               effectiveAllowedConnections,
               terminalAttempts,
               credentials?.poolRateLimit?.allRateLimited === true
             );
-            if (verdict) markClaudeTerminalPool(poolResponse, verdict);
+            if (verdict) markClaudeTerminalPool(poolResponse, model, verdict);
           }
           return poolResponse;
         }
@@ -2130,11 +2137,7 @@ async function handleSingleModelChat(
       const { result, tlsFingerprintUsed } = execution;
       if (claudeAccountContinuityOnly) continuityAttemptedConnections.add(credentials.connectionId);
       if (!result.success) releaseOAuthSession();
-      if (
-        !result.success &&
-        runtimeOptions.terminalFallbackEnabled &&
-        claudeAccountContinuityOnly
-      ) {
+      if (!result.success && terminalPoolEnabled) {
         const status = Number(result.status);
         if (
           requestSignal?.aborted ||
@@ -2146,7 +2149,7 @@ async function handleSingleModelChat(
         }
         terminalAttempts.set(
           credentials.connectionId,
-          isClaudeUpstreamAccountFailure(result.response) ? status : 0
+          effectiveModel === model && isClaudeUpstreamAccountFailure(result.response) ? status : 0
         );
       }
 
@@ -2624,7 +2627,7 @@ async function handleSingleModelChat(
         ));
       const failedStatus = renewalPending ? HTTP_STATUS.SERVICE_UNAVAILABLE : result.status;
       const failedError = renewalPending ? CLAUDE_RENEWAL_PENDING_REASON : result.error;
-      if (renewalPending && runtimeOptions.terminalFallbackEnabled) {
+      if (renewalPending && terminalPoolEnabled) {
         terminalAttempts.set(credentials.connectionId, 0);
       }
 

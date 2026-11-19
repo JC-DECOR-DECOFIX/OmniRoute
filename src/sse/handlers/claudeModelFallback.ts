@@ -19,7 +19,13 @@ import type { TerminalReason } from "../services/claudeTerminalPool";
 import * as log from "../utils/logger";
 
 /** The JC installation's default chain, used when the variable is not set. */
-export const DEFAULT_CLAUDE_MODEL_FALLBACK_CHAIN = "claude-fable-5-2>claude-opus-5-5";
+const FABLE = "claude-fable-5-2";
+const OPUS = "claude-opus-5-5";
+export const DEFAULT_CLAUDE_MODEL_FALLBACK_CHAIN = `${FABLE}>${OPUS}`;
+
+export function isClaudeTerminalSource(model: unknown): model is typeof FABLE | typeof OPUS {
+  return model === FABLE || model === OPUS;
+}
 
 /** Response headers that name the model that actually answered. */
 export const EFFECTIVE_MODEL_HEADER = "X-OmniRoute-Effective-Model";
@@ -35,10 +41,14 @@ export type ClaudeModelFallback = {
 type JsonRecord = Record<string, unknown>;
 type PoolRateLimit = { body: JsonRecord; continuity: JsonRecord };
 export const CLAUDE_TERMINAL_TARGET = "codex/gpt-6.2-sol";
-const terminalPools = new WeakMap<Response, TerminalReason>();
+const terminalPools = new WeakMap<Response, { model: string; reason: TerminalReason }>();
 
-export function markClaudeTerminalPool(response: Response, reason: TerminalReason): void {
-  terminalPools.set(response, reason);
+export function markClaudeTerminalPool(
+  response: Response,
+  model: string,
+  reason: TerminalReason
+): void {
+  if (isClaudeTerminalSource(model)) terminalPools.set(response, { model, reason });
 }
 
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,79}$/i;
@@ -241,20 +251,30 @@ export async function withClaudeModelFallback(
     return response;
   }
   const firstLimited = await readPoolRateLimit(response);
-  let terminalReason = context.terminal ? terminalPools.get(response) : undefined;
-  const first = firstLimited ?? (terminalReason ? await readPoolAnswer(response) : null);
+  const originalProof = context.terminal ? terminalPools.get(response) : undefined;
+  const first = firstLimited ?? (originalProof ? await readPoolAnswer(response) : null);
   if (!first) return response;
 
   const chain =
     context.chain ??
     parseClaudeModelFallbackChain(process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN);
-  const requested = String(first.continuity.requested_model).toLowerCase();
+  const resolved = first.continuity.requested_model;
+  const terminalRoute = context.terminal === true && isClaudeTerminalSource(resolved);
+  let terminalReason =
+    terminalRoute && originalProof?.model === resolved ? originalProof?.reason : undefined;
+  const requested = String(resolved).toLowerCase();
   const limited: PoolRateLimit[] = firstLimited ? [firstLimited] : [];
   const tried: string[] = [];
   const visited = new Set([requested]);
   let current = requested;
 
   for (let next = chain.get(current); next && !visited.has(next); next = chain.get(current)) {
+    // The explicitly enrolled path can only walk Fable → Opus. A divergent
+    // operator chain is not evidence of complete Claude exhaustion.
+    if (terminalRoute && (current !== FABLE || next !== OPUS)) {
+      terminalReason = undefined;
+      break;
+    }
     if (context.signal?.aborted) return response;
     visited.add(next);
     if (!(await context.isModelAllowed(`claude/${next}`))) {
@@ -299,7 +319,8 @@ export async function withClaudeModelFallback(
       });
     }
     const nextLimited = await readPoolRateLimit(fallbackResponse);
-    const nextTerminal = context.terminal ? terminalPools.get(fallbackResponse) : undefined;
+    const nextProof = terminalRoute ? terminalPools.get(fallbackResponse) : undefined;
+    const nextTerminal = nextProof?.model === next ? nextProof.reason : undefined;
     if (!nextLimited && !nextTerminal) {
       // Any other failure of the fallback model is not the client's model's answer: the client
       // keeps the honest rate-limit answer for the model it asked for.
@@ -323,14 +344,16 @@ export async function withClaudeModelFallback(
     }
     await fallbackResponse.body?.cancel().catch(() => {});
     if (nextLimited) limited.push(nextLimited);
-    terminalReason = nextTerminal;
+    // Do not replace missing evidence for the original pool with evidence for
+    // Opus. The legacy 429 path may try Opus without a terminal attestation.
+    terminalReason = terminalReason ? nextTerminal : undefined;
     current = next;
   }
 
   if (
     terminalReason &&
+    current === OPUS &&
     !chain.has(current) &&
-    (requested !== "claude-fable-5-2" || tried.includes("claude-opus-5-5")) &&
     !context.signal?.aborted &&
     (await context.isModelAllowed(CLAUDE_TERMINAL_TARGET)) &&
     !context.signal?.aborted
