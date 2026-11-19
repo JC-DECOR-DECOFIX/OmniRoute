@@ -899,8 +899,8 @@ function refreshHarness({
     callGateway: async ({ token: sent, connectionId, timeoutMs }) => {
       calls.push({ token: sent, connectionId, timeoutMs, at: clock });
       if (gate) await gate.promise;
-      clock += 500;
       const result = results[connectionId] ?? { kind: "ok", stale: false };
+      clock += result.delayMs ?? 500;
       if (result.kind === "ok" && !result.stale && !result.noWrite)
         fetchedAt.set(connectionId, clock);
       return result;
@@ -1974,4 +1974,136 @@ test("an exchange whose request cannot be created fails like a network error", a
     (error) => error.kind === "network" && error.message.startsWith("omni route usage")
   );
   assert.ok(Date.now() - started < 1_000);
+});
+
+// Regressions from the fourth independent review of PR #12.
+
+test("after a restore the first request read still has to be recent", async () => {
+  const h = refreshHarness();
+  h.refresher.restore({
+    nextAllowedAt: null,
+    last: {
+      requestVersion: version(1),
+      status: "done",
+      startedAt: new Date(NOW - 600_000).toISOString(),
+      finishedAt: new Date(NOW - 595_000).toISOString(),
+      accounts: [],
+    },
+  });
+  // Newer than the one answered, but made 100 s ago while the service was down.
+  h.refresher.offer(h.entry(2, 100_000));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.refresher.state().last.requestVersion, version(1));
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+});
+
+test("a late timeout restarts the interval at the timeout", async () => {
+  const slow = { kind: "ok", stale: false, delayMs: 29_000 };
+  const h = refreshHarness({
+    results: { [A]: slow, [B]: slow, [C]: { kind: "timeout", delayMs: 30_000 } },
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const timedOutAt = h.now();
+  assert.equal(h.refresher.state().last.status, "partial");
+  assert.equal(h.refresher.state().nextAllowedAt, new Date(timedOutAt + 120_000).toISOString());
+  h.advance(100_000);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.equal(h.refresher.state().last.status, "throttled");
+});
+
+test("the service publishes nothing and answers nothing until its last state is read", async (t) => {
+  const { dir, write } = privateDir(t);
+  const gateway = await fakeGateway(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const answeredAt = Date.now() - 5_000;
+  const previous = {
+    schema: "omni-route-usage/v1",
+    refresh: {
+      minIntervalMs: 120_000,
+      nextAllowedAt: new Date(answeredAt + 120_000).toISOString(),
+      last: {
+        requestVersion: version(7),
+        requestedAt: new Date(answeredAt).toISOString(),
+        status: "done",
+        startedAt: new Date(answeredAt).toISOString(),
+        finishedAt: new Date(answeredAt + 3_000).toISOString(),
+        accounts: [{ shortId: "aaaaaaaa", updated: true, reason: null }],
+        error: null,
+      },
+    },
+  };
+  const request = {
+    key: REFRESH_REQUEST_KEY,
+    value: { schema: REFRESH_REQUEST_SCHEMA },
+    deleted: false,
+    version: version(7),
+    updatedAt: answeredAt,
+  };
+  const socketPath = join(dir, "d.sock");
+  const events = [];
+  let usageReads = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const json = (status, value) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(value));
+      };
+      if (req.method === "PUT") {
+        events.push({ put: JSON.parse(body).value });
+        return json(200, { entry: {}, replayed: false });
+      }
+      if (req.url.endsWith("refresh-request")) {
+        events.push("request read");
+        return json(200, { entry: request, cursor: null });
+      }
+      usageReads += 1;
+      events.push(`usage read ${usageReads}`);
+      // The daemon is draining on the first read, then answers.
+      if (usageReads === 1) return json(503, { error: "draining" });
+      return json(200, { entry: { key: "omni-route/usage", value: previous }, cursor: null });
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      authorizedConnections: [A],
+      listen: { port: await freePort() },
+      pollIntervalMs: 1_000,
+      happy: { socketPath, tokenFile: write("happy", "daemon-token"), artifactId: "art1" },
+      refresh: {
+        baseUrl: gateway.baseUrl,
+        tokenFile: write("omniroute-access-token", GATEWAY_TOKEN),
+        requestPollMs: 500,
+      },
+    })
+  );
+  const service = startService(t, configPath);
+  await waitFor(() => events.some((e) => e.put));
+  await waitFor(() => events.filter((e) => e === "request read").length >= 2);
+  const firstPut = events.findIndex((e) => e.put);
+  assert.ok(events.indexOf("usage read 2") < firstPut, JSON.stringify(events.slice(0, 5)));
+  // No request is read, and nothing is published, before the read that succeeds.
+  assert.equal(events.slice(0, events.indexOf("usage read 2")).includes("request read"), false);
+  assert.deepEqual(events[firstPut].put.refresh, previous.refresh);
+  assert.equal(gateway.seen.length, 0, "the answered request is not read again");
+  assert.match(service.stdout(), /refresh state not restored: happy kv read returned HTTP 503/);
+  assert.match(service.stdout(), /refresh state restored/);
 });

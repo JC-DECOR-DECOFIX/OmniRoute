@@ -658,7 +658,12 @@ export function createRefresher({
       // Giving up on the answer does not stop Omni Route's own read, which may still be renewing
       // that account's credentials. No other account is read in this round; the minimum interval,
       // counted from the start, leaves it time to finish before the next one.
-      if (result.kind === "timeout") break;
+      if (result.kind === "timeout") {
+        // The interval starts again at the timeout, so the gateway keeps the whole margin
+        // even when the timeout came late in the round.
+        nextAllowedAtMs = Math.max(nextAllowedAtMs, now() + minIntervalMs);
+        break;
+      }
     }
     observer.poll();
     const report = observer.payload();
@@ -719,16 +724,15 @@ export function createRefresher({
 
   /** Takes the store's current entry for the request key; `null` when it holds no value. */
   function offer(entry) {
+    // Only the first read of the request key after a start applies the age limit, whatever
+    // was restored before it.
+    const wasPrimed = primed;
+    primed = true;
     const version = typeof entry?.version === "string" ? entry.version : null;
-    if (version === null || !UUID_RE.test(version)) {
-      primed = true;
-      return;
-    }
+    if (version === null || !UUID_RE.test(version)) return;
     if (lastSeen !== null && version <= lastSeen) return;
     lastSeen = version;
     const updatedAt = Number.isFinite(entry.updatedAt) ? entry.updatedAt : null;
-    const wasPrimed = primed;
-    primed = true;
     if (entry.deleted || entry.value?.schema !== REFRESH_REQUEST_SCHEMA || updatedAt === null) {
       return;
     }
@@ -765,7 +769,6 @@ export function createRefresher({
       : null;
     if (status === null) return;
     lastSeen = version;
-    primed = true;
     const nextMs = time(previous.nextAllowedAt);
     nextAllowedAtMs = nextMs !== null && nextMs > at ? nextMs : null;
     const startedAtMs = time(prior.startedAt);
@@ -867,6 +870,7 @@ async function main(configPath) {
   }
 
   let readRequest = null;
+  let ensureRestored = async () => true;
   if (refresh && flush) {
     const { socketPath, tokenFile, artifactId } = config.happy;
     refresher = createRefresher({
@@ -886,24 +890,38 @@ async function main(configPath) {
       log,
     });
     if (debugLogsRequests()) log("refresh disabled while NODE_DEBUG is set");
-    // The state published before a restart, read before this process publishes anything.
-    try {
-      const previous = await getKvEntry({
-        socketPath,
-        token: readSecretFile(tokenFile),
-        artifactId,
-        key: KV_KEY,
-      });
-      refresher.restore(previous?.deleted ? null : previous?.value?.refresh);
-    } catch (error) {
-      log(`refresh state not restored: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    // The state published before a restart must be taken back before this process publishes
+    // anything or answers a request. A failed read is retried on every tick and request poll;
+    // only a read that succeeds, with or without a previous report, lets either go ahead.
+    let restored = false;
+    let lastRestoreError = null;
+    ensureRestored = coalesce(async () => {
+      if (restored) return true;
+      try {
+        const previous = await getKvEntry({
+          socketPath,
+          token: readSecretFile(tokenFile),
+          artifactId,
+          key: KV_KEY,
+        });
+        refresher.restore(previous?.deleted ? null : previous?.value?.refresh);
+        restored = true;
+        if (lastRestoreError) log("refresh state restored");
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== lastRestoreError) log(`refresh state not restored: ${message}`);
+        lastRestoreError = message;
+        return false;
+      }
+    });
     let reading = false;
     let lastReadError = null;
     readRequest = async () => {
       if (reading) return;
       reading = true;
       try {
+        if (!(await ensureRestored())) return;
         const entry = await getKvEntry({
           socketPath,
           token: readSecretFile(tokenFile),
@@ -934,7 +952,7 @@ async function main(configPath) {
     if (pollError !== lastPollError)
       log(pollError ? `poll failed: ${pollError}` : "poll recovered");
     lastPollError = pollError;
-    if (publishTick) await publishTick();
+    if (publishTick && (await ensureRestored())) await publishTick();
   };
   await tick();
   const timer = setInterval(tick, pollMs);

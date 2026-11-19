@@ -239,16 +239,21 @@ and the `_stale` marker of Omni Route's answer are used; its body is not logged 
 A timeout only ends the wait: the route does not cancel its own read, which may still be
 renewing that account's credentials. So a timeout ends the round, the accounts after it are not
 read (`não consultada: rodada interrompida por tempo esgotado`), and with no account updated the
-round fails with `gateway_timeout`. The minimum interval, counted from the start of the round,
-leaves the gateway at least `minIntervalMs - timeoutMs` (90 s by default) to finish before the
-next round. Omni Route also serializes credential renewals of Claude accounts in its own process.
+round fails with `gateway_timeout`. The minimum interval then starts again at the timeout, and
+`nextAllowedAt` says so, so the next round waits a whole `minIntervalMs` (120 s) after it. That
+lowers the chance of two reads of the same account overlapping in the gateway; it does not prove
+the first one ended. Omni Route also serializes credential renewals of Claude accounts in its own
+process.
 
 When the service starts, before it publishes anything, it reads its own last report from the
 artifact and takes back the refresh state: the request it last answered is not answered again,
 and the interval stays where it was. A refresh that was running when the service stopped is
 reported `failed` and not repeated. That report sits in a store the artifact's viewers can write,
 so only well-formed values are taken back: a request version from the future, an interval more
-than one interval ahead, or an unknown status is ignored, and texts are sanitized again.
+than one interval ahead, or an unknown status is ignored, and texts are sanitized again. Until
+that read succeeds (a store with no previous report counts), nothing is published and no
+request is read; it is retried on every tick and request poll. The first read of the request key
+after a start still ignores a request older than 90 s, whatever was taken back.
 
 While `NODE_DEBUG` is set, Node may print request headers on stderr, so the gateway credential
 is not read at all and requests are answered `not_configured`.
