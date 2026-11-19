@@ -9,13 +9,13 @@
  * next model of `OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN`, through the same authorized pool,
  * priority order and per-model cooldowns.
  *
- * It never applies to an explicit connection pin, a combo, a managed lease, a key that may not use
- * the target model, or any failure other than the pool-wide 429: authentication, request errors,
- * 5xx and timeouts keep their own answer. The pool answers before any output reaches the client,
- * so the switch never splices two responses together.
+ * An independently opt-in Messages policy may extend this to proven upstream account outages.
+ * It walks the same Claude chain before making a single terminal Codex hop. Local pressure,
+ * request errors and emitted output are not evidence of an exhausted pool.
  */
 
 import { getModelSpec } from "@/shared/constants/modelSpecs.ts";
+import type { TerminalReason } from "../services/claudeTerminalPool";
 import * as log from "../utils/logger";
 
 /** The JC installation's default chain, used when the variable is not set. */
@@ -28,11 +28,18 @@ export const MODEL_FALLBACK_HEADER = "X-OmniRoute-Model-Fallback";
 export type ClaudeModelFallback = {
   from: string;
   to: string;
-  reason: "accounts_rate_limited";
+  reason: TerminalReason;
+  provider?: "codex";
 };
 
 type JsonRecord = Record<string, unknown>;
 type PoolRateLimit = { body: JsonRecord; continuity: JsonRecord };
+export const CLAUDE_TERMINAL_TARGET = "codex/gpt-6.2-sol";
+const terminalPools = new WeakMap<Response, TerminalReason>();
+
+export function markClaudeTerminalPool(response: Response, reason: TerminalReason): void {
+  terminalPools.set(response, reason);
+}
 
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,79}$/i;
 const DISABLED = /^(?:off|none|false|0)$/i;
@@ -69,6 +76,15 @@ async function readPoolRateLimit(response: Response): Promise<PoolRateLimit | nu
   ) {
     return null;
   }
+  const pool = await readPoolAnswer(response);
+  if (pool?.continuity.upstream_status !== 429 || pool.continuity.pool_rate_limited !== true) {
+    return null;
+  }
+  return pool;
+}
+
+async function readPoolAnswer(response: Response): Promise<PoolRateLimit | null> {
+  if (response.headers.get("x-omniroute-continuity-status") !== "accounts-unavailable") return null;
   let body: JsonRecord | null = null;
   try {
     body = asRecord(JSON.parse(await response.clone().text()));
@@ -80,11 +96,9 @@ async function readPoolRateLimit(response: Response): Promise<PoolRateLimit | nu
     !body ||
     !continuity ||
     continuity.provider !== "claude" ||
-    continuity.upstream_status !== 429 ||
     continuity.mode !== "authorized-pool" ||
-    // The per-account verdict (src/sse/services/claudePoolRateLimit.ts), not the last status.
-    continuity.pool_rate_limited !== true ||
-    typeof continuity.requested_model !== "string"
+    typeof continuity.requested_model !== "string" ||
+    !MODEL_ID.test(continuity.requested_model)
   ) {
     return null;
   }
@@ -219,24 +233,29 @@ export async function withClaudeModelFallback(
     isModelAllowed: (modelStr: string) => Promise<boolean>;
     dispatch: (modelStr: string, modelFallback: ClaudeModelFallback) => Promise<Response>;
     chain?: Map<string, string>;
+    terminal?: boolean;
+    signal?: AbortSignal;
   }
 ): Promise<Response> {
   if (process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY !== "true" || context.pinned) {
     return response;
   }
-  const first = await readPoolRateLimit(response);
+  const firstLimited = await readPoolRateLimit(response);
+  let terminalReason = context.terminal ? terminalPools.get(response) : undefined;
+  const first = firstLimited ?? (terminalReason ? await readPoolAnswer(response) : null);
   if (!first) return response;
 
   const chain =
     context.chain ??
     parseClaudeModelFallbackChain(process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN);
   const requested = String(first.continuity.requested_model).toLowerCase();
-  const limited: PoolRateLimit[] = [first];
+  const limited: PoolRateLimit[] = firstLimited ? [firstLimited] : [];
   const tried: string[] = [];
   const visited = new Set([requested]);
   let current = requested;
 
   for (let next = chain.get(current); next && !visited.has(next); next = chain.get(current)) {
+    if (context.signal?.aborted) return response;
     visited.add(next);
     if (!(await context.isModelAllowed(`claude/${next}`))) {
       log.warn(
@@ -244,16 +263,22 @@ export async function withClaudeModelFallback(
         JSON.stringify({
           provider: "claude",
           requested_model: requested,
-          model_fallback: { from: requested, to: next, reason: "accounts_rate_limited" },
+          model_fallback: {
+            from: requested,
+            to: next,
+            reason: terminalReason ?? "accounts_rate_limited",
+          },
           result: "fallback-not-allowed-for-key",
         })
       );
+      terminalReason = undefined;
       break;
     }
+    if (context.signal?.aborted) return response;
     const modelFallback: ClaudeModelFallback = {
       from: requested,
       to: next,
-      reason: "accounts_rate_limited",
+      reason: terminalReason ?? "accounts_rate_limited",
     };
     tried.push(next);
     log.warn(
@@ -270,11 +295,12 @@ export async function withClaudeModelFallback(
       void response.body?.cancel().catch(() => {});
       return withHeaders(fallbackResponse, {
         [EFFECTIVE_MODEL_HEADER]: next,
-        [MODEL_FALLBACK_HEADER]: `${requested}>${next}; reason=accounts_rate_limited`,
+        [MODEL_FALLBACK_HEADER]: `${requested}>${next}; reason=${modelFallback.reason}`,
       });
     }
     const nextLimited = await readPoolRateLimit(fallbackResponse);
-    if (!nextLimited) {
+    const nextTerminal = context.terminal ? terminalPools.get(fallbackResponse) : undefined;
+    if (!nextLimited && !nextTerminal) {
       // Any other failure of the fallback model is not the client's model's answer: the client
       // keeps the honest rate-limit answer for the model it asked for.
       await fallbackResponse.body?.cancel().catch(() => {});
@@ -296,15 +322,63 @@ export async function withClaudeModelFallback(
       );
     }
     await fallbackResponse.body?.cancel().catch(() => {});
-    limited.push(nextLimited);
+    if (nextLimited) limited.push(nextLimited);
+    terminalReason = nextTerminal;
     current = next;
   }
 
+  if (
+    terminalReason &&
+    !chain.has(current) &&
+    (requested !== "claude-fable-5-2" || tried.includes("claude-opus-5-5")) &&
+    !context.signal?.aborted &&
+    (await context.isModelAllowed(CLAUDE_TERMINAL_TARGET)) &&
+    !context.signal?.aborted
+  ) {
+    const modelFallback: ClaudeModelFallback = {
+      from: requested,
+      to: "gpt-6.2-sol",
+      provider: "codex",
+      reason: terminalReason,
+    };
+    log.warn(
+      "CLAUDE_CONTINUITY",
+      JSON.stringify({ result: "switching-provider", model_fallback: modelFallback })
+    );
+    const fallbackResponse = await context.dispatch(CLAUDE_TERMINAL_TARGET, modelFallback);
+    if (fallbackResponse.ok) {
+      void response.body?.cancel().catch(() => {});
+      return withHeaders(fallbackResponse, {
+        [EFFECTIVE_MODEL_HEADER]: modelFallback.to,
+        [MODEL_FALLBACK_HEADER]: `${requested}>${modelFallback.to}; reason=${modelFallback.reason}`,
+      });
+    }
+    void fallbackResponse.body?.cancel().catch(() => {});
+    log.warn(
+      "CLAUDE_CONTINUITY",
+      JSON.stringify({
+        result: "terminal-fallback-failed",
+        status: fallbackResponse.status,
+        model_fallback: modelFallback,
+      })
+    );
+    return poolAnswer(
+      response,
+      first,
+      {
+        ...modelFallback,
+        tried: [...tried, modelFallback.to],
+        result: "failed",
+        status: fallbackResponse.status,
+      },
+      limited
+    );
+  }
   if (tried.length === 0) return response;
   const exhausted = {
     from: requested,
     to: tried[tried.length - 1],
-    reason: "accounts_rate_limited",
+    reason: terminalReason ?? "accounts_rate_limited",
     tried,
     result: "unavailable",
   };

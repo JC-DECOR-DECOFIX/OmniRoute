@@ -8,6 +8,7 @@ import { resolveChatCoreRequestSetup } from "./chatCore/requestSetup.ts";
 import { normalizeOpenAICompatibleTools } from "./chatCore/openAICompatibleTools.ts";
 import { buildFailureUsageRecord } from "./chatCore/failureUsage.ts";
 import { estimateFinalInputTokens } from "./chatCore/contextEstimation.ts";
+import { markClaudeUpstreamAccountFailure } from "../utils/claudeUpstreamAccountFailure.ts";
 import {
   extractSystemRoleMessages,
   relocateDirectiveOnlyMessages,
@@ -500,6 +501,7 @@ export async function handleChatCore({
   skipResourcePressureGuard = false,
   reasoningTransportFallback = "drop",
   managedLease = null,
+  terminalClaudeFallback = false,
 }) {
   let { provider, model, extendedContext } = modelInfo;
   if (!skipResourcePressureGuard) {
@@ -943,7 +945,9 @@ export async function handleChatCore({
       : null;
   // Auto-echo the listing-valid form for bare requests to noAuth catalog
   // providers so clients validating response.model against /v1/models don't warn.
-  echoModel = resolveNoAuthEchoModel(requestedModel, provider) ?? echoModel;
+  echoModel = terminalClaudeFallback
+    ? model
+    : (resolveNoAuthEchoModel(requestedModel, provider) ?? echoModel);
   const detailedLoggingEnabled =
     !noLogEnabled &&
     (settings.call_log_pipeline_enabled === true ||
@@ -1005,6 +1009,7 @@ export async function handleChatCore({
       noLogEnabled,
       correlationId,
       modelPinned,
+      terminalClaudeFallback,
       // Resolved conversationId (open-sse/services/conversationTracker.ts) wins when
       // present — it's populated for every request now, not just ones where the
       // client explicitly sent x-omniroute-session-id. The raw header remains a
@@ -1117,7 +1122,7 @@ export async function handleChatCore({
   });
   effectiveServiceTier = resolveEffectiveServiceTier(body);
   setGeminiThoughtSignatureMode(settings.antigravitySignatureCacheMode);
-  const semanticCacheEnabled = settings.semanticCacheEnabled !== false;
+  const semanticCacheEnabled = !terminalClaudeFallback && settings.semanticCacheEnabled !== false;
 
   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model, {
     enabled: detailedLoggingEnabled,
@@ -3162,6 +3167,7 @@ export async function handleChatCore({
 
               // Codex 429 account-rotation failover (disabled for context-relay so combo.ts can inject handoff)
               if (
+                !terminalClaudeFallback &&
                 provider === "codex" &&
                 !managedLease &&
                 comboStrategy !== "context-relay" &&
@@ -3831,6 +3837,7 @@ export async function handleChatCore({
   // deactivation on refresh failure (#9817). The 401/403 then flows into
   // the normal providerFailure classification (record-only in probe mode).
   if (
+    !terminalClaudeFallback &&
     (providerResponse.status === HTTP_STATUS.UNAUTHORIZED ||
       providerResponse.status === HTTP_STATUS.FORBIDDEN) &&
     !hadStreamOptions && // Skip refresh if failure may be from stream_options removal, not auth
@@ -4443,6 +4450,7 @@ export async function handleChatCore({
     // from the same family. This keeps the request alive on the same account
     // instead of failing the entire combo.
     if (
+      !terminalClaudeFallback &&
       !(provider === "claude" && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true") &&
       isModelUnavailableError(statusCode, message, provider)
     ) {
@@ -4637,7 +4645,7 @@ export async function handleChatCore({
       // live here re-sent the FAILING provider's credentials to the emergency
       // provider's endpoint (e.g. the OpenAI API key to integrate.api.nvidia.com)
       // — a cross-provider credential leak that also never succeeded upstream.
-      return createErrorResult(
+      const upstreamFailure = createErrorResult(
         statusCode,
         errMsg,
         retryAfterMs,
@@ -4646,6 +4654,13 @@ export async function handleChatCore({
         upstreamErrorBody,
         { passthrough: sourceFormat === FORMATS.CLAUDE }
       );
+      if (
+        provider === "claude" &&
+        !/proxy[_ ]unreachable/i.test(`${upstreamErrorCode ?? ""} ${errMsg}`)
+      ) {
+        markClaudeUpstreamAccountFailure(upstreamFailure.response);
+      }
+      return upstreamFailure;
     }
     // ── End T5 ───────────────────────────────────────────────────────────────
   }
@@ -4933,6 +4948,12 @@ export async function handleChatCore({
           responseToolSchemas
         )
       : responseBody;
+    if (terminalClaudeFallback && Array.isArray(translatedResponse?.content)) {
+      translatedResponse.content = translatedResponse.content.filter(
+        (block: { type?: string }) =>
+          block.type !== "thinking" && block.type !== "redacted_thinking"
+      );
+    }
     const memoryExtractionResponse = translatedResponse;
 
     // T26: Strip markdown code blocks if provider format is Claude
@@ -5773,7 +5794,8 @@ export async function handleChatCore({
         clientResponseFormat,
       }),
       customToolNames,
-      requestToolIdentityMap
+      requestToolIdentityMap,
+      terminalClaudeFallback
     );
   } else {
     log?.debug?.("STREAM", `Standard passthrough mode`);

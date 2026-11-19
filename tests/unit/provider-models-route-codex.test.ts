@@ -15,6 +15,47 @@ const modelsDb = await import("../../src/lib/db/models.ts");
 const providerModelsRoute = await import("../../src/app/api/providers/[id]/models/route.ts");
 const codexDiscovery = await import("../../src/app/api/providers/[id]/models/discovery/codex.ts");
 
+test("Codex discovery sends client_version independently of UA and applies the model minimum", async () => {
+  const previousVersion = process.env.CODEX_CLIENT_VERSION;
+  const previousUa = process.env.CODEX_USER_AGENT;
+  process.env.CODEX_USER_AGENT = "codex-cli/0.169.1 (synthetic fixture)";
+  try {
+    for (const version of ["0.149.0", "0.169.1"]) {
+      process.env.CODEX_CLIENT_VERSION = version;
+      const models = await codexDiscovery.fetchCodexDiscoveryModels({
+        accessToken: "synthetic-fixture",
+        fetchImpl: async (url, init) => {
+          assert.equal(new URL(url).searchParams.get("client_version"), version);
+          const headers = new Headers(init?.headers);
+          assert.equal(headers.get("version"), version);
+          assert.match(headers.get("user-agent") ?? "", /0\.169\.1/);
+          return Response.json({
+            models: [
+              {
+                slug: "gpt-6.2-sol",
+                visibility: "list",
+                supported_in_api: true,
+                minimal_client_version: "0.169.1",
+              },
+              { slug: "hidden", visibility: "hide", supported_in_api: true },
+              { slug: "not-supported", visibility: "list", supported_in_api: false },
+            ],
+          });
+        },
+      });
+      assert.deepEqual(
+        models?.map((model) => model.id) ?? [],
+        version === "0.169.1" ? ["gpt-6.2-sol"] : []
+      );
+    }
+  } finally {
+    if (previousVersion === undefined) delete process.env.CODEX_CLIENT_VERSION;
+    else process.env.CODEX_CLIENT_VERSION = previousVersion;
+    if (previousUa === undefined) delete process.env.CODEX_USER_AGENT;
+    else process.env.CODEX_USER_AGENT = previousUa;
+  }
+});
+
 type RouteModel = {
   id: string;
   name?: string;

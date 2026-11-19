@@ -147,6 +147,7 @@ type StreamCompletePayload = {
 };
 
 type StreamOptions = {
+  suppressClaudeThinking?: boolean;
   mode?: string;
   targetFormat?: string;
   sourceFormat?: string;
@@ -639,6 +640,7 @@ const STREAM_MODE = {
 export function createSSEStream(options: StreamOptions = {}) {
   const {
     mode = STREAM_MODE.TRANSLATE,
+    suppressClaudeThinking = false,
     targetFormat,
     sourceFormat,
     clientResponseFormat = null,
@@ -748,6 +750,7 @@ export function createSSEStream(options: StreamOptions = {}) {
           signatureNamespace,
           copilotCompatibleReasoning,
           suppressThinkClose,
+          suppressClaudeThinking,
           accumulatedContent: "",
           accumulatedReasoning: "",
           toolSchemas: extractToolSchemaMap(body),
@@ -2961,7 +2964,8 @@ export function createSSETransformStreamWithLogger(
   copilotCompatibleReasoning = false,
   suppressThinkClose = false,
   customToolNames: ReadonlySet<string> = new Set(),
-  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null
+  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null,
+  suppressClaudeThinking = false
 ) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
@@ -2980,6 +2984,7 @@ export function createSSETransformStreamWithLogger(
     suppressThinkClose,
     customToolNames,
     requestToolIdentityMap,
+    suppressClaudeThinking,
   });
 }
 
