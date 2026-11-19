@@ -19,7 +19,10 @@ test("reads apiFormat / targetFormat only when present as strings", () => {
 test("apiFormat / targetFormat absent or non-string → undefined", () => {
   assert.equal(resolveChatCoreRequestSetup({}, {}, "m").apiFormat, undefined);
   assert.equal(resolveChatCoreRequestSetup({ apiFormat: 123 }, {}, "m").apiFormat, undefined);
-  assert.equal(resolveChatCoreRequestSetup({ targetFormat: null }, {}, "m").customModelTargetFormat, undefined);
+  assert.equal(
+    resolveChatCoreRequestSetup({ targetFormat: null }, {}, "m").customModelTargetFormat,
+    undefined
+  );
 });
 
 test("modelInfo that is not an object → both markers undefined", () => {
@@ -29,12 +32,34 @@ test("modelInfo that is not an object → both markers undefined", () => {
 });
 
 test("requestedModel uses the client body.model when it is a non-blank string", () => {
-  assert.equal(resolveChatCoreRequestSetup({}, { model: "claude-3" }, "fallback").requestedModel, "claude-3");
+  assert.equal(
+    resolveChatCoreRequestSetup({}, { model: "claude-3" }, "fallback").requestedModel,
+    "claude-3"
+  );
 });
 
 test("requestedModel falls back to the resolved model id when body.model is blank/absent/non-string", () => {
-  assert.equal(resolveChatCoreRequestSetup({}, { model: "   " }, "fallback").requestedModel, "fallback");
+  assert.equal(
+    resolveChatCoreRequestSetup({}, { model: "   " }, "fallback").requestedModel,
+    "fallback"
+  );
   assert.equal(resolveChatCoreRequestSetup({}, {}, "fallback").requestedModel, "fallback");
-  assert.equal(resolveChatCoreRequestSetup({}, { model: 42 }, "fallback").requestedModel, "fallback");
+  assert.equal(
+    resolveChatCoreRequestSetup({}, { model: 42 }, "fallback").requestedModel,
+    "fallback"
+  );
   assert.equal(resolveChatCoreRequestSetup({}, null, "fallback").requestedModel, "fallback");
+});
+
+test("an explicit modelInfo.requestedModel wins over the dispatched body.model", () => {
+  const setup = resolveChatCoreRequestSetup(
+    { requestedModel: "claude/claude-fable-5-2" },
+    { model: "claude/claude-opus-5-5" },
+    "claude-opus-5-5"
+  );
+  assert.equal(setup.requestedModel, "claude/claude-fable-5-2");
+  assert.equal(
+    resolveChatCoreRequestSetup({ requestedModel: " " }, { model: "claude-3" }, "m").requestedModel,
+    "claude-3"
+  );
 });

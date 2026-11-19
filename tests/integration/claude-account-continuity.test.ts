@@ -677,3 +677,374 @@ test("native model with all Claude accounts inactive reports recovery even while
   await h.settingsDb.updateSettings({ preferClaudeCodeForUnprefixedClaudeModels: false });
   assert.notEqual((await getModelInfo(nativeModel)).provider, "claude");
 });
+
+// ── Model fallback: Fable 5.2 → Opus 5.5 when the whole pool is rate-limited for Fable ─────────
+
+const FABLE = "claude-fable-5-2";
+const OPUS = "claude-opus-5-5";
+const RATE_LIMIT_WORDING =
+  "This request would exceed your account's rate limit. Please try again later.";
+const fallbackChain = await import("../../src/sse/handlers/claudeModelFallback.ts");
+const callLogs = await import("../../src/lib/usage/callLogs.ts");
+
+type UpstreamBody = {
+  model: string;
+  thinking?: { type?: string };
+  messages: Array<{ role: string; content: Array<{ type: string }> }>;
+  [field: string]: unknown;
+};
+type Sent = { account: string; model: string; body: UpstreamBody };
+type LoggedCall = { status?: number; model?: string; requestedModel?: string | null };
+/** Synthetic upstream that records which account received which model. */
+function upstream(answer: (account: string, model: string) => Response | Promise<Response>) {
+  const sent: Sent[] = [];
+  globalThis.fetch = async (_url, init) => {
+    const account = h.toPlainHeaders(init?.headers)["x-api-key"];
+    const upstreamBody = JSON.parse(String(init?.body));
+    sent.push({ account, model: upstreamBody.model, body: upstreamBody });
+    return answer(account, upstreamBody.model);
+  };
+  return sent;
+}
+/** model@account in dispatch order, with the executor's same-account 429 retries collapsed. */
+function route(sent: Sent[]) {
+  return sent
+    .map((entry) => `${entry.model}@${entry.account}`)
+    .filter((step, index, steps) => step !== steps[index - 1]);
+}
+function rateLimited(message = RATE_LIMIT_WORDING) {
+  return new Response(
+    JSON.stringify({ type: "error", error: { type: "rate_limit_error", message } }),
+    { status: 429, headers: { "content-type": "application/json" } }
+  );
+}
+function upstreamError(status: number, type: string, message: string) {
+  return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+/** A Fable turn in the middle of a tool loop: signed thinking, tool_use, tool_result. */
+function fableToolLoop(extra: Record<string, unknown> = {}) {
+  return {
+    model: `claude/${FABLE}`,
+    max_tokens: 64000,
+    thinking: { type: "adaptive" },
+    output_config: { effort: "high" },
+    tools: [
+      {
+        name: "lookup",
+        description: "Read a value",
+        input_schema: { type: "object", properties: {} },
+      },
+    ],
+    messages: [
+      { role: "user", content: "look the value up" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "thinking",
+            thinking: "I should call lookup.",
+            signature: "c2lnbmVkLWJ5LWZhYmxl",
+          },
+          { type: "tool_use", id: "toolu_fable", name: "lookup", input: {} },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_fable", content: "already executed" }],
+      },
+    ],
+    ...extra,
+  };
+}
+async function pooledFallback() {
+  const pooled = await pool();
+  h.BaseExecutor.RETRY_CONFIG.delayMs = 5;
+  return pooled;
+}
+
+test("model fallback: chain parsing keeps only well-formed links and can be disabled", () => {
+  const parse = fallbackChain.parseClaudeModelFallbackChain;
+  assert.deepEqual([...parse(undefined)], [[FABLE, OPUS]]);
+  assert.deepEqual(
+    [...parse("a-1>b-2>c-3, x>y")],
+    [
+      ["a-1", "b-2"],
+      ["b-2", "c-3"],
+      ["x", "y"],
+    ]
+  );
+  assert.deepEqual([...parse("a>a, bad model>y, >y, x>, x>y, x>z")], [["x", "y"]]);
+  for (const disabled of ["", " ", "off", "none", "false", "0"])
+    assert.equal(parse(disabled).size, 0);
+});
+
+test("model fallback: the adapted request drops only signed thinking and keeps the client's request", () => {
+  const original = {
+    model: `claude/${FABLE}`,
+    max_tokens: 500000,
+    messages: [
+      { role: "user", content: [{ type: "text", text: "q" }] },
+      { role: "assistant", content: [{ type: "redacted_thinking", data: "opaque" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "t", signature: "s" },
+          { type: "text", text: "a" },
+          { type: "tool_use", id: "toolu_1", name: "lookup", input: {} },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "r" }] },
+      { role: "assistant", content: "plain text answer" },
+    ],
+  };
+  const snapshot = structuredClone(original);
+  const adapted = fallbackChain.adaptRequestForFallbackModel(original, OPUS) as typeof original;
+  assert.deepEqual(original, snapshot, "the client's request is not mutated");
+  assert.equal(adapted.model, original.model);
+  assert.equal(adapted.max_tokens, 128000);
+  assert.deepEqual(adapted.messages, [
+    original.messages[0],
+    {
+      role: "assistant",
+      content: [original.messages[2].content[1], original.messages[2].content[2]],
+    },
+    original.messages[3],
+    original.messages[4],
+  ]);
+});
+
+test("model fallback: every account limited on Fable answers with Opus on the first account in priority", async () => {
+  const { key } = await pooledFallback();
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("opus answer", OPUS)
+  );
+  const requestBody = fableToolLoop();
+  const response = await call(key.key, requestBody);
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  assert.match(text, /opus answer/);
+  assert.equal(JSON.parse(text).model, OPUS);
+  assert.deepEqual(route(sent), [
+    `${FABLE}@synthetic-1`,
+    `${FABLE}@synthetic-2`,
+    `${FABLE}@synthetic-3`,
+    `${OPUS}@synthetic-1`,
+  ]);
+  assert.equal(response.headers.get("X-OmniRoute-Effective-Model"), OPUS);
+  assert.match(
+    String(response.headers.get("X-OmniRoute-Model-Fallback")),
+    /claude-fable-5-2>claude-opus-5-5/
+  );
+
+  // Opus receives the request Fable received, without Fable's signed thinking: the same
+  // system, tools, thinking mode, tool_use and tool_result; only the model differs.
+  const fable = sent.find((entry) => entry.model === FABLE)!.body;
+  const opus = sent.find((entry) => entry.model === OPUS)!.body;
+  assert.deepEqual(fable.messages[1].content[0], requestBody.messages[1].content[0]);
+  const withoutThinking = structuredClone(fable);
+  withoutThinking.messages[1].content = withoutThinking.messages[1].content.filter(
+    (block: { type: string }) => block.type !== "thinking"
+  );
+  assert.deepEqual({ ...opus, model: "same" }, { ...withoutThinking, model: "same" });
+  assert.deepEqual(opus.messages[1].content, [
+    { type: "tool_use", id: "toolu_fable", name: "lookup", input: {} },
+  ]);
+  assert.equal(opus.thinking.type, "adaptive");
+
+  // The call log keeps the model the client asked for next to the one that answered.
+  const served = async () =>
+    ((await callLogs.getCallLogs({ model: OPUS, limit: 5 })) as LoggedCall[]).find(
+      (row) => row.status === 200
+    );
+  const logged = await h.waitFor(served);
+  assert.ok(logged, "the Opus answer is in the call log");
+  assert.equal(logged.model, OPUS);
+  assert.equal(logged.requestedModel, `claude/${FABLE}`);
+});
+
+test("model fallback: while Fable cools down the next request goes to Opus without a Fable call", async () => {
+  const { key } = await pooledFallback();
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("opus answer", OPUS)
+  );
+  await (await call(key.key, fableToolLoop())).text();
+  const before = sent.length;
+  const response = await call(key.key, fableToolLoop({ metadata: { user_id: "second-turn" } }));
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(route(sent.slice(before)), [`${OPUS}@synthetic-1`]);
+});
+
+test("model fallback: Fable stays on Fable while one account can still serve it", async () => {
+  const { key } = await pooledFallback();
+  const sent = upstream((account, upstreamModel) =>
+    account === "synthetic-1" && upstreamModel === FABLE
+      ? rateLimited()
+      : h.buildClaudeResponse(`answer ${upstreamModel}`, upstreamModel)
+  );
+  const response = await call(key.key, fableToolLoop());
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /answer claude-fable-5-2/);
+  assert.deepEqual(route(sent), [`${FABLE}@synthetic-1`, `${FABLE}@synthetic-2`]);
+  assert.equal(response.headers.get("X-OmniRoute-Effective-Model"), null);
+});
+
+test("model fallback: a direct Opus request is unchanged", async () => {
+  const { key } = await pooledFallback();
+  const sent = upstream((_account, upstreamModel) => h.buildClaudeResponse("opus", upstreamModel));
+  const response = await call(key.key, fableToolLoop({ model: `claude/${OPUS}` }));
+  await response.text();
+  assert.equal(response.status, 200);
+  assert.deepEqual(route(sent), [`${OPUS}@synthetic-1`]);
+  assert.equal(response.headers.get("X-OmniRoute-Model-Fallback"), null);
+});
+
+for (const failure of [
+  {
+    name: "401 invalid credentials",
+    answer: () => upstreamError(401, "authentication_error", "Invalid bearer token"),
+    status: 502,
+  },
+  {
+    name: "400 invalid request",
+    answer: () => upstreamError(400, "invalid_request_error", "messages: bad shape"),
+    status: 400,
+  },
+  {
+    name: "503 upstream outage",
+    answer: () => upstreamError(503, "api_error", "Service unavailable"),
+    status: 503,
+  },
+  {
+    name: "529 overloaded",
+    answer: () => upstreamError(529, "overloaded_error", "Overloaded"),
+    status: 529,
+  },
+]) {
+  test(`model fallback: ${failure.name} on Fable never switches the model`, async () => {
+    const { key } = await pooledFallback();
+    const sent = upstream((_account, upstreamModel) =>
+      upstreamModel === FABLE ? failure.answer() : h.buildClaudeResponse("wrong model", OPUS)
+    );
+    const response = await call(key.key, fableToolLoop());
+    await response.text();
+    assert.equal(
+      sent.some((entry) => entry.model === OPUS),
+      false,
+      route(sent).join(" ")
+    );
+    assert.notEqual(response.status, 200);
+  });
+}
+
+test("model fallback: an explicit connection pin keeps its model", async () => {
+  const { key, connections } = await pooledFallback();
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("wrong model", OPUS)
+  );
+  const response = await call(key.key, fableToolLoop(), {
+    "x-omniroute-connection": connections[0].id,
+  });
+  await response.text();
+  assert.equal(response.status, 429);
+  assert.deepEqual(route(sent), [`${FABLE}@synthetic-1`]);
+});
+
+test("model fallback: a key that may not use Opus keeps the Fable rate-limit answer", async () => {
+  const { key } = await pooledFallback();
+  await h.apiKeysDb.updateApiKeyPermissions(key.id, {
+    modelAccessMode: "restricted",
+    allowedModels: [`claude/${FABLE}`],
+  });
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("wrong model", OPUS)
+  );
+  const response = await call(key.key, fableToolLoop());
+  const error = await response.json();
+  assert.equal(response.status, 429);
+  assert.equal(error.continuity.requested_model, FABLE);
+  assert.equal(
+    sent.some((entry) => entry.model === OPUS),
+    false
+  );
+});
+
+test("model fallback: the variable can disable the chain", async () => {
+  const { key } = await pooledFallback();
+  process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN = "off";
+  try {
+    const sent = upstream((_account, upstreamModel) =>
+      upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("wrong model", OPUS)
+    );
+    const response = await call(key.key, fableToolLoop());
+    await response.text();
+    assert.equal(response.status, 429);
+    assert.equal(
+      sent.some((entry) => entry.model === OPUS),
+      false
+    );
+  } finally {
+    delete process.env.OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN;
+  }
+});
+
+test("model fallback: Opus limited too answers 429 with the earliest retry of both models", async () => {
+  const { key, connections } = await pooledFallback();
+  const { lockModel } = await import("../../open-sse/services/accountFallback.ts");
+  // Opus is already cooling on every account, sooner than the Fable limit will clear.
+  const opusReset = new Date(Date.now() + 120_000).toISOString();
+  const sent = upstream(() => rateLimited());
+  for (const connection of connections) {
+    lockModel("claude", connection.id, OPUS, "rate_limited", 120_000);
+  }
+  const response = await call(key.key, fableToolLoop());
+  const error = await response.json();
+  assert.equal(response.status, 429);
+  assert.deepEqual(route(sent), [
+    `${FABLE}@synthetic-1`,
+    `${FABLE}@synthetic-2`,
+    `${FABLE}@synthetic-3`,
+  ]);
+  assert.equal(error.error.code, "upstream_accounts_unavailable");
+  assert.equal(error.continuity.requested_model, FABLE);
+  assert.equal(error.continuity.model_fallback.to, OPUS);
+  assert.equal(error.continuity.model_fallback.result, "unavailable");
+  const retryAfter = Number(response.headers.get("Retry-After"));
+  assert.ok(retryAfter > 0 && retryAfter <= 121, `Retry-After ${retryAfter}`);
+  assert.ok(Math.abs(Date.parse(error.continuity.retry_after_at) - Date.parse(opusReset)) < 5_000);
+  assert.equal(response.headers.get("x-should-retry"), "false");
+});
+
+test("model fallback: an Opus failure other than the pool limit keeps the Fable answer", async () => {
+  const { key } = await pooledFallback();
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE
+      ? rateLimited()
+      : upstreamError(400, "invalid_request_error", "Invalid signature in thinking block")
+  );
+  const response = await call(key.key, fableToolLoop());
+  const error = await response.json();
+  assert.equal(response.status, 429);
+  assert.equal(error.continuity.requested_model, FABLE);
+  assert.equal(error.continuity.model_fallback.result, "failed");
+  assert.equal(error.continuity.model_fallback.status, 400);
+  assert.ok(Number(response.headers.get("Retry-After")) > 0);
+  assert.ok(route(sent).includes(`${OPUS}@synthetic-1`));
+});
+
+test("model fallback: a streamed Fable request is streamed by Opus before any Fable output", async () => {
+  const { key } = await pooledFallback();
+  upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : sse("opus streamed")
+  );
+  const response = await call(key.key, fableToolLoop({ stream: true }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /opus streamed/);
+  assert.match(text, /message_stop/);
+  assert.equal(response.headers.get("X-OmniRoute-Effective-Model"), OPUS);
+});

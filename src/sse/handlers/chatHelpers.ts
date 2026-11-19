@@ -425,6 +425,7 @@ export async function executeChatWithBreaker({
   reasoningTransportFallback = "drop",
   sessionAffinityKey = null,
   managedLease = null,
+  requestedModel = null,
 }: ExecuteChatWithBreakerOptions): Promise<ExecuteChatWithBreakerResult> {
   let tlsFingerprintUsed = false;
   const normalizedTrafficType: TrafficType =
@@ -462,6 +463,8 @@ export async function executeChatWithBreaker({
               extendedContext,
               apiFormat: modelApiFormat,
               targetFormat: modelTargetFormat,
+              // The model the client asked for, when another one serves it (model fallback).
+              ...(typeof requestedModel === "string" && requestedModel ? { requestedModel } : {}),
             },
             credentials: refreshedCredentials,
             log: handlerLog,

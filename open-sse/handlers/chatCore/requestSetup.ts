@@ -19,7 +19,10 @@ export type ChatCoreRequestSetup = {
    * the provider default.
    */
   customModelTargetFormat: string | undefined;
-  /** The client-requested model string, falling back to the resolved model id when absent/blank. */
+  /**
+   * The client-requested model string: an explicit `modelInfo.requestedModel` first, then
+   * `body.model`, falling back to the resolved model id when absent/blank.
+   */
   requestedModel: string;
 };
 
@@ -45,7 +48,17 @@ export function resolveChatCoreRequestSetup(
         ? ((modelInfo as { targetFormat?: string }).targetFormat as string)
         : undefined
       : undefined;
+  // A caller serving the request with another model (Claude continuity model fallback) names the
+  // client's model explicitly, because the dispatched body already carries the serving model.
+  const explicitRequestedModel =
+    modelInfo && typeof modelInfo === "object" && "requestedModel" in modelInfo
+      ? (modelInfo as { requestedModel?: unknown }).requestedModel
+      : undefined;
   const requestedModel =
-    typeof body?.model === "string" && body.model.trim().length > 0 ? body.model : model;
+    typeof explicitRequestedModel === "string" && explicitRequestedModel.trim().length > 0
+      ? explicitRequestedModel
+      : typeof body?.model === "string" && body.model.trim().length > 0
+        ? body.model
+        : model;
   return { apiFormat, customModelTargetFormat, requestedModel };
 }
