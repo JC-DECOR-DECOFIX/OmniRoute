@@ -43,6 +43,10 @@ const REFRESH_DEFAULTS = {
 // an older one was made while the service was down and its viewer has moved on.
 const STARTUP_REQUEST_MAX_AGE_MS = 90_000;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+// Agents of their own, so a proxy configured for the process (NODE_USE_ENV_PROXY with
+// HTTP_PROXY, which the global agent honors) never receives a request or its credential.
+const DIRECT_HTTP = new http.Agent();
+const DIRECT_HTTPS = new https.Agent();
 
 /** Same owner-only rule as the continuity client's private configuration. */
 export function readPrivateFile(path) {
@@ -162,7 +166,10 @@ function validateRefresh(config) {
 export function refreshSettings(config) {
   if (config.refresh === undefined) return null;
   const merged = { ...REFRESH_DEFAULTS, ...config.refresh };
-  return { ...merged, baseUrl: new URL(merged.baseUrl).origin };
+  const url = new URL(merged.baseUrl);
+  // A name is resolved by the system and could point elsewhere; the loopback address cannot.
+  if (url.hostname === "localhost") url.hostname = "127.0.0.1";
+  return { ...merged, baseUrl: url.origin };
 }
 
 function sameSecret(provided, expected) {
@@ -323,7 +330,8 @@ export function exchange({ client = http, url, options, body, deadlineMs, label 
       fail("network", code ? `failed: ${error.code}` : "failed");
     };
     const timer = setTimeout(() => fail("timeout", "timed out"), deadlineMs);
-    req = url ? client.request(url, options) : client.request(options);
+    const direct = { ...options, agent: client === https ? DIRECT_HTTPS : DIRECT_HTTP };
+    req = url ? client.request(url, direct) : client.request(direct);
     req.on("response", (res) => {
       const chunks = [];
       let size = 0;
@@ -417,6 +425,19 @@ export function createPublishQueue({ publish, payload, onResult = () => {} }) {
     });
     chain = run.catch(() => {});
     return run;
+  };
+}
+
+/** Calls `fn` unless a call is still pending, in which case its promise is shared. */
+export function coalesce(fn) {
+  let pending = null;
+  return () => {
+    pending ??= Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        pending = null;
+      });
+    return pending;
   };
 }
 
@@ -547,6 +568,9 @@ export function createRefresher({
   let nextAllowedAtMs = null;
   let running = null;
   let pending = null;
+  // When the last refresh that called the gateway ended; a request made before then was made
+  // while it ran, even if it is first seen afterwards.
+  let lastRefreshEndMs = null;
 
   const iso = (ms) => (ms === null ? null : new Date(ms).toISOString());
 
@@ -583,7 +607,9 @@ export function createRefresher({
     const answer = (fields) => {
       last = { ...base, startedAt: null, finishedAt: iso(now()), accounts: [], ...fields };
     };
-    if (throttle || (nextAllowedAtMs !== null && startedAtMs < nextAllowedAtMs)) {
+    const madeDuringRefresh = lastRefreshEndMs !== null && request.updatedAt <= lastRefreshEndMs;
+    const inInterval = nextAllowedAtMs !== null && startedAtMs < nextAllowedAtMs;
+    if (throttle || madeDuringRefresh || inInterval) {
       observer.poll();
       answer({ status: "throttled", error: null });
       log("refresh throttled");
@@ -637,7 +663,8 @@ export function createRefresher({
     const count = accounts.filter((a) => a.updated).length;
     const status = count === accounts.length ? "done" : count > 0 ? "partial" : "failed";
     const error = status === "failed" ? commonError(results) : null;
-    last = { ...last, status, finishedAt: iso(now()), accounts, error };
+    lastRefreshEndMs = now();
+    last = { ...last, status, finishedAt: iso(lastRefreshEndMs), accounts, error };
     log(
       status === "failed"
         ? `refresh failed: ${error ?? "no account updated"}`
@@ -661,6 +688,7 @@ export function createRefresher({
           await publish();
         }
         refreshed = true;
+        lastRefreshEndMs = now();
         log("refresh failed: internal");
       }
       next = pending;
@@ -783,6 +811,10 @@ async function main(configPath) {
     };
   }
 
+  // At most one periodic publish waits in the queue: while the daemon is slow, later ticks
+  // join it instead of piling up. It takes the newest report when its turn comes. A failed
+  // write is logged by the queue; the next tick or heartbeat tries again.
+  const publishTick = flush ? coalesce(() => flush().catch(() => {})) : null;
   let lastPollError = null;
   const tick = async () => {
     observer.poll();
@@ -790,8 +822,7 @@ async function main(configPath) {
     if (pollError !== lastPollError)
       log(pollError ? `poll failed: ${pollError}` : "poll recovered");
     lastPollError = pollError;
-    // A failed write is logged by the queue; the next tick or heartbeat tries again.
-    if (flush) await flush().catch(() => {});
+    if (publishTick) await publishTick();
   };
   await tick();
   const timer = setInterval(tick, pollMs);

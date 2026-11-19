@@ -220,7 +220,16 @@ true`, and Claude is a rotating-refresh provider (`anthropic-oauth` group,
   `testStatus`, error fields and an ended or quota-recovered cooldown. The automatic sync does the
   same.
 
-The `refresh` block therefore stays absent until the operator has accepted those effects.
+- **It may update the account record from the reading**: the Claude bootstrap metadata kept in
+  `providerSpecificData` (`syncClaudeBootstrapIfNeeded`), and the extra-usage state
+  (`syncClaudeExtraUsageStateIfNeeded`). When the extra-usage block policy is on for the account
+  and the reading shows extra usage queued, that **puts the account in a cooldown**
+  (`testStatus: "unavailable"`, `rateLimitedUntil`) until the reported reset; with the policy
+  off, it clears that state. The automatic sync does the same.
+
+The `refresh` block therefore stays absent until the operator has accepted those effects in
+writing. The token file existing is not that acceptance: creating the token and turning the
+block on are separate decisions.
 
 The accounts are called one at a time, `spacingMs` apart; `timeoutMs` bounds each whole call,
 response body included. After the last call the database is read again, and an account counts as
@@ -230,8 +239,11 @@ and the `_stale` marker of Omni Route's answer are used; its body is not logged 
 The gateway is called only after the `running` state has been written to the artifact. When that
 write fails, nothing is called, the request is answered `failed` with `error: null`, and it does
 not use the interval. Every write and read of the data store has a 10 s deadline for the whole
-exchange, and a response that is cut off counts as a failure, so a stuck daemon cannot stall the
-publishing of later reports.
+exchange, and a response that is cut off counts as a failure. At most one periodic publish
+waits behind a slow write; later ticks join it, so a stuck daemon cannot pile up writes. Every
+call, to the daemon and to Omni Route, goes through an agent of its own, never the process's
+global agent, so a proxy set in the environment (`NODE_USE_ENV_PROXY` with `HTTP_PROXY`) never
+sees a request or its credential, and `localhost` in `baseUrl` is used as `127.0.0.1`.
 
 **Why at most one refresh every two minutes.** Omni Route already waits 180 s per token when
 `/api/oauth/usage` answers 429 (`open-sse/services/claudeUsageCooldown.ts`): Anthropic limits that
@@ -239,9 +251,10 @@ endpoint on a scale of minutes. The automatic sync runs every 70 minutes with 1.
 accounts. Two minutes keeps the manual path at no more than three reads (one per account) every
 two minutes, about 90 an hour in the worst case, and the quota is a whole percentage that moves
 slowly. A request inside the interval does not call the gateway: the database is read again and
-the request is answered as `throttled`. Requests seen while a refresh runs are answered as
-`throttled` when it ends, even if the interval ran out meanwhile; since `last` holds one request,
-only the newest of them is answered. Only one refresh runs at a time.
+the request is answered as `throttled`. A request made while a refresh runs (by the store's
+`updatedAt`, whether it is seen during the refresh or only after it) is answered as `throttled`,
+even if the interval ran out meanwhile; since `last` holds one request, only the newest of them
+is answered. Only one refresh runs at a time.
 
 The result goes out in the published report (and in `GET /internal/omni-route/usage`) as
 `refresh`, and is published as soon as it changes:

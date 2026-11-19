@@ -14,6 +14,7 @@ import {
   sanitizeReason,
 } from "../../scripts/ops/omniroute-observability/aggregate.mjs";
 import {
+  coalesce,
   createObserver,
   createPublisher,
   createPublishQueue,
@@ -1570,7 +1571,8 @@ test("a request seen during a refresh is throttled even when the interval ends m
   assert.equal(h.calls.length, 3, "the gateway is read once");
   assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
   assert.equal(h.refresher.state().last.requestVersion, version(2));
-  // A request after that is a new refresh.
+  // A request made after that refresh ended is a new refresh.
+  h.advance(1_000);
   h.refresher.offer(h.entry(3));
   await h.refresher.idle();
   assert.equal(h.calls.length, 6);
@@ -1653,4 +1655,131 @@ test("the service keeps publishing after the daemon rejects a write", async (t) 
   await waitFor(() => puts.length >= 2);
   assert.match(service.stdout(), /happy publish failed: happy kv write returned HTTP 503/);
   await waitFor(() => service.stdout().includes("happy publish recovered"));
+});
+
+// Regressions from the second independent review of PR #12.
+
+test("a request made during a refresh but first seen after it is throttled", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  const release = h.hold();
+  h.refresher.offer(h.entry(1));
+  await new Promise((resolve) => setImmediate(resolve));
+  // The refresh outlasts the interval; the next request is written just before it ends and
+  // read only after.
+  h.advance(200_000);
+  release();
+  await h.refresher.idle();
+  h.refresher.offer(h.entry(2, 1_000));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
+  // A request written after the refresh ended, with the interval over, reads the vendor again.
+  h.advance(1_000);
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 6);
+});
+
+test("periodic publishes join the one already waiting", async () => {
+  let release;
+  let calls = 0;
+  const run = coalesce(async () => {
+    calls += 1;
+    await new Promise((resolve) => (release = resolve));
+  });
+  const waits = Array.from({ length: 10 }, () => run());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  release();
+  await Promise.all(waits);
+  const next = run();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 2);
+  release();
+  await next;
+});
+
+test("localhost is pinned to the loopback address", (t) => {
+  const { dir, write } = privateDir(t);
+  const config = loadConfig(
+    write(
+      "config.json",
+      JSON.stringify({
+        dbPath: join(dir, "db.sqlite"),
+        tokenFile: join(dir, "token"),
+        authorizedConnections: [A],
+        happy: { socketPath: join(dir, "s"), tokenFile: join(dir, "h"), artifactId: "art1" },
+        refresh: { tokenFile: join(dir, "t"), baseUrl: "http://localhost:20128" },
+      })
+    )
+  );
+  assert.equal(refreshSettings(config).baseUrl, "http://127.0.0.1:20128");
+});
+
+test("a proxy configured for the process never receives a call or its credential", async (t) => {
+  const proxied = [];
+  const proxy = http.createServer((req, res) => {
+    proxied.push({ url: req.url, authorization: req.headers.authorization });
+    res.writeHead(502).end();
+  });
+  proxy.on("connect", (req, socket) => {
+    proxied.push({ url: req.url });
+    socket.destroy();
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    proxy.closeAllConnections();
+    proxy.close();
+  });
+  const { baseUrl, seen } = await fakeGateway(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const proxyUrl = `http://127.0.0.1:${proxy.address().port}`;
+  const serverUrl = new URL("server.mjs", SERVICE_DIR).href;
+  const script = `
+    import http from "node:http";
+    const { gatewayUsageCall } = await import(${JSON.stringify(serverUrl)});
+    const via = await new Promise((resolve) => {
+      http.get(${JSON.stringify(`${baseUrl}/global`)}, (res) => { res.resume(); resolve(res.statusCode); })
+        .on("error", () => resolve("error"));
+    });
+    const direct = await gatewayUsageCall({
+      baseUrl: ${JSON.stringify(baseUrl)}, token: ${JSON.stringify(GATEWAY_TOKEN)},
+      connectionId: "a", timeoutMs: 5000,
+    });
+    process.stdout.write(JSON.stringify({ via, direct }));`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: {
+      ...process.env,
+      NODE_USE_ENV_PROXY: "1",
+      HTTP_PROXY: proxyUrl,
+      HTTPS_PROXY: proxyUrl,
+      NO_PROXY: "",
+      no_proxy: "",
+    },
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  assert.equal(code, 0, stderr);
+  const { via, direct } = JSON.parse(stdout);
+  // The global agent does go through the proxy, so the check below means something.
+  assert.equal(via, 502);
+  assert.deepEqual(direct, { kind: "ok", stale: false });
+  assert.deepEqual(
+    seen.map((r) => r.url),
+    ["/api/usage/a"]
+  );
+  assert.equal(
+    proxied.some((r) => r.authorization?.includes(GATEWAY_TOKEN)),
+    false
+  );
+  assert.deepEqual(
+    proxied.map((r) => r.url),
+    [`${baseUrl}/global`]
+  );
 });
