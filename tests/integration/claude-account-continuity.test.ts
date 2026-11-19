@@ -1029,6 +1029,34 @@ test("model fallback: Opus limited too answers 429 with the earliest retry of bo
   assert.equal(response.headers.get("x-should-retry"), "false");
 });
 
+test("model fallback: Retry-After waits for an account free of all its limits, not the first cooldown", async () => {
+  const { key, connections } = await pooledFallback();
+  const { lockModel } = await import("../../open-sse/services/accountFallback.ts");
+  const { updateProviderConnection } = await import("../../src/lib/db/providers.ts");
+  // Fable for 1h and Opus for 30min on every account; the first account also has a 60s
+  // per-minute cooldown, which frees none of them.
+  for (const connection of connections) {
+    lockModel("claude", connection.id, FABLE, "quota_exhausted", 3_600_000);
+    lockModel("claude", connection.id, OPUS, "rate_limited", 1_800_000);
+  }
+  await updateProviderConnection(connections[0].id, {
+    rateLimitedUntil: new Date(Date.now() + 60_000).toISOString(),
+    testStatus: "unavailable",
+    errorCode: 429,
+  });
+  const sent = upstream(() => rateLimited());
+  const response = await call(key.key, fableToolLoop());
+  const error = await response.json();
+  assert.equal(response.status, 429);
+  assert.deepEqual(sent, []);
+  assert.equal(error.continuity.model_fallback.result, "unavailable");
+  const retryAfter = Number(response.headers.get("Retry-After"));
+  assert.ok(retryAfter > 1_790 && retryAfter <= 1_801, `Retry-After ${retryAfter}`);
+  assert.ok(
+    Math.abs(Date.parse(error.continuity.retry_after_at) - (Date.now() + 1_800_000)) < 5_000
+  );
+});
+
 test("model fallback: an Opus failure other than the pool limit keeps the Fable answer", async () => {
   const { key } = await pooledFallback();
   const sent = upstream((_account, upstreamModel) =>

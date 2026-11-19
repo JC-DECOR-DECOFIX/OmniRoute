@@ -166,9 +166,14 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
 
 /** Epoch milliseconds at which the pool said this model becomes eligible again. */
 function retryAt(continuity: JsonRecord): number | null {
-  const at =
-    typeof continuity.retry_after_at === "string" ? Date.parse(continuity.retry_after_at) : NaN;
-  return Number.isFinite(at) ? at : null;
+  // `pool_eligible_at` is the first account free of all its limits; `retry_after_at` is the
+  // earliest cooldown of any kind and only stands in when the pool could not date its limits.
+  for (const field of ["pool_eligible_at", "retry_after_at"]) {
+    const value = continuity[field];
+    const at = typeof value === "string" ? Date.parse(value) : NaN;
+    if (Number.isFinite(at)) return at;
+  }
+  return null;
 }
 
 /** Re-issue the original pool answer with the fallback outcome and the earliest honest retry. */
