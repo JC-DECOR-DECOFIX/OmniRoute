@@ -144,8 +144,13 @@ token is read from an owner-only file and compared in constant time.
 | 200      | Report (`schema: "omni-route-usage/v1"`)        |
 | 400      | Malformed request target                        |
 | 401      | Missing or wrong token                          |
+| 500      | Unexpected error; `error: "internal_error"`     |
 | 503      | No successful poll yet; body carries `observer` |
 | 404/405  | Other path or method                            |
+
+A 500 comes from an unexpected exception while a request is answered, on any path including
+`/healthz`. The process keeps running and keeps the report it holds; if the response had already
+started, the connection is closed instead.
 
 `GET /healthz` needs no token and returns only `{ ok, status }`.
 
