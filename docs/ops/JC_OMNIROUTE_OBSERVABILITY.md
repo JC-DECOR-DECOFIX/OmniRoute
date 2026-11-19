@@ -107,15 +107,18 @@ instead of a guessed one:
 `accounts[].state` follows the gateway's own account selection (`isTerminalConnectionStatus` and
 the cooldown check in `src/sse/services/auth.ts`):
 
-| State                                    | Meaning                                                                   |
-| ---------------------------------------- | ------------------------------------------------------------------------- |
-| `inactive`                               | `is_active` is off                                                        |
-| `expired`, `banned`, `credits_exhausted` | Terminal status; excluded until an operator acts                          |
-| `cooldown`                               | `rate_limited_until` is in the future; `stateUntil` is its end            |
-| `active`                                 | Eligible for selection, including after a cooldown that has already ended |
+| State                                    | Meaning                                                            |
+| ---------------------------------------- | ------------------------------------------------------------------ |
+| `inactive`                               | `is_active` is off                                                 |
+| `expired`, `banned`, `credits_exhausted` | Terminal status; excluded until an operator acts                   |
+| `cooldown`                               | `rate_limited_until` is in the future; `stateUntil` is its end     |
+| `active`                                 | Passes the stored-state filters, including after an ended cooldown |
 
 The stored `test_status` is reported beside it as `testStatus`: an account can read `unavailable`
-there while its state is `active`, because an ended cooldown no longer excludes it.
+there while its state is `active`, because an ended cooldown no longer excludes it. `active`
+only means the stored state does not exclude the account; whether it serves a given request
+still depends on the authorized pool, the model (a model-scoped lockout lives in memory) and
+quota policy.
 
 ## Staleness
 
@@ -139,6 +142,7 @@ token is read from an owner-only file and compared in constant time.
 | Response | Meaning                                         |
 | -------- | ----------------------------------------------- |
 | 200      | Report (`schema: "omni-route-usage/v1"`)        |
+| 400      | Malformed request target                        |
 | 401      | Missing or wrong token                          |
 | 503      | No successful poll yet; body carries `observer` |
 | 404/405  | Other path or method                            |

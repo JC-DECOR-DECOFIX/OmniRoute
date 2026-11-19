@@ -797,3 +797,46 @@ test("many snapshots with unreadable times do not hide the last valid one", () =
   const b = account(buildUsageReport(db, { now: NOW }), B).quota;
   assert.equal(b.windows.fiveHour.usedPercent, 65);
 });
+
+// Regression from the fourth independent review of PR #9.
+
+test("a malformed request target is answered with 400 and the server keeps serving", async (t) => {
+  const observer = createObserver({
+    read: () => ({ schema: "omni-route-usage/v1", generatedAt: "x" }),
+    now: () => NOW,
+  });
+  observer.poll();
+  const server = createUsageServer({ observer, token: "local-token" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const { port } = server.address();
+  const raw = (target) =>
+    new Promise((resolve, reject) => {
+      const socket = net.connect(port, "127.0.0.1", () =>
+        socket.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`)
+      );
+      let data = "";
+      socket.on("data", (chunk) => (data += chunk));
+      socket.on("end", () => resolve(data.split(" ")[1]));
+      socket.on("error", reject);
+    });
+  for (const target of ["//", "//a:b@", "//[::1"]) assert.equal(await raw(target), "400");
+  assert.equal(await raw("/healthz"), "200");
+  const ok = await new Promise((resolve, reject) => {
+    http
+      .get(
+        {
+          host: "127.0.0.1",
+          port,
+          path: USAGE_PATH,
+          headers: { authorization: "Bearer local-token" },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode);
+        }
+      )
+      .on("error", reject);
+  });
+  assert.equal(ok, 200);
+});

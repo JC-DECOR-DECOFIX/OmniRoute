@@ -167,17 +167,29 @@ export function createUsageServer({ observer, token }) {
       });
       res.end(JSON.stringify(body));
     };
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (req.method === "GET" && url.pathname === "/healthz") {
-      return send(200, { ok: true, status: observer.payload().observer.status });
+    // A request target such as "//" is not a valid URL; answer it instead of throwing.
+    let url;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      return send(400, { error: "bad_request" });
     }
-    if (url.pathname !== USAGE_PATH) return send(404, { error: "not_found" });
-    if (req.method !== "GET") return send(405, { error: "method_not_allowed" });
-    const header = req.headers.authorization ?? "";
-    const provided = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
-    if (!provided || !sameSecret(provided, token)) return send(401, { error: "unauthorized" });
-    const body = observer.payload();
-    return send(observer.hasReport() ? 200 : 503, body);
+    try {
+      if (req.method === "GET" && url.pathname === "/healthz") {
+        return send(200, { ok: true, status: observer.payload().observer.status });
+      }
+      if (url.pathname !== USAGE_PATH) return send(404, { error: "not_found" });
+      if (req.method !== "GET") return send(405, { error: "method_not_allowed" });
+      const header = req.headers.authorization ?? "";
+      const provided = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
+      if (!provided || !sameSecret(provided, token)) return send(401, { error: "unauthorized" });
+      const body = observer.payload();
+      return send(observer.hasReport() ? 200 : 503, body);
+    } catch {
+      // No request may end the process and lose the report held in memory.
+      if (!res.headersSent) return send(500, { error: "internal_error" });
+      return res.destroy();
+    }
   });
 }
 
