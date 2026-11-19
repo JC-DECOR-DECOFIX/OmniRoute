@@ -145,10 +145,14 @@ Configuration `~/.omniroute/observability/config.json`, mode 0600:
   "authorizedConnections": ["APPROVED_ID_1", "APPROVED_ID_2", "APPROVED_ID_3"],
   "gateway": { "build": "INSTALLED_BUILD_SHA" },
   "tokenFile": "/Users/giovanni/.omniroute/observability/token",
-  "listen": { "port": 20131 },
+  "listen": { "port": 20141 },
   "pollIntervalMs": 15000
 }
 ```
+
+Port 20141 is used because the installed gateway process itself listens on 20128, 20131 and 20132
+(measured with `lsof` on 2026-11-19), and 20130 is the default port of the embedded 9Router
+service. Check that the chosen port is free before loading the agent.
 
 `authorizedConnections` is copied from `allowed_connections` of the continuity client
 configuration; only that field is read from it, never its gateway credential. The token file

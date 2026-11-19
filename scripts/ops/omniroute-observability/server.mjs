@@ -19,7 +19,7 @@ export const USAGE_PATH = "/internal/omni-route/usage";
 export const KV_KEY = "omni-route/usage";
 
 const DEFAULT_POLL_MS = 15_000;
-const DEFAULT_PORT = 20131;
+const DEFAULT_PORT = 20141;
 const DEFAULT_HEARTBEAT_MS = 60_000;
 const PUBLISH_TIMEOUT_MS = 10_000;
 
