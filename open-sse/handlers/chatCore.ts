@@ -511,11 +511,8 @@ export async function handleChatCore({
     }
   }
   // Per-request model-routing metadata (first extracted slice of the request-setup phase).
-  const { apiFormat, customModelTargetFormat, requestedModel } = resolveChatCoreRequestSetup(
-    modelInfo,
-    body,
-    model
-  );
+  const { apiFormat, customModelTargetFormat, requestedModel, callLogRequestedModel } =
+    resolveChatCoreRequestSetup(modelInfo, body, model);
   const isModelScope = () => isModelScopeProvider(provider, credentials?.providerSpecificData);
   const startTime = Date.now();
   // Per-request trace id + checkpoint helper. Lets us see exactly which await
@@ -994,7 +991,7 @@ export async function handleChatCore({
       reqLogger,
       pendingRequestId,
       clientRawRequest,
-      requestedModel,
+      requestedModel: callLogRequestedModel,
       credentials,
       startTime,
       body,

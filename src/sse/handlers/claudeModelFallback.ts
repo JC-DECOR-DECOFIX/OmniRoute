@@ -82,6 +82,8 @@ async function readPoolRateLimit(response: Response): Promise<PoolRateLimit | nu
     continuity.provider !== "claude" ||
     continuity.upstream_status !== 429 ||
     continuity.mode !== "authorized-pool" ||
+    // The per-account verdict (src/sse/services/claudePoolRateLimit.ts), not the last status.
+    continuity.pool_rate_limited !== true ||
     typeof continuity.requested_model !== "string"
   ) {
     return null;
@@ -108,17 +110,43 @@ export function adaptRequestForFallbackModel(body: JsonRecord, to: string): Json
     next.max_tokens = Math.min(next.max_tokens, maxOutput);
   }
   if (Array.isArray(body.messages)) {
-    next.messages = body.messages.flatMap((message) => {
+    let dropped = false;
+    const kept = body.messages.flatMap((message) => {
       const record = asRecord(message);
       if (record?.role !== "assistant" || !Array.isArray(record.content)) return [message];
       const content = record.content.filter(
         (block) => !THINKING_BLOCKS.has(String(asRecord(block)?.type))
       );
       if (content.length === record.content.length) return [message];
-      return content.length > 0 ? [{ ...record, content }] : [];
+      if (content.length > 0) return [{ ...record, content }];
+      dropped = true;
+      return [];
     });
+    next.messages = dropped ? mergeAdjacentTurns(kept) : kept;
   }
   return next;
+}
+
+function asBlocks(content: unknown): unknown[] {
+  return Array.isArray(content) ? content : [{ type: "text", text: String(content ?? "") }];
+}
+
+/** An assistant turn made only of thinking leaves two turns of one role next to each other. */
+function mergeAdjacentTurns(messages: unknown[]): unknown[] {
+  const merged: unknown[] = [];
+  for (const message of messages) {
+    const record = asRecord(message);
+    const previous = asRecord(merged[merged.length - 1]);
+    if (record && previous && record.role === previous.role) {
+      merged[merged.length - 1] = {
+        ...previous,
+        content: [...asBlocks(previous.content), ...asBlocks(record.content)],
+      };
+    } else {
+      merged.push(message);
+    }
+  }
+  return merged;
 }
 
 function withHeaders(response: Response, headers: Record<string, string>): Response {
@@ -154,6 +182,7 @@ function poolAnswer(
     .map((entry) => retryAt(entry.continuity))
     .filter((at): at is number => at !== null)
     .sort((a, b) => a - b)[0];
+  void original.body?.cancel().catch(() => {});
   const continuity: JsonRecord = { ...first.continuity, model_fallback: modelFallback };
   const headers = new Headers(original.headers);
   headers.delete("content-length");
@@ -177,7 +206,10 @@ function poolAnswer(
 export async function withClaudeModelFallback(
   response: Response,
   context: {
-    /** The request fixed one connection, or must not leave its routing constraints. */
+    /**
+     * The request fixed one connection, must not leave its routing constraints, or its key is
+     * not bound to an explicit account pool: the original answer stands.
+     */
     pinned: boolean;
     isModelAllowed: (modelStr: string) => Promise<boolean>;
     dispatch: (modelStr: string, modelFallback: ClaudeModelFallback) => Promise<Response>;
@@ -230,6 +262,7 @@ export async function withClaudeModelFallback(
     );
     const fallbackResponse = await context.dispatch(`claude/${next}`, modelFallback);
     if (fallbackResponse.ok) {
+      void response.body?.cancel().catch(() => {});
       return withHeaders(fallbackResponse, {
         [EFFECTIVE_MODEL_HEADER]: next,
         [MODEL_FALLBACK_HEADER]: `${requested}>${next}; reason=accounts_rate_limited`,

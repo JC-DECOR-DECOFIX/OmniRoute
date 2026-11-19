@@ -84,17 +84,24 @@ rate limit (`This request would exceed your account's rate limit`) while Opus 5.
 kept answering on the same accounts: the cached cooldown then refused every Fable
 request at once with `attempts: 0`.
 
-When the pool answers `upstream_accounts_unavailable` with `upstream_status: 429`
-for the requested model (every eligible account limited, live or from the cached
-per-model cooldown), `src/sse/handlers/claudeModelFallback.ts` sends the same request
-once more for the next model of `OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN`. Unset, the
-chain is `claude-fable-5-2>claude-opus-5-5`; links are comma-separated
-`from>to[>next]`, and an empty value or `off` disables it. The fallback model goes
-through the same authorized pool, priority order and per-model cooldowns.
+When the pool answers `upstream_accounts_unavailable` for the requested model and
+every eligible account is unavailable for it only because of a rate limit or an
+exhausted quota (live or from the cached per-model cooldown),
+`src/sse/handlers/claudeModelFallback.ts` sends the same request once more for the
+next model of `OMNIROUTE_CLAUDE_MODEL_FALLBACK_CHAIN`. Unset, the chain is
+`claude-fable-5-2>claude-opus-5-5`; links are comma-separated `from>to[>next]`, and
+an empty value or `off` disables it. The fallback model goes through the same
+authorized pool, priority order and per-model cooldowns.
 
 - It never applies to an explicit `x-omniroute-connection` pin, a combo, a managed
   lease, a combo live test, or a key whose model policy does not allow the target.
-- Only the pool-wide 429 triggers it. Authentication (401/502), request (400),
+- It applies only to a key bound to an explicit account pool (`allowedConnections`),
+  so a key without one never reaches an account it was not given.
+- The pool judges each account on its recorded state
+  (`src/sse/services/claudePoolRateLimit.ts`), not on the last status seen, and marks
+  the answer `continuity.pool_rate_limited: true` with `pool_eligible_at`, the first
+  instant an account is free again. One account down with a 503 while the others
+  answer 429 is not a pool-wide rate limit. Authentication (401/502), request (400),
   billing (402), permission (403), 5xx, 529 and timeouts keep their own answer.
 - The pool answers before any output reaches the client, so the switch never splices
   two responses. After partial output the existing recovery rule applies unchanged.
@@ -107,13 +114,15 @@ through the same authorized pool, priority order and per-model cooldowns.
   model by chatCore, as for any request.
 - The answer carries `X-OmniRoute-Effective-Model` and
   `X-OmniRoute-Model-Fallback: <from>><to>; reason=accounts_rate_limited`; the
-  response `model` is the model that answered. Continuity log lines include
-  `model_fallback: {from, to, reason}`, and the call log keeps the client's model in
-  `requested_model` next to the serving `model`.
+  response `model` is the model that answered, also with the requested-model echo
+  setting on. Continuity log lines include `model_fallback: {from, to, reason}`, and
+  the call log keeps the client's model in `requested_model` next to the serving
+  `model`.
 - If the fallback model is also rate-limited on the whole pool, the client receives
   the original 429 with `continuity.model_fallback.result: "unavailable"` and the
-  earliest `Retry-After` of the models tried. Any other failure of the fallback model
-  returns the original 429 with `result: "failed"` and the fallback's status.
+  earliest `Retry-After` of the models tried, from each model's `pool_eligible_at`.
+  Any other failure of the fallback model returns the original 429 with
+  `result: "failed"` and the fallback's status.
 
 The per-model wait after this 429 stays the local one hour. On 2026-11-19 the Fable
 limit was still in force when that hour expired (a new 429 at 17:55 UTC on the first

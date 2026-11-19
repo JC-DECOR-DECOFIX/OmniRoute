@@ -51,15 +51,15 @@ test("requestedModel falls back to the resolved model id when body.model is blan
   assert.equal(resolveChatCoreRequestSetup({}, null, "fallback").requestedModel, "fallback");
 });
 
-test("an explicit modelInfo.requestedModel wins over the dispatched body.model", () => {
+test("an explicit modelInfo.requestedModel names the call-log model, never the echoed one", () => {
   const setup = resolveChatCoreRequestSetup(
     { requestedModel: "claude/claude-fable-5-2" },
     { model: "claude/claude-opus-5-5" },
     "claude-opus-5-5"
   );
-  assert.equal(setup.requestedModel, "claude/claude-fable-5-2");
-  assert.equal(
-    resolveChatCoreRequestSetup({ requestedModel: " " }, { model: "claude-3" }, "m").requestedModel,
-    "claude-3"
-  );
+  assert.equal(setup.callLogRequestedModel, "claude/claude-fable-5-2");
+  assert.equal(setup.requestedModel, "claude/claude-opus-5-5");
+  const blank = resolveChatCoreRequestSetup({ requestedModel: " " }, { model: "claude-3" }, "m");
+  assert.equal(blank.callLogRequestedModel, "claude-3");
+  assert.equal(resolveChatCoreRequestSetup({}, {}, "m").callLogRequestedModel, "m");
 });

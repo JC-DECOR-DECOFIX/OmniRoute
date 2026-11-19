@@ -32,7 +32,7 @@ function body(stream = false) {
     messages: [{ role: "user", content: "continuity" }],
   };
 }
-function sse(text: string, complete = true) {
+function sse(text: string, complete = true, responseModel = model) {
   const events = [
     {
       type: "message_start",
@@ -40,7 +40,7 @@ function sse(text: string, complete = true) {
         id: "synthetic",
         type: "message",
         role: "assistant",
-        model,
+        model: responseModel,
         content: [],
         usage: { input_tokens: 1, output_tokens: 0 },
       },
@@ -693,16 +693,26 @@ type UpstreamBody = {
   messages: Array<{ role: string; content: Array<{ type: string }> }>;
   [field: string]: unknown;
 };
-type Sent = { account: string; model: string; body: UpstreamBody };
+type Sent = {
+  account: string;
+  model: string;
+  body: UpstreamBody;
+  headers: Record<string, string>;
+};
 type LoggedCall = { status?: number; model?: string; requestedModel?: string | null };
 /** Synthetic upstream that records which account received which model. */
 function upstream(answer: (account: string, model: string) => Response | Promise<Response>) {
   const sent: Sent[] = [];
   globalThis.fetch = async (_url, init) => {
-    const account = h.toPlainHeaders(init?.headers)["x-api-key"];
+    const headers = h.toPlainHeaders(init?.headers);
     const upstreamBody = JSON.parse(String(init?.body));
-    sent.push({ account, model: upstreamBody.model, body: upstreamBody });
-    return answer(account, upstreamBody.model);
+    sent.push({
+      account: headers["x-api-key"],
+      model: upstreamBody.model,
+      body: upstreamBody,
+      headers,
+    });
+    return answer(headers["x-api-key"], upstreamBody.model);
   };
   return sent;
 }
@@ -1039,7 +1049,7 @@ test("model fallback: an Opus failure other than the pool limit keeps the Fable 
 test("model fallback: a streamed Fable request is streamed by Opus before any Fable output", async () => {
   const { key } = await pooledFallback();
   upstream((_account, upstreamModel) =>
-    upstreamModel === FABLE ? rateLimited() : sse("opus streamed")
+    upstreamModel === FABLE ? rateLimited() : sse("opus streamed", true, OPUS)
   );
   const response = await call(key.key, fableToolLoop({ stream: true }));
   const text = await response.text();
@@ -1047,4 +1057,126 @@ test("model fallback: a streamed Fable request is streamed by Opus before any Fa
   assert.match(text, /opus streamed/);
   assert.match(text, /message_stop/);
   assert.equal(response.headers.get("X-OmniRoute-Effective-Model"), OPUS);
+});
+
+test("model fallback: a thinking-only turn removed between two user turns leaves them merged", () => {
+  const adapted = fallbackChain.adaptRequestForFallbackModel(
+    {
+      model: `claude/${FABLE}`,
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s" }] },
+        { role: "user", content: [{ type: "text", text: "second" }] },
+      ],
+    },
+    OPUS
+  );
+  assert.deepEqual(adapted.messages, [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "first" },
+        { type: "text", text: "second" },
+      ],
+    },
+  ]);
+});
+
+for (const order of [
+  ["503", "429", "429"],
+  ["429", "429", "503"],
+]) {
+  test(`model fallback: accounts answering ${order.join(", ")} on Fable never switch the model`, async () => {
+    const { key } = await pooledFallback();
+    const sent = upstream((account, upstreamModel) => {
+      if (upstreamModel !== FABLE) return h.buildClaudeResponse("wrong model", OPUS);
+      return order[Number(account.slice(-1)) - 1] === "503"
+        ? upstreamError(503, "api_error", "Service unavailable")
+        : rateLimited();
+    });
+    const response = await call(key.key, fableToolLoop());
+    await response.text();
+    assert.notEqual(response.status, 200);
+    assert.equal(
+      sent.some((entry) => entry.model === OPUS),
+      false,
+      route(sent).join(" ")
+    );
+    // The next request, answered from the cached state without any upstream call, neither.
+    const before = sent.length;
+    const cached = await call(key.key, fableToolLoop());
+    await cached.text();
+    assert.equal(
+      sent.slice(before).some((entry) => entry.model === OPUS),
+      false,
+      route(sent.slice(before)).join(" ")
+    );
+  });
+}
+
+test("model fallback: a key not bound to an account pool keeps the Fable rate-limit answer", async () => {
+  await pooledFallback();
+  const unbound = await h.seedApiKey({ name: "unbound-key" });
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("wrong model", OPUS)
+  );
+  const response = await call(unbound.key, fableToolLoop());
+  await response.text();
+  assert.notEqual(response.status, 200);
+  assert.equal(
+    sent.some((entry) => entry.model === OPUS),
+    false,
+    route(sent).join(" ")
+  );
+});
+
+test("model fallback: with the requested-model echo on, the answer still names Opus", async () => {
+  const { key } = await pooledFallback();
+  await h.settingsDb.updateSettings({ echoRequestedModelName: true });
+  try {
+    upstream((_account, upstreamModel) =>
+      upstreamModel === FABLE ? rateLimited() : sse("opus streamed", true, OPUS)
+    );
+    const streamed = await call(key.key, fableToolLoop({ stream: true }));
+    const events = (await streamed.text())
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)));
+    const start = events.find((event) => event.type === "message_start");
+    assert.ok(start, "message_start is streamed");
+    assert.match(String(start.message.model), /claude-opus-5-5/);
+    assert.doesNotMatch(String(start.message.model), /fable/);
+
+    upstream((_account, upstreamModel) =>
+      upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("opus answer", OPUS)
+    );
+    const json = await call(key.key, fableToolLoop());
+    const answer = await json.json();
+    assert.equal(json.status, 200);
+    assert.match(String(answer.model), /claude-opus-5-5/);
+    assert.doesNotMatch(String(answer.model), /fable/);
+  } finally {
+    await h.settingsDb.updateSettings({ echoRequestedModelName: false });
+  }
+});
+
+test("model fallback: Opus receives the headers and betas Fable received", async () => {
+  const { key } = await pooledFallback();
+  const sent = upstream((_account, upstreamModel) =>
+    upstreamModel === FABLE ? rateLimited() : h.buildClaudeResponse("opus answer", OPUS)
+  );
+  const response = await call(key.key, fableToolLoop(), {
+    "anthropic-beta": "interleaved-thinking-2025-05-14",
+  });
+  await response.text();
+  assert.equal(response.status, 200);
+  const fable = sent.find((entry) => entry.model === FABLE && entry.account === "synthetic-1")!;
+  const opus = sent.find((entry) => entry.model === OPUS)!;
+  assert.equal(opus.account, "synthetic-1");
+  assert.ok(opus.headers["anthropic-beta"], "Opus receives the Claude betas");
+  assert.equal(opus.headers["anthropic-beta"], fable.headers["anthropic-beta"]);
+  const differing = Object.keys({ ...fable.headers, ...opus.headers }).filter(
+    (name) => name !== "content-length" && fable.headers[name] !== opus.headers[name]
+  );
+  assert.deepEqual(differing, []);
 });

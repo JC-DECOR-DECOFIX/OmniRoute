@@ -1286,9 +1286,17 @@ async function handleChatImplementation(
       false
     );
   // Claude continuity pool rate-limited for this model: next model of the configured chain.
+  // Only for a key bound to an explicit account pool, checked with the key the policy used.
+  const keyPool = apiKeyInfo?.allowedConnections;
   const response = await withClaudeModelFallback(await singleModel(body, resolvedModelStr), {
-    pinned: Boolean(requestedConnectionId) || Boolean(managedLease) || isComboLiveTest,
-    isModelAllowed: (fallbackModel) => isModelAllowedForKey(apiKey, fallbackModel),
+    pinned:
+      Boolean(requestedConnectionId) ||
+      Boolean(managedLease) ||
+      isComboLiveTest ||
+      !policy.apiKey ||
+      !Array.isArray(keyPool) ||
+      keyPool.length === 0,
+    isModelAllowed: (fallbackModel) => isModelAllowedForKey(policy.apiKey, fallbackModel),
     dispatch: (fallbackModel, modelFallback) =>
       singleModel(adaptRequestForFallbackModel(body, modelFallback.to), fallbackModel, {
         ...singleModelOptions,
@@ -1810,6 +1818,12 @@ async function handleSingleModelChat(
               ? {
                   retry_after: Number(responseHeaders.get("Retry-After")),
                   retry_after_at: credentials.retryAfter,
+                }
+              : {}),
+            ...(credentials?.poolRateLimit?.allRateLimited
+              ? {
+                  pool_rate_limited: true,
+                  pool_eligible_at: credentials.poolRateLimit.eligibleAt,
                 }
               : {}),
           };

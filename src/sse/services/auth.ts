@@ -146,6 +146,7 @@ import {
 } from "@/shared/utils/shuffleDeck";
 import { shouldIsolateProbeFailures } from "@/shared/utils/probeOrigin";
 import { isClaudeModelScopedRateLimit } from "@omniroute/open-sse/services/quotaTextCooldowns.ts";
+import { describePoolRateLimit } from "./claudePoolRateLimit";
 import {
   applyExclusiveConnectionLeasePolicy,
   invalidateManagedConnectionLease,
@@ -1496,6 +1497,19 @@ export async function getProviderCredentials(
 
     let modelLockedCount = 0;
     let familyLockedCount = 0;
+    // Accounts that can serve this model, judged one by one (Claude continuity model fallback).
+    const describeEligiblePool = (quotaResets: Array<[string, string | null]> = []) =>
+      describePoolRateLimit(
+        connections.filter(
+          (c) =>
+            !["modelExcluded", "modelNotAdvertised"].includes(
+              connectionFilterStatus.get(c.id) ?? ""
+            )
+        ),
+        provider,
+        requestedModel,
+        new Map(quotaResets)
+      );
     const connectionFilterStatus = new Map<string, string>();
     // #11089: multi-host self-hosted providers keep a per-connection synced
     // inventory. Without it, a request can be routed to a host that never had
@@ -1701,6 +1715,7 @@ export async function getProviderCredentials(
           cooldownScope: allBlockedByModelCooldown ? "model" : "connection",
           cooldownModel: allBlockedByModelCooldown ? requestedModel : null,
           connectionsCount: connections.length,
+          poolRateLimit: describeEligiblePool(),
         };
       }
       const syntheticFallback = await maybeSyntheticNoAuthFallback(
@@ -1801,6 +1816,7 @@ export async function getProviderCredentials(
         retryAfterHuman: formatRetryAfter(retryAfter),
         lastError: `All ${provider} accounts reached configured quota threshold`,
         lastErrorCode: 429,
+        poolRateLimit: describeEligiblePool(blockedByPolicy.map((e) => [e.id, e.resetAt])),
       };
     }
 
@@ -1845,6 +1861,13 @@ export async function getProviderCredentials(
         retryAfterHuman: formatRetryAfter(retryAfter),
         lastError: `All ${provider} accounts have exhausted their quota`,
         lastErrorCode: 429,
+        poolRateLimit: describeEligiblePool([
+          ...blockedByPolicy.map((e): [string, string | null] => [e.id, e.resetAt]),
+          ...exhaustedQuota.map((c): [string, string | null] => [
+            c.id,
+            getQuotaCache(c.id)?.nextResetAt || null,
+          ]),
+        ]),
       };
     }
 

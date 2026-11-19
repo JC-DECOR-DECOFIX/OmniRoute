@@ -463,8 +463,7 @@ export async function executeChatWithBreaker({
               extendedContext,
               apiFormat: modelApiFormat,
               targetFormat: modelTargetFormat,
-              // The model the client asked for, when another one serves it (model fallback).
-              ...(typeof requestedModel === "string" && requestedModel ? { requestedModel } : {}),
+              requestedModel: requestedModel || undefined, // set when another model serves it
             },
             credentials: refreshedCredentials,
             log: handlerLog,
