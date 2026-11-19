@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -16,8 +18,10 @@ import {
   createPublisher,
   createUsageServer,
   loadConfig,
+  readFailure,
   readPrivateFile,
   reportFingerprint,
+  sqliteReader,
   USAGE_PATH,
 } from "../../scripts/ops/omniroute-observability/server.mjs";
 
@@ -242,6 +246,7 @@ test("switches come from attempts of one request on different accounts", () => {
   assert.equal(older.effectiveModel, "claude-fable-5-2");
   assert.equal(older.outcome, "served");
   assert.equal(older.reason.summary.includes("SECRET"), false);
+  assert.equal(older.reason.summary.includes("Bearer"), false);
   assert.deepEqual(r.lastSwitch, newest);
 });
 
@@ -285,7 +290,7 @@ test("cooldown is reported with its end", () => {
 test("sanitizeReason redacts tokens and bounds length", () => {
   assert.equal(sanitizeReason(`x ${SECRET} y`), "x [redacted] y");
   assert.equal(sanitizeReason("Bearer abc.def"), "[redacted]");
-  assert.equal(sanitizeReason("a".repeat(400)).length, 158);
+  assert.equal(sanitizeReason("a b ".repeat(200)).length, 158);
   assert.equal(sanitizeReason(""), null);
 });
 
@@ -294,7 +299,12 @@ test("observer keeps the last report and turns stale when reads fail", () => {
   let fail = false;
   const observer = createObserver({
     read: () => {
-      if (fail) throw new Error("database is locked");
+      if (fail) {
+        throw Object.assign(new Error("database is locked at /private/path"), {
+          code: "ERR_SQLITE_ERROR",
+          errstr: "database is locked",
+        });
+      }
       return {
         schema: "omni-route-usage/v1",
         generatedAt: new Date(clock).toISOString(),
@@ -312,7 +322,7 @@ test("observer keeps the last report and turns stale when reads fail", () => {
   observer.poll();
   const payload = observer.payload();
   assert.equal(payload.observer.status, "stale");
-  assert.equal(payload.observer.lastError, "database is locked");
+  assert.equal(payload.observer.lastError, "ERR_SQLITE_ERROR: database is locked");
   assert.equal(payload.value, 1);
 });
 
@@ -434,4 +444,199 @@ test("the service starts when run through a symlinked install directory", (t) =>
   });
   assert.equal(run.status, 1);
   assert.match(run.stdout, /fatal: .*missing-token/);
+});
+
+// Regressions from the independent review of PR #9.
+
+test("a failed read is reported by code, never by its message", () => {
+  assert.equal(readFailure(new Error("token=sk-ant-abc leaked at /Users/x")), "read_failed");
+  assert.equal(readFailure(Object.assign(new Error("x"), { code: "ENOENT" })), "ENOENT");
+  assert.equal(
+    readFailure(
+      Object.assign(new Error("x"), { code: "ERR_SQLITE_ERROR", errstr: "disk I/O error" })
+    ),
+    "ERR_SQLITE_ERROR"
+  );
+  assert.equal(readFailure(Object.assign(new Error("x"), { code: "bad code; rm" })), "read_failed");
+  assert.equal(readFailure("plain string"), "read_failed");
+});
+
+test("free text from the database is redacted beyond known key formats", () => {
+  assert.equal(sanitizeReason("upstream said token=abc123def"), "upstream said [redacted]");
+  assert.equal(sanitizeReason('{"api_key": "xyz789"} rejected'), '{"[redacted]"} rejected');
+  assert.equal(
+    sanitizeReason("x eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij y"),
+    "x [redacted] y"
+  );
+  assert.equal(sanitizeReason("key AbCdEf0123456789AbCdEf0123456789xyz end"), "key [redacted] end");
+  assert.equal(sanitizeReason(`Bearer\n${SECRET}`), "[redacted]");
+  const plain = "[429]: This request would exceed your account's rate limit";
+  assert.equal(sanitizeReason(plain), plain);
+});
+
+test("text fields that do not have their expected shape are dropped", () => {
+  const db = fixture();
+  db.prepare(
+    `INSERT INTO call_logs VALUES ('bad', ?, 200, ?, ?, 'claude', 'one@example.com', ?, NULL, NULL, NULL)`
+  ).run(at(0.1), "claude-opus-5-5\nInjected: header", "claude/<script>", A);
+  db.prepare("UPDATE key_value SET value = ? WHERE key = ?").run(
+    JSON.stringify({
+      fetchedAt: at(20),
+      plan: "max\u0000<b>",
+      quotas: { "weekly (7d)": { used: 50, resetAt: at(-3000) } },
+    }),
+    A
+  );
+  const r = buildUsageReport(db, { now: NOW, authorized: [A] });
+  assert.equal(r.current.connectionId, A);
+  assert.equal(r.current.effectiveModel, null);
+  assert.equal(r.current.requestedModel, null);
+  assert.equal(account(r, A).quota.plan, null);
+  assert.equal(account(r, B).quota.plan, "team");
+});
+
+test("a cache entry without quotas does not hide a valid snapshot", () => {
+  const db = fixture();
+  db.prepare("UPDATE key_value SET value = ? WHERE key = ?").run(
+    JSON.stringify({ fetchedAt: at(0), quotas: null }),
+    A
+  );
+  const a = account(buildUsageReport(db, { now: NOW }), A).quota;
+  assert.equal(a.windows.fiveHour.usedPercent, 90);
+  assert.equal(a.windows.fiveHour.source.endsWith("quota_snapshots"), true);
+  assert.equal(a.windows.weekly, null);
+  assert.equal(a.fetchedAt, at(300));
+  assert.equal(a.status, "stale");
+});
+
+test("a missing percentage is not read as 0 % remaining", () => {
+  const db = fixture();
+  db.prepare(
+    `INSERT INTO quota_snapshots (provider, connection_id, window_key, remaining_percentage, next_reset_at, created_at)
+     VALUES ('claude', ?, 'weekly (7d)', NULL, ?, ?)`
+  ).run(C, at(-5000), at(0));
+  db.prepare("UPDATE key_value SET value = ? WHERE key = ?").run(
+    JSON.stringify({
+      fetchedAt: at(15),
+      quotas: { "session (5h)": { used: null, resetAt: at(-60) }, "weekly (7d)": { used: 96 } },
+    }),
+    C
+  );
+  const c = account(buildUsageReport(db, { now: NOW }), C).quota;
+  assert.equal(c.windows.weekly.usedPercent, 96);
+  assert.equal(c.windows.weekly.source.endsWith("providerLimitsCache"), true);
+  assert.equal(c.windows.fiveHour, null);
+});
+
+test("switches skip attempts without an account and attempts outside the look-back", () => {
+  const db = fixture();
+  const row = db.prepare(
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?)`
+  );
+  // A fails, a rejection with no account, then B serves the same request.
+  row.run("n1", at(45), 503, A, "corr-4");
+  row.run("n2", at(44.9), 400, null, "corr-4");
+  row.run("n3", at(44.8), 200, B, "corr-4");
+  // An attempt eight days old does not take part in a switch inside the window.
+  row.run("o1", at(8 * 24 * 60), 500, A, "corr-5");
+  row.run("o2", at(50), 500, B, "corr-5");
+  row.run("o3", at(49.9), 200, C, "corr-5");
+  // Two attempts with one timestamp keep their insertion order.
+  row.run("t1", at(40), 529, C, "corr-6");
+  row.run("t2", at(40), 200, A, "corr-6");
+  const r = buildUsageReport(db, { now: NOW });
+  for (const event of r.switches) {
+    assert.notEqual(event.from.connectionId, null);
+    assert.notEqual(event.to.connectionId, null);
+  }
+  const pairs = (corr) =>
+    r.switches
+      .filter((e) => e.correlationId === corr)
+      .map((e) => `${e.from.shortId}>${e.to.shortId}`);
+  assert.deepEqual(pairs("corr-4"), ["aaaaaaaa>bbbbbbbb"]);
+  assert.deepEqual(pairs("corr-5"), ["bbbbbbbb>cccccccc"]);
+  assert.deepEqual(pairs("corr-6"), ["cccccccc>aaaaaaaa"]);
+});
+
+test("e-mails come from the connection, not from the call log label", () => {
+  const db = fixture();
+  db.prepare("UPDATE call_logs SET account = 'Second Account' WHERE id = 'r8'").run();
+  const r = buildUsageReport(db, { now: NOW });
+  assert.equal(r.current.connectionId, B);
+  assert.equal(r.current.email, "two@example.com");
+  assert.equal(r.current.emailConfirmed, false);
+  assert.equal(JSON.stringify(r).includes("Second Account"), false);
+  const [newest] = r.switches;
+  assert.equal(newest.to.email, "two@example.com");
+});
+
+test("a temporary cooldown marked unavailable still reports its end", () => {
+  const db = fixture();
+  db.prepare("UPDATE provider_connections SET test_status = 'unavailable' WHERE id = ?").run(B);
+  db.prepare(
+    "UPDATE provider_connections SET test_status = 'unavailable', rate_limited_until = NULL WHERE id = ?"
+  ).run(C);
+  const r = buildUsageReport(db, { now: NOW });
+  assert.equal(account(r, B).state, "cooldown");
+  assert.equal(account(r, B).stateUntil, at(-30));
+  assert.equal(account(r, C).state, "unavailable");
+  assert.equal(account(r, C).stateUntil, null);
+});
+
+test("a poll leaves the database file unchanged", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "obs-db-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "storage.sqlite");
+  const source = fixture();
+  source.exec(`VACUUM INTO '${path}'`);
+  source.close();
+  const digest = () => createHash("sha256").update(readFileSync(path)).digest("hex");
+  const before = digest();
+  const report = sqliteReader({ dbPath: path, authorized: [A], gateway: {} })(NOW);
+  assert.equal(report.current.connectionId, B);
+  assert.equal(digest(), before);
+});
+
+test("configuration rejects a socket listener and malformed ids", (t) => {
+  const { dir, write } = privateDir(t);
+  const base = { dbPath: join(dir, "db.sqlite"), tokenFile: join(dir, "token") };
+  const config = (value) => loadConfig(write("config.json", JSON.stringify(value)));
+  assert.throws(
+    () => config({ ...base, listen: { socket: join(dir, "storage.sqlite") } }),
+    /socket/
+  );
+  assert.throws(() => config({ ...base, authorizedConnections: ["ok", "../x"] }), /authorized/);
+  assert.throws(() => config({ ...base, gateway: { build: "<b>" } }), /gateway/);
+  assert.deepEqual(config({ ...base, gateway: { build: "09966db7" } }).gateway, {
+    build: "09966db7",
+  });
+});
+
+test("a port already in use ends the service with a non-zero exit", async (t) => {
+  const { dir, write } = privateDir(t);
+  const blocker = net.createServer();
+  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  t.after(() => blocker.close());
+  const tokenFile = write("token", "local-token");
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile,
+      listen: { port: blocker.address().port },
+    })
+  );
+  const child = spawn(process.execPath, [
+    fileURLToPath(new URL("server.mjs", SERVICE_DIR)),
+    configPath,
+  ]);
+  let stdout = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  clearTimeout(timer);
+  assert.equal(code, 1);
+  assert.match(stdout, /poll failed: (ERR_SQLITE_ERROR|read_failed)/);
+  assert.match(stdout, /fatal: .*EADDRINUSE/);
+  assert.equal(stdout.includes("local-token"), false);
 });

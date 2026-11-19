@@ -8,7 +8,7 @@
 // Usage: node server.mjs /absolute/path/to/config.json
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import http from "node:http";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -46,11 +46,25 @@ export function loadConfig(path) {
   if (typeof config.tokenFile !== "string" || !isAbsolute(config.tokenFile)) {
     throw new Error("config.tokenFile must be an absolute path");
   }
-  if (config.authorizedConnections !== undefined && !Array.isArray(config.authorizedConnections)) {
+  const authorized = config.authorizedConnections ?? [];
+  if (!Array.isArray(authorized) || !authorized.every((id) => /^[A-Za-z0-9-]{1,64}$/.test(id))) {
     throw new Error("config.authorizedConnections must be a list of connection ids");
   }
+  const gateway = config.gateway ?? {};
+  if (
+    typeof gateway !== "object" ||
+    Array.isArray(gateway) ||
+    !Object.values(gateway).every((v) => typeof v === "string" && /^[A-Za-z0-9 ._-]{0,64}$/.test(v))
+  ) {
+    throw new Error("config.gateway must map names to short labels");
+  }
+  // TCP on loopback is the only listener: a configurable socket path would be unlinked before
+  // binding, and a wrong path could remove a file this service does not own.
+  if (config.listen?.socket !== undefined) {
+    throw new Error("config.listen.socket is not supported; use config.listen.port");
+  }
   const port = config.listen?.port ?? DEFAULT_PORT;
-  if (!config.listen?.socket && !(Number.isInteger(port) && port > 0 && port < 65536)) {
+  if (!(Number.isInteger(port) && port > 0 && port < 65536)) {
     throw new Error("config.listen.port must be a TCP port");
   }
   const pollMs = config.pollIntervalMs ?? DEFAULT_POLL_MS;
@@ -66,6 +80,21 @@ function sameSecret(provided, expected) {
   return timingSafeEqual(a, b);
 }
 
+/**
+ * What the report says about a failed read: the error's code and, for SQLite, its fixed result
+ * text such as "database is locked". The message itself is never served, since it can quote
+ * paths or values.
+ */
+export function readFailure(error) {
+  const code =
+    typeof error?.code === "string" && /^(ERR_[A-Z0-9_]{1,60}|E[A-Z]{2,20})$/.test(error.code)
+      ? error.code
+      : "read_failed";
+  const detail =
+    typeof error?.errstr === "string" && /^[a-z ]{1,60}$/.test(error.errstr) ? error.errstr : null;
+  return detail ? `${code}: ${detail}` : code;
+}
+
 /** Holds the latest report and how current it is. Pure apart from the injected reader. */
 export function createObserver({ read, pollMs = DEFAULT_POLL_MS, now = Date.now }) {
   let report = null;
@@ -79,7 +108,7 @@ export function createObserver({ read, pollMs = DEFAULT_POLL_MS, now = Date.now 
       lastError = null;
     } catch (error) {
       // Keep the last good report; the payload says it is stale and why.
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = readFailure(error);
     }
   }
 
@@ -227,8 +256,13 @@ async function main(configPath) {
   }
 
   let lastPublishError = null;
+  let lastPollError = null;
   const tick = async () => {
     observer.poll();
+    const pollError = observer.payload().observer.lastError;
+    if (pollError !== lastPollError)
+      log(pollError ? `poll failed: ${pollError}` : "poll recovered");
+    lastPollError = pollError;
     if (!publish) return;
     try {
       await publish(observer.payload());
@@ -249,13 +283,8 @@ async function main(configPath) {
     process.exit(1);
   });
   server.on("listening", () => log(`listening on ${JSON.stringify(server.address())}`));
-  if (config.listen?.socket) {
-    rmSync(config.listen.socket, { force: true });
-    server.listen(config.listen.socket);
-  } else {
-    // Loopback only: the report names accounts and is not meant for the network.
-    server.listen(config.listen?.port ?? DEFAULT_PORT, "127.0.0.1");
-  }
+  // Loopback only: the report names accounts and is not meant for the network.
+  server.listen(config.listen?.port ?? DEFAULT_PORT, "127.0.0.1");
 
   const stop = () => {
     clearInterval(timer);

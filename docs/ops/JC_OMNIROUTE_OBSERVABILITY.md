@@ -28,9 +28,14 @@ selects a credential column and no statement writes.
 | `key_value` namespace `providerLimitsCache` | `fetchedAt`, `plan`, `quotas["session (5h)"]`, `quotas["weekly (7d)"]` (`used`, `resetAt`)                                                 | Subscription quota and when it was read                 |
 | `quota_snapshots`                           | `remaining_percentage`, `next_reset_at`, `created_at` for `session (5h)` and `weekly (7d)`                                                 | A newer quota reading than the cache, when there is one |
 
-Only `provider = 'claude'` rows are read. Error summaries are passed through a redactor that
-replaces anything shaped like an Anthropic key, a Bearer credential or a JWT, and are truncated
-to 160 characters. The unit test `tests/unit/omniroute-observability.test.mjs` fails if either
+Only `provider = 'claude'` rows are read, and only rows attributed to an account
+(`connection_id` set) take part in the account facts. Every text value is checked against the
+shape it should have (model ids, error types, plan names, e-mails, ids, timestamps) and dropped
+when it does not match. Error summaries are free text: they are passed through a redactor that
+replaces Bearer credentials, Anthropic keys, JWTs, `token=`/`api_key:`-style assignments and any
+other long opaque run of key-like characters, and are truncated to 160 characters. Redaction is
+a defense in depth, not a guarantee, which is why the report is served only on loopback with a
+token. The unit test `tests/unit/omniroute-observability.test.mjs` fails if either
 service file mentions a credential column name or if a seeded credential value reaches the
 report.
 
@@ -44,7 +49,9 @@ The report therefore gives three distinct facts:
 
 - `current`: the account of the **newest successful (2xx) Claude request** in `call_logs`, with
   its requested and effective model and timestamp. That is the account that most recently
-  answered anything.
+  answered anything. Its e-mail comes from the OAuth connection record; `call_logs.account` is
+  only a label (it can be a name or a short id), so it is never shown, and `emailConfirmed` says
+  whether it equals the connection's e-mail.
 - `inUse`: every account with a successful request in the last five minutes, with its request
   count.
 - `switches` and `lastSwitch`: attempts of one client request share a `correlation_id`. When a
@@ -72,8 +79,15 @@ Omni Route stores that reading in two places:
   to `antigravity`/`agy`, not to Claude.
 - `quota_snapshots`, written by the in-memory quota cache (`src/domain/quotaCache.ts`), which
   rechecks each active OAuth account about every five minutes but writes a snapshot only on the
-  first observation of a window or when its value changes. A snapshot's `created_at` is when the
-  value last changed, not when it was last confirmed.
+  first observation of a window or when its value changes. It rechecks only accounts already in
+  that in-memory cache. A snapshot's `created_at` is when the value last changed, not when it
+  was last confirmed.
+
+When a fetch fails, Omni Route keeps the previous good cache entry with its original `fetchedAt`
+(`mergeProviderLimitsCacheEntry`, `src/lib/usage/providerLimitsCache.ts`), so a failing vendor
+read shows up here as an aging reading, not as a new one. A cache entry without a quota table, or
+with no valid window, is not treated as a reading at all, and a missing percentage is never read
+as 0 % or 100 %.
 
 Because the five-minute rechecks that find no change leave no record, an account whose usage is
 steady can be reported `stale` although Omni Route confirmed it recently. The report shows the
@@ -93,9 +107,12 @@ instead of a guessed one:
 Two independent signals are reported:
 
 - `observer.status` describes the observer itself: `fresh` while the last successful poll is at
-  most two poll intervals old, `stale` when polls are failing (the last good report is kept and
-  `observer.lastError` says why), `unavailable` before the first successful poll. The endpoint
-  answers 503 until the first report exists.
+  most two poll intervals old, `stale` when polls are failing, `unavailable` before the first
+  successful poll. The endpoint answers 503 until the first report exists. While polls fail, the
+  last good report is kept as it was: its account, quota and reset states are history as of
+  `observer.lastSuccessAt`, and consumers must present them that way. `observer.lastError` holds
+  only the error code (for SQLite also its fixed result text, such as `database is locked`), never
+  the error message.
 - `accounts[].quota.status` describes the vendor reading: `fresh` when the newest reading is at
   most 10 minutes old, `stale` when older, `unavailable` when there is no reading at all.
 
