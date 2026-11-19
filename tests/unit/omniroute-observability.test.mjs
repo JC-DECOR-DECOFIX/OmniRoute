@@ -14,13 +14,22 @@ import {
   sanitizeReason,
 } from "../../scripts/ops/omniroute-observability/aggregate.mjs";
 import {
+  coalesce,
   createObserver,
   createPublisher,
+  createPublishQueue,
+  createRefresher,
   createUsageServer,
+  debugLogsRequests,
+  exchange,
+  gatewayUsageCall,
   loadConfig,
   readFailure,
   readPrivateFile,
+  refreshSettings,
   reportFingerprint,
+  REFRESH_REQUEST_KEY,
+  REFRESH_REQUEST_SCHEMA,
   sqliteReader,
   USAGE_PATH,
 } from "../../scripts/ops/omniroute-observability/server.mjs";
@@ -839,4 +848,1294 @@ test("a malformed request target is answered with 400 and the server keeps servi
       .on("error", reject);
   });
   assert.equal(ok, 200);
+});
+
+// Manual refresh requested from the panel.
+
+const GATEWAY_TOKEN = "oma_FAKEGATEWAYTOKEN0123456789abcdef";
+const version = (n) => `019a${String(n).padStart(4, "0")}-0000-7000-8000-000000000000`;
+
+/**
+ * A refresher over a fake gateway and a report whose quota times move when a call succeeds.
+ * `results` maps a connection id to what its gateway call returns; the default succeeds.
+ */
+function refreshHarness({
+  results = {},
+  token = GATEWAY_TOKEN,
+  connections = [A, B, C],
+  failPublish = () => false,
+} = {}) {
+  let clock = NOW;
+  const fetchedAt = new Map(connections.map((id) => [id, NOW - 3_600_000]));
+  const calls = [];
+  const published = [];
+  const logs = [];
+  let reads = 0;
+  let gate = null;
+  let refresher = null;
+  const observer = createObserver({
+    read: (now) => {
+      reads += 1;
+      return {
+        schema: "omni-route-usage/v1",
+        generatedAt: new Date(now).toISOString(),
+        accounts: connections.map((id) => ({
+          connectionId: id,
+          quota: { fetchedAt: new Date(fetchedAt.get(id)).toISOString() },
+        })),
+      };
+    },
+    now: () => clock,
+    refreshState: () => refresher.state(),
+  });
+  observer.poll();
+  refresher = createRefresher({
+    observer,
+    connections,
+    readToken: () => {
+      if (token === null) throw new Error("ENOENT: /private/omniroute-access-token");
+      return token;
+    },
+    callGateway: async ({ token: sent, connectionId, timeoutMs }) => {
+      calls.push({ token: sent, connectionId, timeoutMs, at: clock });
+      if (gate) await gate.promise;
+      const result = results[connectionId] ?? { kind: "ok", stale: false };
+      clock += result.delayMs ?? 500;
+      if (result.kind === "ok" && !result.stale && !result.noWrite)
+        fetchedAt.set(connectionId, clock);
+      return result;
+    },
+    minIntervalMs: 120_000,
+    spacingMs: 1_500,
+    timeoutMs: 30_000,
+    onChange: async () => {
+      const payload = structuredClone(observer.payload());
+      if (failPublish(payload)) throw new Error("happy kv write returned HTTP 503");
+      published.push(payload);
+    },
+    log: (message) => logs.push(message),
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+    },
+  });
+  const entry = (n, ageMs = 0, value = { schema: REFRESH_REQUEST_SCHEMA }) => ({
+    key: REFRESH_REQUEST_KEY,
+    value,
+    deleted: false,
+    version: version(n),
+    updatedAt: clock - ageMs,
+    updatedBy: "u1",
+    writeId: null,
+  });
+  const hold = () => {
+    let release;
+    gate = { promise: new Promise((resolve) => (release = resolve)) };
+    return () => {
+      gate = null;
+      release();
+    };
+  };
+  return {
+    refresher,
+    observer,
+    calls,
+    published,
+    logs,
+    entry,
+    hold,
+    reads: () => reads,
+    advance: (ms) => (clock += ms),
+    now: () => clock,
+    statuses: () => published.map((p) => p.refresh.last?.status),
+  };
+}
+
+test("a refresh publishes running, then done, calling each account in turn", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  const start = h.now();
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.deepEqual(h.statuses(), ["running", "done"]);
+  const [running, done] = h.published.map((p) => p.refresh);
+  assert.equal(running.last.startedAt, new Date(start).toISOString());
+  assert.equal(running.last.finishedAt, null);
+  assert.equal(running.nextAllowedAt, new Date(start + 120_000).toISOString());
+  assert.equal(done.minIntervalMs, 120_000);
+  assert.equal(done.nextAllowedAt, running.nextAllowedAt);
+  assert.equal(done.last.requestVersion, version(1));
+  assert.equal(done.last.requestedAt, new Date(start).toISOString());
+  assert.equal(done.last.error, null);
+  assert.deepEqual(done.last.accounts, [
+    { shortId: "aaaaaaaa", updated: true, reason: null },
+    { shortId: "bbbbbbbb", updated: true, reason: null },
+    { shortId: "cccccccc", updated: true, reason: null },
+  ]);
+  assert.deepEqual(
+    h.calls.map((c) => c.connectionId),
+    [A, B, C]
+  );
+  // One call at a time, spaced, each with its own timeout and the token from the file.
+  assert.equal(h.calls[1].at - h.calls[0].at, 2_000);
+  assert.ok(h.calls.every((c) => c.token === GATEWAY_TOKEN && c.timeoutMs === 30_000));
+  assert.deepEqual(h.logs, ["refresh requested", "refresh done 3/3"]);
+});
+
+test("a request inside the minimum interval is throttled without calling the gateway", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const nextAllowedAt = h.refresher.state().nextAllowedAt;
+  const readsBefore = h.reads();
+  h.advance(30_000);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.equal(h.reads(), readsBefore + 1, "the database is read again");
+  const last = h.published.at(-1).refresh;
+  assert.equal(last.nextAllowedAt, nextAllowedAt);
+  assert.deepEqual(last.last, {
+    requestVersion: version(2),
+    requestedAt: new Date(h.now()).toISOString(),
+    status: "throttled",
+    startedAt: null,
+    finishedAt: new Date(h.now()).toISOString(),
+    accounts: [],
+    error: null,
+  });
+  assert.equal(h.logs.at(-1), "refresh throttled");
+  // Once the interval has passed, a new request reads the vendor again.
+  h.advance(120_000);
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 6);
+  assert.equal(h.published.at(-1).refresh.last.status, "done");
+});
+
+test("a refresh that updates some accounts is partial and says why for the others", async () => {
+  const h = refreshHarness({
+    results: {
+      [A]: { kind: "http", status: 409 },
+      [B]: { kind: "ok", stale: true },
+    },
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const { last } = h.published.at(-1).refresh;
+  assert.equal(last.status, "partial");
+  assert.equal(last.error, null);
+  assert.deepEqual(last.accounts, [
+    { shortId: "aaaaaaaa", updated: false, reason: "em uso exclusivo" },
+    {
+      shortId: "bbbbbbbb",
+      updated: false,
+      reason: "a Anthropic não devolveu a cota (provável limite de consultas)",
+    },
+    { shortId: "cccccccc", updated: true, reason: null },
+  ]);
+  assert.equal(h.logs.at(-1), "refresh partial 1/3");
+});
+
+test("a refresh rejected by the gateway for every account fails with the common cause", async () => {
+  const unauthorized = { kind: "http", status: 401 };
+  const h = refreshHarness({
+    results: { [A]: unauthorized, [B]: unauthorized, [C]: unauthorized },
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const refresh = h.published.at(-1).refresh;
+  assert.equal(refresh.last.status, "failed");
+  assert.equal(refresh.last.error, "gateway_auth_failed");
+  assert.ok(refresh.last.accounts.every((a) => a.reason === "credencial do painel recusada"));
+  assert.notEqual(refresh.nextAllowedAt, null, "a failed call still counts against the interval");
+  assert.equal(h.logs.at(-1), "refresh failed: gateway_auth_failed");
+});
+
+test("other common causes are reported by kind", async () => {
+  const cases = [
+    [{ kind: "network" }, "gateway_unreachable", "Omni Route inacessível"],
+    [{ kind: "timeout" }, "gateway_timeout", "tempo esgotado"],
+    [{ kind: "http", status: 502 }, "gateway_http_502", "Omni Route respondeu HTTP 502"],
+  ];
+  for (const [result, error, reason] of cases) {
+    const h = refreshHarness({ results: { [A]: result, [B]: result, [C]: result } });
+    h.refresher.offer(null);
+    h.refresher.offer(h.entry(1));
+    await h.refresher.idle();
+    const { last } = h.published.at(-1).refresh;
+    assert.equal(last.error, error);
+    assert.equal(last.accounts[0].reason, reason);
+  }
+  // Different causes have no common one; a call accepted without a new reading says so.
+  const mixed = refreshHarness({
+    results: {
+      [A]: { kind: "network" },
+      [B]: { kind: "http", status: 409 },
+      [C]: { kind: "ok", stale: false, noWrite: true },
+    },
+  });
+  mixed.refresher.offer(null);
+  mixed.refresher.offer(mixed.entry(1));
+  await mixed.refresher.idle();
+  const { last } = mixed.published.at(-1).refresh;
+  assert.equal(last.status, "failed");
+  assert.equal(last.error, null);
+  assert.equal(last.accounts[2].reason, "leitura nova não encontrada no banco");
+});
+
+test("without the gateway token file a request fails as not configured and calls nothing", async () => {
+  const h = refreshHarness({ token: null });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  const refresh = h.published.at(-1).refresh;
+  assert.equal(refresh.nextAllowedAt, null);
+  assert.equal(refresh.last.status, "failed");
+  assert.equal(refresh.last.error, "not_configured");
+  assert.equal(refresh.last.startedAt, null);
+  assert.equal(h.logs.at(-1), "refresh failed: not_configured");
+  assert.equal(JSON.stringify([h.published, h.logs]).includes("/private"), false);
+});
+
+test("at start an old request is marked seen without being served", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(h.entry(1, 91_000));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.published.length, 0);
+  assert.equal(h.refresher.state().last, null);
+  // The same entry read again stays seen; a newer one is served.
+  h.refresher.offer(h.entry(1, 91_000));
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.equal(h.refresher.state().last.requestVersion, version(2));
+});
+
+test("at start a recent request is served once", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(h.entry(1, 10_000));
+  await h.refresher.idle();
+  h.refresher.offer(h.entry(1, 10_000));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.deepEqual(h.statuses(), ["running", "done"]);
+});
+
+test("a request that arrives during a refresh is answered when it ends", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  const release = h.hold();
+  h.refresher.offer(h.entry(1));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.statuses(), ["running"]);
+  h.refresher.offer(h.entry(2));
+  h.refresher.offer(h.entry(3));
+  release();
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3, "one refresh at a time");
+  assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
+  assert.equal(h.refresher.state().last.requestVersion, version(3));
+});
+
+test("entries that are not refresh requests are ignored", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1, 0, { schema: "something-else" }));
+  h.refresher.offer({ ...h.entry(2), deleted: true, value: null });
+  h.refresher.offer({ ...h.entry(3), version: "not-a-version" });
+  h.refresher.offer({ ...h.entry(4), version: version(4).toUpperCase() });
+  h.refresher.offer({ ...h.entry(5), updatedAt: "yesterday" });
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.published.length, 0);
+  // An older version than one already seen is not a new request.
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+});
+
+test("the refresh state changes the published fingerprint", () => {
+  const base = { schema: "s", generatedAt: "1", observer: { status: "fresh", lastError: null } };
+  const running = { ...base, refresh: { last: { status: "running" } } };
+  const done = { ...base, refresh: { last: { status: "done" } } };
+  assert.notEqual(reportFingerprint(running), reportFingerprint(done));
+  assert.notEqual(reportFingerprint({ ...base, refresh: null }), reportFingerprint(running));
+});
+
+test("published states are written in order even while another write is in flight", async () => {
+  let state = "tick";
+  const written = [];
+  let release;
+  const first = new Promise((resolve) => (release = resolve));
+  let calls = 0;
+  // A plain publisher in the service refuses a write while another one is in flight.
+  let inFlight = false;
+  const flush = createPublishQueue({
+    publish: async (payload) => {
+      assert.equal(inFlight, false);
+      inFlight = true;
+      calls += 1;
+      if (calls === 1) await first;
+      written.push(payload.state);
+      inFlight = false;
+    },
+    payload: () => ({ state }),
+  });
+  // A tick's write is in flight when the refresh starts and publishes "running".
+  const tick = flush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  state = "running";
+  const running = flush();
+  release();
+  await running;
+  state = "done";
+  await flush();
+  await tick;
+  assert.deepEqual(written, ["tick", "running", "done"]);
+});
+
+test("a publish failure does not stop the queue", async () => {
+  const errors = [];
+  let n = 0;
+  const flush = createPublishQueue({
+    publish: async () => {
+      n += 1;
+      if (n === 1) throw new Error("happy kv write returned HTTP 503");
+      return "written";
+    },
+    payload: () => ({}),
+    onResult: (error, result) => errors.push(error?.message ?? result),
+  });
+  // Each caller learns how its own publish went; the next one still runs.
+  const first = flush();
+  const second = flush();
+  await assert.rejects(first, /HTTP 503/);
+  assert.equal(await second, "written");
+  assert.deepEqual(errors, ["happy kv write returned HTTP 503", "written"]);
+});
+
+test("refresh configuration is validated", (t) => {
+  const { dir, write } = privateDir(t);
+  const base = {
+    dbPath: join(dir, "db.sqlite"),
+    tokenFile: join(dir, "token"),
+    authorizedConnections: [A],
+    happy: { socketPath: join(dir, "s.sock"), tokenFile: join(dir, "happy"), artifactId: "art1" },
+  };
+  const refresh = { tokenFile: join(dir, "omniroute-access-token") };
+  const config = (value) => loadConfig(write("config.json", JSON.stringify(value)));
+  assert.deepEqual(refreshSettings(config({ ...base, refresh })), {
+    baseUrl: "http://127.0.0.1:20128",
+    tokenFile: refresh.tokenFile,
+    minIntervalMs: 120_000,
+    requestPollMs: 2_000,
+    timeoutMs: 30_000,
+    spacingMs: 1_500,
+  });
+  for (const baseUrl of ["http://localhost:20128", "https://[::1]:20128/"]) {
+    assert.equal(config({ ...base, refresh: { ...refresh, baseUrl } }).refresh.baseUrl, baseUrl);
+  }
+  for (const baseUrl of [
+    "http://192.168.0.15:20128",
+    "http://example.com",
+    "http://127.0.0.1.example.com",
+    "http://user:pass@127.0.0.1:20128",
+    "http://127.0.0.1:20128/api",
+    "http://127.0.0.1:20128/?x=1",
+    "ftp://127.0.0.1",
+    "not a url",
+  ]) {
+    assert.throws(() => config({ ...base, refresh: { ...refresh, baseUrl } }), /baseUrl/, baseUrl);
+  }
+  const bad = [
+    [{ minIntervalMs: 59_999 }, /minIntervalMs/],
+    [{ requestPollMs: 499 }, /requestPollMs/],
+    [{ requestPollMs: 10_001 }, /requestPollMs/],
+    [{ timeoutMs: 4_999 }, /timeoutMs/],
+    [{ timeoutMs: 60_001 }, /timeoutMs/],
+    [{ spacingMs: -1 }, /spacingMs/],
+    [{ tokenFile: "token" }, /tokenFile/],
+    // An explicit null is not the default: it would remove the interval or the poll delay.
+    [{ minIntervalMs: null }, /minIntervalMs/],
+    [{ requestPollMs: null }, /requestPollMs/],
+    [{ timeoutMs: null }, /timeoutMs/],
+    [{ spacingMs: null }, /spacingMs/],
+    [{ baseUrl: null }, /baseUrl/],
+    [{ baseUrl: 20128 }, /baseUrl/],
+    [{ minIntervalMs: 120_000.5 }, /minIntervalMs/],
+  ];
+  for (const [change, error] of bad) {
+    assert.throws(() => config({ ...base, refresh: { ...refresh, ...change } }), error);
+  }
+  assert.throws(() => config({ ...base, happy: undefined, refresh }), /happy/);
+  assert.throws(() => config({ ...base, authorizedConnections: [], refresh }), /authorized/);
+  assert.throws(() => config({ ...base, refresh: [] }), /refresh/);
+  assert.equal(refreshSettings(config(base)), null);
+});
+
+test("without refresh configured the report carries refresh: null", () => {
+  const observer = createObserver({
+    read: () => ({ schema: "omni-route-usage/v1", generatedAt: "x" }),
+    now: () => NOW,
+  });
+  observer.poll();
+  assert.equal(observer.payload().refresh, null);
+  assert.equal(Object.hasOwn(observer.payload(), "refresh"), true);
+});
+
+/** A fake Omni Route: answers each path with the response the test set for it. */
+async function fakeGateway(t, respond) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ url: req.url, authorization: req.headers.authorization });
+    respond(req, res);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  return { baseUrl: `http://127.0.0.1:${server.address().port}`, seen };
+}
+
+test("the gateway call keeps only the status and the stale marker", async (t) => {
+  const secretBody = `upstream 429 rate limited ${SECRET} Bearer ${GATEWAY_TOKEN}`;
+  const { baseUrl, seen } = await fakeGateway(t, (req, res) => {
+    const json = (status, body) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (req.url.endsWith("/ok")) {
+      return json(200, {
+        plan: "Claude Max 20x",
+        quotas: { "weekly (7d)": { used: 41, resetAt: "2026-11-23T06:00:00.000Z" } },
+      });
+    }
+    // What the installed build answers after a 429 from /api/oauth/usage: the legacy fallback's
+    // message becomes the stale reason, and the previous quotas are served.
+    if (req.url.endsWith("/limited")) {
+      return json(200, {
+        message: null,
+        quotas: { "weekly (7d)": { used: 40 } },
+        _stale: true,
+        _staleSince: "2026-11-19T18:00:00.000Z",
+        _staleReason: "Claude connected. Usage API requires admin permissions.",
+      });
+    }
+    if (req.url.endsWith("/busy")) return json(409, { error: secretBody });
+    if (req.url.endsWith("/denied")) return json(401, { error: secretBody });
+    if (req.url.endsWith("/huge")) return json(200, { pad: "x".repeat(1_200_000) });
+    if (req.url.endsWith("/cut")) {
+      res.writeHead(200, { "content-type": "application/json", "content-length": "100" });
+      res.write('{"quotas":');
+      setTimeout(() => res.socket.destroy(), 20);
+      return;
+    }
+    if (req.url.endsWith("/trickle")) {
+      // Headers and a byte every 50 ms, forever: no inactivity timeout would fire.
+      res.writeHead(200, { "content-type": "application/json" });
+      const timer = setInterval(() => res.write(" "), 50);
+      res.on("close", () => clearInterval(timer));
+      return;
+    }
+    // "/slow" never answers.
+  });
+  const call = (connectionId, timeoutMs = 5_000) =>
+    gatewayUsageCall({ baseUrl, token: GATEWAY_TOKEN, connectionId, timeoutMs });
+  assert.deepEqual(await call("ok"), { kind: "ok", stale: false });
+  assert.deepEqual(await call("limited"), { kind: "ok", stale: true });
+  assert.deepEqual(await call("busy"), { kind: "http", status: 409 });
+  assert.deepEqual(await call("denied"), { kind: "http", status: 401 });
+  assert.deepEqual(await call("huge"), { kind: "network" });
+  assert.deepEqual(await call("cut"), { kind: "network" });
+  assert.deepEqual(await call("slow", 200), { kind: "timeout" });
+  const started = Date.now();
+  assert.deepEqual(await call("trickle", 300), { kind: "timeout" });
+  assert.ok(Date.now() - started < 2_000, "the deadline covers the whole exchange");
+  assert.equal(seen[0].url, "/api/usage/ok");
+  assert.equal(seen[0].authorization, `Bearer ${GATEWAY_TOKEN}`);
+  // A connection id cannot leave the usage path.
+  await call("../../api/providers");
+  assert.equal(seen.at(-1).url, "/api/usage/..%2F..%2Fapi%2Fproviders");
+});
+
+test("an unreachable gateway is a network failure", async () => {
+  const blocker = net.createServer();
+  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  const { port } = blocker.address();
+  await new Promise((resolve) => blocker.close(resolve));
+  const result = await gatewayUsageCall({
+    baseUrl: `http://127.0.0.1:${port}`,
+    token: GATEWAY_TOKEN,
+    connectionId: A,
+    timeoutMs: 5_000,
+  });
+  assert.deepEqual(result, { kind: "network" });
+});
+
+/**
+ * A fake Happy daemon on a Unix socket: records requests and answers kv reads of the request
+ * key with `requestEntry()`.
+ */
+async function fakeDaemon(t, dir, requestEntry = () => null) {
+  const requests = [];
+  const socketPath = join(dir, "d.sock");
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        body: body ? JSON.parse(body) : null,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      if (req.method === "GET") res.end(JSON.stringify({ entry: requestEntry(), cursor: null }));
+      else res.end(JSON.stringify({ entry: {}, replayed: false }));
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  return { socketPath, requests };
+}
+
+async function freePort() {
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+  return port;
+}
+
+function startService(t, configPath, env = process.env) {
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL("server.mjs", SERVICE_DIR)), configPath],
+    { env }
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  t.after(() => child.kill("SIGKILL"));
+  return { child, stdout: () => stdout, stderr: () => stderr };
+}
+
+async function waitFor(predicate, ms = 8_000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("condition not met in time");
+}
+
+test("the service without a refresh block publishes refresh: null and never reads requests", async (t) => {
+  const { dir, write } = privateDir(t);
+  const daemon = await fakeDaemon(t, dir);
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      listen: { port: await freePort() },
+      happy: {
+        socketPath: daemon.socketPath,
+        tokenFile: write("happy", "daemon-token"),
+        artifactId: "art1",
+      },
+    })
+  );
+  startService(t, configPath);
+  await waitFor(() => daemon.requests.some((r) => r.method === "PUT"));
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(
+    daemon.requests.some((r) => r.method === "GET"),
+    false
+  );
+  const put = daemon.requests.find((r) => r.method === "PUT");
+  assert.equal(put.body.value.refresh, null);
+});
+
+test("the service reads refresh requests through the daemon and answers them", async (t) => {
+  const { dir, write } = privateDir(t);
+  const entry = {
+    key: REFRESH_REQUEST_KEY,
+    value: { schema: REFRESH_REQUEST_SCHEMA, extra: GATEWAY_TOKEN },
+    deleted: false,
+    version: version(7),
+    updatedAt: Date.now(),
+  };
+  const daemon = await fakeDaemon(t, dir, () => entry);
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      authorizedConnections: [A],
+      listen: { port: await freePort() },
+      happy: {
+        socketPath: daemon.socketPath,
+        tokenFile: write("happy", "daemon-token"),
+        artifactId: "art1",
+      },
+      refresh: { tokenFile: join(dir, "omniroute-access-token"), requestPollMs: 500 },
+    })
+  );
+  const service = startService(t, configPath);
+  const answered = () =>
+    daemon.requests.find((r) => r.method === "PUT" && r.body.value.refresh?.last);
+  await waitFor(answered);
+  const get = daemon.requests.find((r) => r.method === "GET" && r.url.endsWith("refresh-request"));
+  assert.equal(get.url, "/v0/artifacts/art1/api/v1/kv/entry?key=omni-route%2Frefresh-request");
+  assert.equal(get.authorization, "Bearer daemon-token");
+  const { refresh } = answered().body.value;
+  assert.equal(refresh.minIntervalMs, 120_000);
+  assert.equal(refresh.last.requestVersion, version(7));
+  assert.equal(refresh.last.error, "not_configured");
+  // The first report already carries the refresh state, before any request is answered.
+  const firstPut = daemon.requests.find((r) => r.method === "PUT");
+  assert.deepEqual(firstPut.body.value.refresh, {
+    minIntervalMs: 120_000,
+    nextAllowedAt: null,
+    last: null,
+  });
+  await waitFor(() => service.stdout().includes("refresh failed: not_configured"));
+  const everything =
+    JSON.stringify(daemon.requests.filter((r) => r.method === "PUT")) + service.stdout();
+  assert.equal(everything.includes(GATEWAY_TOKEN), false);
+  assert.equal(service.stdout().includes("daemon-token"), false);
+});
+
+test("no gateway token appears in a published refresh or its log", async () => {
+  const h = refreshHarness({
+    results: {
+      [A]: { kind: "http", status: 401 },
+      [B]: { kind: "ok", stale: true },
+    },
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const everything = JSON.stringify([h.published, h.logs]);
+  for (const needle of [GATEWAY_TOKEN, "oma_", "Bearer ", "sk-ant"]) {
+    assert.equal(everything.includes(needle), false, needle);
+  }
+});
+
+// Regressions from the independent review of PR #12.
+
+test("the gateway is not called when the running state cannot be published", async () => {
+  let storeDown = true;
+  const h = refreshHarness({
+    failPublish: (payload) => storeDown && payload.refresh.last?.status === "running",
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  const refresh = h.refresher.state();
+  assert.equal(refresh.nextAllowedAt, null, "the request does not use the interval");
+  assert.equal(refresh.last.status, "failed");
+  assert.equal(refresh.last.error, null);
+  assert.equal(refresh.last.startedAt, null);
+  assert.deepEqual(h.statuses(), ["failed"]);
+  assert.equal(h.logs.at(-1), "refresh failed: publish");
+  // Once the store takes writes again, the next request is served.
+  storeDown = false;
+  h.advance(5_000);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.deepEqual(h.statuses(), ["failed", "running", "done"]);
+  assert.equal(h.calls.length, 3);
+});
+
+test("a request seen during a refresh is throttled even when the interval ends meanwhile", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  const release = h.hold();
+  h.refresher.offer(h.entry(1));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.refresher.offer(h.entry(2));
+  // The first refresh takes longer than the whole interval.
+  h.advance(200_000);
+  release();
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3, "the gateway is read once");
+  assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
+  assert.equal(h.refresher.state().last.requestVersion, version(2));
+  // A request made after that refresh ended is a new refresh.
+  h.advance(1_000);
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 6);
+});
+
+test("an exchange fails on a rejected, interrupted or endless response", async (t) => {
+  const { dir } = privateDir(t);
+  const socketPath = join(dir, "k.sock");
+  const server = http.createServer((req, res) => {
+    if (req.url === "/rejected") {
+      res.writeHead(503);
+      return res.end("draining");
+    }
+    if (req.url === "/cut") {
+      res.writeHead(200, { "content-length": "50" });
+      res.write("{");
+      return setTimeout(() => res.socket.destroy(), 20);
+    }
+    if (req.url === "/endless") {
+      res.writeHead(200);
+      const timer = setInterval(() => res.write(" "), 50);
+      return res.on("close", () => clearInterval(timer));
+    }
+    res.writeHead(200);
+    res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const call = (path, deadlineMs = 2_000) =>
+    exchange({ options: { socketPath, path, method: "PUT" }, deadlineMs, label: "happy kv write" });
+  assert.deepEqual(await call("/ok"), { status: 200, text: "{}" });
+  assert.deepEqual(await call("/rejected"), { status: 503, text: "draining" });
+  await assert.rejects(call("/cut"), (error) => error.kind === "network");
+  await assert.rejects(
+    call("/endless", 300),
+    (error) => error.kind === "timeout" && error.message === "happy kv write timed out"
+  );
+  await assert.rejects(
+    exchange({
+      options: { socketPath: join(dir, "missing.sock"), path: "/", method: "GET" },
+      deadlineMs: 2_000,
+      label: "happy kv read",
+    }),
+    (error) => error.kind === "network" && !error.message.includes(dir)
+  );
+});
+
+test("the service keeps publishing after the daemon rejects a write", async (t) => {
+  const { dir, write } = privateDir(t);
+  const socketPath = join(dir, "d.sock");
+  const puts = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.method !== "PUT") return res.writeHead(404).end();
+      puts.push(Date.now());
+      res.writeHead(puts.length === 1 ? 503 : 200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      listen: { port: await freePort() },
+      pollIntervalMs: 1_000,
+      happy: { socketPath, tokenFile: write("happy", "daemon-token"), artifactId: "art1" },
+    })
+  );
+  const service = startService(t, configPath);
+  await waitFor(() => puts.length >= 2);
+  assert.match(service.stdout(), /happy publish failed: happy kv write returned HTTP 503/);
+  await waitFor(() => service.stdout().includes("happy publish recovered"));
+});
+
+// Regressions from the second independent review of PR #12.
+
+test("a request made during a refresh but first seen after it is throttled", async () => {
+  const h = refreshHarness();
+  h.refresher.offer(null);
+  const release = h.hold();
+  h.refresher.offer(h.entry(1));
+  await new Promise((resolve) => setImmediate(resolve));
+  // The refresh outlasts the interval; the next request is written just before it ends and
+  // read only after.
+  h.advance(200_000);
+  release();
+  await h.refresher.idle();
+  h.refresher.offer(h.entry(2, 1_000));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
+  // A request written after the refresh ended, with the interval over, reads the vendor again.
+  h.advance(1_000);
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 6);
+});
+
+test("periodic publishes join the one already waiting", async () => {
+  let release;
+  let calls = 0;
+  const run = coalesce(async () => {
+    calls += 1;
+    await new Promise((resolve) => (release = resolve));
+  });
+  const waits = Array.from({ length: 10 }, () => run());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  release();
+  await Promise.all(waits);
+  const next = run();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 2);
+  release();
+  await next;
+});
+
+test("localhost is pinned to the loopback address", (t) => {
+  const { dir, write } = privateDir(t);
+  const config = loadConfig(
+    write(
+      "config.json",
+      JSON.stringify({
+        dbPath: join(dir, "db.sqlite"),
+        tokenFile: join(dir, "token"),
+        authorizedConnections: [A],
+        happy: { socketPath: join(dir, "s"), tokenFile: join(dir, "h"), artifactId: "art1" },
+        refresh: { tokenFile: join(dir, "t"), baseUrl: "http://localhost:20128" },
+      })
+    )
+  );
+  assert.equal(refreshSettings(config).baseUrl, "http://127.0.0.1:20128");
+});
+
+test("a proxy configured for the process never receives a call or its credential", async (t) => {
+  const proxied = [];
+  const proxy = http.createServer((req, res) => {
+    proxied.push({ url: req.url, authorization: req.headers.authorization });
+    res.writeHead(502).end();
+  });
+  proxy.on("connect", (req, socket) => {
+    proxied.push({ url: req.url });
+    socket.destroy();
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    proxy.closeAllConnections();
+    proxy.close();
+  });
+  const { baseUrl, seen } = await fakeGateway(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const proxyUrl = `http://127.0.0.1:${proxy.address().port}`;
+  const serverUrl = new URL("server.mjs", SERVICE_DIR).href;
+  const script = `
+    import http from "node:http";
+    const { gatewayUsageCall } = await import(${JSON.stringify(serverUrl)});
+    const via = await new Promise((resolve) => {
+      http.get(${JSON.stringify(`${baseUrl}/global`)}, (res) => { res.resume(); resolve(res.statusCode); })
+        .on("error", () => resolve("error"));
+    });
+    const direct = await gatewayUsageCall({
+      baseUrl: ${JSON.stringify(baseUrl)}, token: ${JSON.stringify(GATEWAY_TOKEN)},
+      connectionId: "a", timeoutMs: 5000,
+    });
+    process.stdout.write(JSON.stringify({ via, direct }));`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: {
+      ...process.env,
+      NODE_USE_ENV_PROXY: "1",
+      HTTP_PROXY: proxyUrl,
+      HTTPS_PROXY: proxyUrl,
+      NO_PROXY: "",
+      no_proxy: "",
+    },
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  assert.equal(code, 0, stderr);
+  const { via, direct } = JSON.parse(stdout);
+  // The global agent does go through the proxy, so the check below means something.
+  assert.equal(via, 502);
+  assert.deepEqual(direct, { kind: "ok", stale: false });
+  assert.deepEqual(
+    seen.map((r) => r.url),
+    ["/api/usage/a"]
+  );
+  assert.equal(
+    proxied.some((r) => r.authorization?.includes(GATEWAY_TOKEN)),
+    false
+  );
+  assert.deepEqual(
+    proxied.map((r) => r.url),
+    [`${baseUrl}/global`]
+  );
+});
+
+// Regressions from the third independent review of PR #12.
+
+test("a timed-out account ends the round without reading the others", async () => {
+  const h = refreshHarness({ results: { [A]: { kind: "timeout" } } });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.deepEqual(
+    h.calls.map((c) => c.connectionId),
+    [A]
+  );
+  const { last } = h.refresher.state();
+  assert.equal(last.status, "failed");
+  assert.equal(last.error, "gateway_timeout");
+  assert.deepEqual(
+    last.accounts.map((a) => a.reason),
+    [
+      "tempo esgotado",
+      "não consultada: rodada interrompida por tempo esgotado",
+      "não consultada: rodada interrompida por tempo esgotado",
+    ]
+  );
+  const later = refreshHarness({ results: { [B]: { kind: "timeout" } } });
+  later.refresher.offer(null);
+  later.refresher.offer(later.entry(1));
+  await later.refresher.idle();
+  assert.equal(later.calls.length, 2);
+  assert.equal(later.refresher.state().last.status, "partial");
+});
+
+test("after a restart a request already answered is not answered again", async () => {
+  const first = refreshHarness();
+  first.refresher.offer(null);
+  first.refresher.offer(first.entry(1));
+  await first.refresher.idle();
+  const published = first.published.at(-1).refresh;
+
+  // The new process reads its own last report before publishing anything.
+  const h = refreshHarness();
+  h.advance(1_000);
+  h.refresher.restore(structuredClone(published));
+  assert.deepEqual(h.refresher.state(), published);
+  h.refresher.offer({ ...h.entry(1), updatedAt: NOW });
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  // A new request inside the restored interval is throttled.
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.refresher.state().last.status, "throttled");
+  assert.equal(h.refresher.state().nextAllowedAt, published.nextAllowedAt);
+});
+
+test("a refresh cut short by a restart is reported failed and not repeated", async () => {
+  const h = refreshHarness();
+  h.refresher.restore({
+    minIntervalMs: 120_000,
+    nextAllowedAt: new Date(NOW + 100_000).toISOString(),
+    last: {
+      requestVersion: version(1),
+      requestedAt: new Date(NOW - 20_000).toISOString(),
+      status: "running",
+      startedAt: new Date(NOW - 20_000).toISOString(),
+      finishedAt: null,
+      accounts: [],
+      error: null,
+    },
+  });
+  const { last } = h.refresher.state();
+  assert.equal(last.status, "failed");
+  assert.equal(last.finishedAt, new Date(NOW).toISOString());
+  assert.equal(h.logs.at(-1), "refresh interrupted by a restart");
+  h.refresher.offer({ ...h.entry(1), updatedAt: NOW - 20_000 });
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+});
+
+test("restored state that is not well formed is not trusted", async () => {
+  const restored = (previous) => {
+    const h = refreshHarness();
+    h.refresher.restore(previous);
+    return h;
+  };
+  const valid = {
+    nextAllowedAt: new Date(NOW + 60_000).toISOString(),
+    last: { requestVersion: version(1), status: "done", accounts: [] },
+  };
+  assert.equal(restored(valid).refresher.state().last.requestVersion, version(1));
+  // A version from the future would hide every request until then.
+  const future = "ffffffff-ffff-7000-8000-000000000000";
+  const h = restored({ ...valid, last: { ...valid.last, requestVersion: future } });
+  assert.equal(h.refresher.state().last, null);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  // An interval pushed far ahead is dropped; foreign fields and text are cleaned.
+  const odd = restored({
+    nextAllowedAt: "2999-01-01T00:00:00.000Z",
+    last: {
+      requestVersion: version(1),
+      status: "done",
+      accounts: [
+        { shortId: "<script>", updated: false },
+        { shortId: "aaaaaaaa", updated: false, reason: `x ${GATEWAY_TOKEN}`, extra: 1 },
+      ],
+      error: "pwned",
+      injected: true,
+    },
+  }).refresher.state();
+  assert.equal(odd.nextAllowedAt, null);
+  assert.deepEqual(odd.last.accounts, [
+    { shortId: "aaaaaaaa", updated: false, reason: "x [redacted]" },
+  ]);
+  assert.equal(odd.last.error, null);
+  assert.equal(Object.hasOwn(odd.last, "injected"), false);
+  for (const bad of [null, {}, { last: { requestVersion: "x", status: "done" } }]) {
+    assert.equal(restored(bad).refresher.state().last, null);
+  }
+  assert.equal(
+    restored({ last: { requestVersion: version(1), status: "weird" } }).refresher.state().last,
+    null
+  );
+});
+
+test("NODE_DEBUG disables the gateway credential", () => {
+  assert.equal(debugLogsRequests({}), false);
+  assert.equal(debugLogsRequests({ NODE_DEBUG: "" }), false);
+  assert.equal(debugLogsRequests({ NODE_DEBUG: "https" }), true);
+  assert.equal(debugLogsRequests({ NODE_DEBUG: "net,tls" }), true);
+});
+
+test("the service with NODE_DEBUG set never sends the gateway token", async (t) => {
+  const { dir, write } = privateDir(t);
+  const gateway = await fakeGateway(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const entry = {
+    key: REFRESH_REQUEST_KEY,
+    value: { schema: REFRESH_REQUEST_SCHEMA },
+    deleted: false,
+    version: version(9),
+    updatedAt: Date.now(),
+  };
+  const daemon = await fakeDaemon(t, dir, () => entry);
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      authorizedConnections: [A],
+      listen: { port: await freePort() },
+      happy: {
+        socketPath: daemon.socketPath,
+        tokenFile: write("happy", "daemon-token"),
+        artifactId: "art1",
+      },
+      refresh: {
+        baseUrl: gateway.baseUrl,
+        tokenFile: write("omniroute-access-token", GATEWAY_TOKEN),
+        requestPollMs: 500,
+      },
+    })
+  );
+  const service = startService(t, configPath, { ...process.env, NODE_DEBUG: "http,https,net" });
+  const answered = () =>
+    daemon.requests.find((r) => r.method === "PUT" && r.body.value.refresh?.last);
+  await waitFor(answered);
+  assert.equal(answered().body.value.refresh.last.error, "not_configured");
+  assert.equal(gateway.seen.length, 0);
+  assert.match(service.stdout(), /refresh disabled while NODE_DEBUG is set/);
+  assert.equal(service.stderr().includes(GATEWAY_TOKEN), false);
+  assert.equal(service.stdout().includes(GATEWAY_TOKEN), false);
+});
+
+test("an exchange whose request cannot be created fails like a network error", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    exchange({
+      options: { host: "127.0.0.1", path: "/", method: "GET", headers: { "bad\nname": "x" } },
+      deadlineMs: 60_000,
+      label: "omni route usage",
+    }),
+    (error) => error.kind === "network" && error.message.startsWith("omni route usage")
+  );
+  assert.ok(Date.now() - started < 1_000);
+});
+
+// Regressions from the fourth independent review of PR #12.
+
+test("after a restore the first request read still has to be recent", async () => {
+  const h = refreshHarness();
+  h.refresher.restore({
+    nextAllowedAt: null,
+    last: {
+      requestVersion: version(1),
+      status: "done",
+      startedAt: new Date(NOW - 600_000).toISOString(),
+      finishedAt: new Date(NOW - 595_000).toISOString(),
+      accounts: [],
+    },
+  });
+  // Newer than the one answered, but made 100 s ago while the service was down.
+  h.refresher.offer(h.entry(2, 100_000));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.refresher.state().last.requestVersion, version(1));
+  h.refresher.offer(h.entry(3));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+});
+
+test("a late timeout restarts the interval at the timeout", async () => {
+  const slow = { kind: "ok", stale: false, delayMs: 29_000 };
+  const h = refreshHarness({
+    results: { [A]: slow, [B]: slow, [C]: { kind: "timeout", delayMs: 30_000 } },
+  });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const timedOutAt = h.now();
+  assert.equal(h.refresher.state().last.status, "partial");
+  assert.equal(h.refresher.state().nextAllowedAt, new Date(timedOutAt + 120_000).toISOString());
+  h.advance(100_000);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 3);
+  assert.equal(h.refresher.state().last.status, "throttled");
+});
+
+test("the service publishes nothing and answers nothing until its last state is read", async (t) => {
+  const { dir, write } = privateDir(t);
+  const gateway = await fakeGateway(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const answeredAt = Date.now() - 5_000;
+  const previous = {
+    schema: "omni-route-usage/v1",
+    refresh: {
+      minIntervalMs: 120_000,
+      nextAllowedAt: new Date(answeredAt + 120_000).toISOString(),
+      last: {
+        requestVersion: version(7),
+        requestedAt: new Date(answeredAt).toISOString(),
+        status: "done",
+        startedAt: new Date(answeredAt).toISOString(),
+        finishedAt: new Date(answeredAt + 3_000).toISOString(),
+        accounts: [{ shortId: "aaaaaaaa", updated: true, reason: null }],
+        error: null,
+      },
+    },
+  };
+  const request = {
+    key: REFRESH_REQUEST_KEY,
+    value: { schema: REFRESH_REQUEST_SCHEMA },
+    deleted: false,
+    version: version(7),
+    updatedAt: answeredAt,
+  };
+  const socketPath = join(dir, "d.sock");
+  const events = [];
+  let usageReads = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const json = (status, value) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(value));
+      };
+      if (req.method === "PUT") {
+        events.push({ put: JSON.parse(body).value });
+        return json(200, { entry: {}, replayed: false });
+      }
+      if (req.url.endsWith("refresh-request")) {
+        events.push("request read");
+        return json(200, { entry: request, cursor: null });
+      }
+      usageReads += 1;
+      events.push(`usage read ${usageReads}`);
+      // The daemon is draining on the first read, then answers.
+      if (usageReads === 1) return json(503, { error: "draining" });
+      return json(200, { entry: { key: "omni-route/usage", value: previous }, cursor: null });
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath: join(dir, "missing.sqlite"),
+      tokenFile: write("token", "local-token"),
+      authorizedConnections: [A],
+      listen: { port: await freePort() },
+      pollIntervalMs: 1_000,
+      happy: { socketPath, tokenFile: write("happy", "daemon-token"), artifactId: "art1" },
+      refresh: {
+        baseUrl: gateway.baseUrl,
+        tokenFile: write("omniroute-access-token", GATEWAY_TOKEN),
+        requestPollMs: 500,
+      },
+    })
+  );
+  const service = startService(t, configPath);
+  await waitFor(() => events.some((e) => e.put));
+  await waitFor(() => events.filter((e) => e === "request read").length >= 2);
+  const firstPut = events.findIndex((e) => e.put);
+  assert.ok(events.indexOf("usage read 2") < firstPut, JSON.stringify(events.slice(0, 5)));
+  // No request is read, and nothing is published, before the read that succeeds.
+  assert.equal(events.slice(0, events.indexOf("usage read 2")).includes("request read"), false);
+  assert.deepEqual(events[firstPut].put.refresh, previous.refresh);
+  assert.equal(gateway.seen.length, 0, "the answered request is not read again");
+  assert.match(service.stdout(), /refresh state not restored: happy kv read returned HTTP 503/);
+  assert.match(service.stdout(), /refresh state restored/);
+});
+
+// Regression from the fifth independent review of PR #12.
+
+test("a restart after a late timeout whose result was not written keeps a whole interval", async () => {
+  // The round started 90 s ago and timed out just now; its result never reached the store, so
+  // the published state is still "running" with the interval counted from the start.
+  const slow = { kind: "ok", stale: false, delayMs: 29_000 };
+  let resultWritten = true;
+  const first = refreshHarness({
+    results: { [A]: slow, [B]: slow, [C]: { kind: "timeout", delayMs: 30_000 } },
+    failPublish: (payload) => !resultWritten && payload.refresh.last?.status !== "running",
+  });
+  resultWritten = false;
+  first.refresher.offer(null);
+  first.refresher.offer(first.entry(1));
+  await first.refresher.idle();
+  const published = first.published.at(-1).refresh;
+  assert.equal(published.last.status, "running");
+
+  // The service restarts 10 s later.
+  const h = refreshHarness();
+  h.advance(first.now() - NOW + 10_000);
+  const restartedAt = h.now();
+  h.refresher.restore(structuredClone(published));
+  assert.equal(h.refresher.state().nextAllowedAt, new Date(restartedAt + 120_000).toISOString());
+  h.advance(30_000);
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.refresher.state().last.status, "throttled");
 });

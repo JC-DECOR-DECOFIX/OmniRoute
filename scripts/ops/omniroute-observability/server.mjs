@@ -5,23 +5,49 @@
 // when configured, publishes it to a Happy artifact's data store so Happy Desktop and the Happy
 // phone apps can show it through the daemon's own authenticated connection.
 //
+// With a `refresh` block it also answers the panel's "refresh" button: the panel writes a request
+// to the artifact's data store, and the service asks Omni Route to read each authorized account's
+// quota again, at most once per minimum interval.
+//
 // Usage: node server.mjs /absolute/path/to/config.json
 
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
-import { buildUsageReport } from "./aggregate.mjs";
+import { buildUsageReport, sanitizeReason } from "./aggregate.mjs";
 
 export const USAGE_PATH = "/internal/omni-route/usage";
 export const KV_KEY = "omni-route/usage";
+export const REFRESH_REQUEST_KEY = "omni-route/refresh-request";
+export const REFRESH_REQUEST_SCHEMA = "omni-route-refresh-request/v1";
 
 const DEFAULT_POLL_MS = 15_000;
 const DEFAULT_PORT = 20141;
 const DEFAULT_HEARTBEAT_MS = 60_000;
 const PUBLISH_TIMEOUT_MS = 10_000;
+const KV_READ_TIMEOUT_MS = 10_000;
+// A data-store value is at most 256 KiB; its entry wraps it in a little more.
+const MAX_RESPONSE_BYTES = 1024 * 1024;
+
+const REFRESH_DEFAULTS = {
+  baseUrl: "http://127.0.0.1:20128",
+  minIntervalMs: 120_000,
+  requestPollMs: 2_000,
+  timeoutMs: 30_000,
+  spacingMs: 1_500,
+};
+// A request already in the store when the service starts is served only if it is this recent;
+// an older one was made while the service was down and its viewer has moved on.
+const STARTUP_REQUEST_MAX_AGE_MS = 90_000;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+// Agents of their own, so a proxy configured for the process (NODE_USE_ENV_PROXY with
+// HTTP_PROXY, which the global agent honors) never receives a request or its credential.
+const DIRECT_HTTP = new http.Agent();
+const DIRECT_HTTPS = new https.Agent();
 
 /** Same owner-only rule as the continuity client's private configuration. */
 export function readPrivateFile(path) {
@@ -71,7 +97,80 @@ export function loadConfig(path) {
   if (!Number.isInteger(pollMs) || pollMs < 1_000) {
     throw new Error("config.pollIntervalMs must be at least 1000");
   }
+  if (config.refresh !== undefined) validateRefresh(config);
   return config;
+}
+
+function integerIn(value, min, max) {
+  return Number.isInteger(value) && value >= min && value <= max;
+}
+
+/**
+ * The refresh block calls Omni Route with a credential, so it may only point at the gateway on
+ * this machine, and it needs the Happy block, through which requests arrive.
+ */
+function validateRefresh(config) {
+  if (!config.refresh || typeof config.refresh !== "object" || Array.isArray(config.refresh)) {
+    throw new Error("config.refresh must be an object");
+  }
+  // The settings are validated as the service will use them, defaults applied: an explicit
+  // null is not a default and is refused.
+  const refresh = { ...REFRESH_DEFAULTS, ...config.refresh };
+  const happy = config.happy ?? {};
+  if (
+    typeof happy.artifactId !== "string" ||
+    typeof happy.socketPath !== "string" ||
+    typeof happy.tokenFile !== "string"
+  ) {
+    throw new Error("config.refresh needs the happy block (socketPath, tokenFile, artifactId)");
+  }
+  if (!(config.authorizedConnections ?? []).length) {
+    throw new Error("config.refresh needs config.authorizedConnections");
+  }
+  let url;
+  try {
+    if (typeof refresh.baseUrl !== "string") throw new TypeError("not a string");
+    url = new URL(refresh.baseUrl);
+  } catch {
+    throw new Error("config.refresh.baseUrl must be a URL");
+  }
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    !LOOPBACK_HOSTS.has(url.hostname) ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(
+      "config.refresh.baseUrl must be an http(s) loopback origin without credentials"
+    );
+  }
+  if (typeof refresh.tokenFile !== "string" || !isAbsolute(refresh.tokenFile)) {
+    throw new Error("config.refresh.tokenFile must be an absolute path");
+  }
+  const limits = {
+    minIntervalMs: [60_000, 24 * 60 * 60_000],
+    requestPollMs: [500, 10_000],
+    timeoutMs: [5_000, 60_000],
+    spacingMs: [0, 10_000],
+  };
+  for (const [name, [min, max]] of Object.entries(limits)) {
+    if (!integerIn(refresh[name], min, max)) {
+      throw new Error(`config.refresh.${name} must be an integer from ${min} to ${max}`);
+    }
+  }
+}
+
+/** The refresh settings with their defaults applied, or null when the block is absent. */
+export function refreshSettings(config) {
+  if (config.refresh === undefined) return null;
+  const merged = { ...REFRESH_DEFAULTS, ...config.refresh };
+  const url = new URL(merged.baseUrl);
+  // A name is resolved by the system and could point elsewhere; the loopback address cannot.
+  if (url.hostname === "localhost") url.hostname = "127.0.0.1";
+  return { ...merged, baseUrl: url.origin };
 }
 
 function sameSecret(provided, expected) {
@@ -107,8 +206,16 @@ export function readFailure(error) {
   return detail ? `${code}: ${detail}` : code;
 }
 
-/** Holds the latest report and how current it is. Pure apart from the injected reader. */
-export function createObserver({ read, pollMs = DEFAULT_POLL_MS, now = Date.now }) {
+/**
+ * Holds the latest report and how current it is. Pure apart from the injected reader.
+ * `refreshState` supplies the payload's `refresh` field; it is null when refresh is not set up.
+ */
+export function createObserver({
+  read,
+  pollMs = DEFAULT_POLL_MS,
+  now = Date.now,
+  refreshState = () => null,
+}) {
   let report = null;
   let lastSuccessAt = null;
   let lastError = null;
@@ -134,6 +241,7 @@ export function createObserver({ read, pollMs = DEFAULT_POLL_MS, now = Date.now 
           : "stale";
     return {
       ...(report ?? { schema: "omni-route-usage/v1", generatedAt: null }),
+      refresh: refreshState(),
       observer: {
         status,
         lastSuccessAt: lastSuccessAt === null ? null : new Date(lastSuccessAt).toISOString(),
@@ -201,35 +309,83 @@ export function reportFingerprint(payload) {
     .digest("hex");
 }
 
-function putKv({ socketPath, token, artifactId, value, writeId }) {
-  const body = JSON.stringify({ value, writeId });
-  const path = `/v0/artifacts/${encodeURIComponent(artifactId)}/api/v1/kv/entry?key=${encodeURIComponent(KV_KEY)}`;
+/**
+ * One HTTP exchange with a deadline for the whole of it and a bounded response body. Resolves
+ * with the status and the body text. Rejects, with `kind` "timeout" or "network", when the
+ * deadline passes, the body is too large, or the connection fails or closes before the response
+ * ends. Error messages carry only the label and a system error code, never a path or a body.
+ */
+export function exchange({ client = http, url, options, body, deadlineMs, label }) {
   return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        socketPath,
-        path,
-        method: "PUT",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
-        },
-        timeout: PUBLISH_TIMEOUT_MS,
-      },
-      (res) => {
-        res.resume();
-        res.on("end", () =>
-          res.statusCode >= 200 && res.statusCode < 300
-            ? resolve(res.statusCode)
-            : reject(new Error(`happy kv write returned HTTP ${res.statusCode}`))
-        );
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error("happy kv write timed out")));
-    req.on("error", reject);
+    let settled = false;
+    let req = null;
+    const fail = (kind, detail) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      req?.destroy();
+      reject(Object.assign(new Error(`${label} ${detail}`), { kind }));
+    };
+    const failed = (error) => {
+      const code = typeof error?.code === "string" && /^E[A-Z_]{2,30}$/.test(error.code);
+      fail("network", code ? `failed: ${error.code}` : "failed");
+    };
+    const timer = setTimeout(() => fail("timeout", "timed out"), deadlineMs);
+    const direct = { ...options, agent: client === https ? DIRECT_HTTPS : DIRECT_HTTP };
+    try {
+      req = url ? client.request(url, direct) : client.request(direct);
+    } catch (error) {
+      // Invalid options throw before a request exists; they end the same way as a failed one.
+      failed(error);
+      return;
+    }
+    req.on("response", (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) fail("network", "response too large");
+        else chunks.push(chunk);
+      });
+      res.on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString("utf8") });
+      });
+      res.on("error", failed);
+      res.on("close", () => {
+        if (!res.complete) fail("network", "response interrupted");
+      });
+    });
+    req.on("error", failed);
     req.end(body);
   });
+}
+
+function kvPath(artifactId, key) {
+  return `/v0/artifacts/${encodeURIComponent(artifactId)}/api/v1/kv/entry?key=${encodeURIComponent(key)}`;
+}
+
+async function putKv({ socketPath, token, artifactId, value, writeId }) {
+  const body = JSON.stringify({ value, writeId });
+  const { status } = await exchange({
+    options: {
+      socketPath,
+      path: kvPath(artifactId, KV_KEY),
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+      },
+    },
+    body,
+    deadlineMs: PUBLISH_TIMEOUT_MS,
+    label: "happy kv write",
+  });
+  if (status < 200 || status >= 300) throw new Error(`happy kv write returned HTTP ${status}`);
+  return status;
 }
 
 /** Publishes when the report changes, and at least once per heartbeat so viewers see liveness. */
@@ -255,6 +411,420 @@ export function createPublisher({ write, heartbeatMs = DEFAULT_HEARTBEAT_MS, now
   };
 }
 
+/**
+ * Runs publishes one after another, each with the payload as it is when its turn comes, so a
+ * refresh's "running" and its result are both written, in that order, even while a tick's
+ * write is still in flight. Each call's promise settles with its own publish, so a caller can
+ * tell whether its state went out; a failure does not stop the publishes queued after it.
+ */
+export function createPublishQueue({ publish, payload, onResult = () => {} }) {
+  let chain = Promise.resolve();
+  return function flush() {
+    const run = chain.then(async () => {
+      try {
+        const result = await publish(payload());
+        onResult(null, result);
+        return result;
+      } catch (error) {
+        onResult(error);
+        throw error;
+      }
+    });
+    chain = run.catch(() => {});
+    return run;
+  };
+}
+
+/** Calls `fn` unless a call is still pending, in which case its promise is shared. */
+export function coalesce(fn) {
+  let pending = null;
+  return () => {
+    pending ??= Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        pending = null;
+      });
+    return pending;
+  };
+}
+
+/** Reads one entry of the artifact's data store, or null when the key holds no value. */
+async function getKvEntry({ socketPath, token, artifactId, key }) {
+  const { status, text } = await exchange({
+    options: {
+      socketPath,
+      path: kvPath(artifactId, key),
+      method: "GET",
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    },
+    deadlineMs: KV_READ_TIMEOUT_MS,
+    label: "happy kv read",
+  });
+  if (status !== 200) throw new Error(`happy kv read returned HTTP ${status}`);
+  try {
+    return JSON.parse(text)?.entry ?? null;
+  } catch {
+    throw new Error("happy kv read returned invalid JSON");
+  }
+}
+
+/**
+ * Asks Omni Route to read one account's quota from the vendor now (GET /api/usage/:id, which
+ * persists the reading). Only the status and the `_stale` marker of the answer are kept; the
+ * body is not returned, logged or published.
+ */
+export async function gatewayUsageCall({ baseUrl, token, connectionId, timeoutMs }) {
+  const url = new URL(`/api/usage/${encodeURIComponent(connectionId)}`, baseUrl);
+  let response;
+  try {
+    response = await exchange({
+      client: url.protocol === "https:" ? https : http,
+      url,
+      options: {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      },
+      deadlineMs: timeoutMs,
+      label: "omni route usage",
+    });
+  } catch (error) {
+    return { kind: error.kind === "timeout" ? "timeout" : "network" };
+  }
+  const { status, text } = response;
+  if (status < 200 || status >= 300) return { kind: "http", status };
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // A success without a readable body still says the call was accepted.
+  }
+  // Omni Route marks `_stale` when Anthropic answered without quotas and the previous reading
+  // was kept. Its `_staleReason` does not say why: after a 429 the build falls back to a legacy
+  // endpoint and reports that endpoint's message instead.
+  return { kind: "ok", stale: body?._stale === true };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Why an account's quota was not read again, in words the panel shows as they are. */
+function refreshReason(result) {
+  if (!result) return "não consultada";
+  switch (result.kind) {
+    case "ok":
+      // The installed build does not say why a stale answer came back; a 429 from Anthropic's
+      // usage endpoint, or Omni Route's 3-minute wait after one, is the usual cause.
+      if (result.stale) return "a Anthropic não devolveu a cota (provável limite de consultas)";
+      return "leitura nova não encontrada no banco";
+    case "timeout":
+      return "tempo esgotado";
+    case "network":
+      return "Omni Route inacessível";
+    case "http":
+      if (result.status === 409) return "em uso exclusivo";
+      if (result.status === 429) return "limite de consultas da Anthropic";
+      if (result.status === 401 || result.status === 403) return "credencial do painel recusada";
+      if (result.status === 404) return "conta não encontrada no Omni Route";
+      return `Omni Route respondeu HTTP ${result.status}`;
+    default:
+      return "falha desconhecida";
+  }
+}
+
+function resultKind(result) {
+  if (!result) return null;
+  if (result.kind === "http") {
+    return result.status === 401 || result.status === 403
+      ? "gateway_auth_failed"
+      : `gateway_http_${result.status}`;
+  }
+  if (result.kind === "network") return "gateway_unreachable";
+  if (result.kind === "timeout") return "gateway_timeout";
+  return null;
+}
+
+/** The cause shared by every failed call, when there is one. */
+function commonError(results) {
+  const kinds = new Set(results.map(resultKind));
+  return kinds.size === 1 ? [...kinds][0] : null;
+}
+
+/**
+ * Serves refresh requests from the panel. A request is a data-store entry whose version is newer
+ * than the last one seen; it is served at most once per `minIntervalMs`, one refresh at a time.
+ * Every change of state is published through `onChange`; the gateway is called only after the
+ * "running" state has been written, so the panel never misses a refresh that is under way.
+ * Requests seen while a refresh runs are answered as throttled when it ends, whatever the time:
+ * the panel shows only the newest request, so only the newest of them is answered.
+ */
+export function createRefresher({
+  observer,
+  connections,
+  readToken,
+  callGateway,
+  minIntervalMs = REFRESH_DEFAULTS.minIntervalMs,
+  spacingMs = REFRESH_DEFAULTS.spacingMs,
+  timeoutMs = REFRESH_DEFAULTS.timeoutMs,
+  onChange = async () => {},
+  log = () => {},
+  now = Date.now,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  let primed = false;
+  let lastSeen = null;
+  let last = null;
+  let nextAllowedAtMs = null;
+  let running = null;
+  let pending = null;
+  // When the last refresh that called the gateway ended; a request made before then was made
+  // while it ran, even if it is first seen afterwards.
+  let lastRefreshEndMs = null;
+
+  const iso = (ms) => (ms === null ? null : new Date(ms).toISOString());
+
+  function state() {
+    return { minIntervalMs, nextAllowedAt: iso(nextAllowedAtMs), last };
+  }
+
+  async function publish() {
+    try {
+      await onChange();
+      return true;
+    } catch {
+      // The queue logs the failure; the state stays in memory for the next publish.
+      return false;
+    }
+  }
+
+  function token() {
+    try {
+      const value = readToken();
+      return /^[\x21-\x7e]{1,4096}$/.test(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Answers one request; true when it called the gateway. */
+  async function serve(request, throttle) {
+    const startedAtMs = now();
+    const base = {
+      requestVersion: request.version,
+      requestedAt: iso(request.updatedAt),
+    };
+    const answer = (fields) => {
+      last = { ...base, startedAt: null, finishedAt: iso(now()), accounts: [], ...fields };
+    };
+    const madeDuringRefresh = lastRefreshEndMs !== null && request.updatedAt <= lastRefreshEndMs;
+    const inInterval = nextAllowedAtMs !== null && startedAtMs < nextAllowedAtMs;
+    if (throttle || madeDuringRefresh || inInterval) {
+      observer.poll();
+      answer({ status: "throttled", error: null });
+      log("refresh throttled");
+      await publish();
+      return false;
+    }
+    const credential = token();
+    if (credential === null) {
+      answer({ status: "failed", error: "not_configured" });
+      log("refresh failed: not_configured");
+      await publish();
+      return false;
+    }
+
+    const previousNextAllowedAtMs = nextAllowedAtMs;
+    nextAllowedAtMs = startedAtMs + minIntervalMs;
+    last = {
+      ...base,
+      status: "running",
+      startedAt: iso(startedAtMs),
+      finishedAt: null,
+      accounts: [],
+      error: null,
+    };
+    if (!(await publish())) {
+      // Nothing is read while the panel cannot be told; the request does not use the interval.
+      nextAllowedAtMs = previousNextAllowedAtMs;
+      answer({ status: "failed", error: null });
+      log("refresh failed: publish");
+      await publish();
+      return false;
+    }
+
+    const results = [];
+    for (const [index, connectionId] of connections.entries()) {
+      if (index > 0) await sleep(spacingMs);
+      const result = await callGateway({ token: credential, connectionId, timeoutMs });
+      results.push(result);
+      // Giving up on the answer does not stop Omni Route's own read, which may still be renewing
+      // that account's credentials. No other account is read in this round, and the interval
+      // starts again at the timeout, so the gateway keeps the whole margin even when the
+      // timeout came late in the round.
+      if (result.kind === "timeout") {
+        nextAllowedAtMs = Math.max(nextAllowedAtMs, now() + minIntervalMs);
+        break;
+      }
+    }
+    observer.poll();
+    const report = observer.payload();
+    const accounts = connections.map((connectionId, index) => {
+      const quota = report.accounts?.find((a) => a.connectionId === connectionId)?.quota;
+      const fetchedAtMs = typeof quota?.fetchedAt === "string" ? Date.parse(quota.fetchedAt) : NaN;
+      const updated = Number.isFinite(fetchedAtMs) && fetchedAtMs >= startedAtMs;
+      return {
+        shortId: connectionId.slice(0, 8),
+        updated,
+        reason: updated
+          ? null
+          : index < results.length
+            ? sanitizeReason(refreshReason(results[index]))
+            : "não consultada: rodada interrompida por tempo esgotado",
+      };
+    });
+    const count = accounts.filter((a) => a.updated).length;
+    const status = count === accounts.length ? "done" : count > 0 ? "partial" : "failed";
+    const error =
+      status !== "failed"
+        ? null
+        : results.length < connections.length
+          ? "gateway_timeout"
+          : commonError(results);
+    lastRefreshEndMs = now();
+    last = { ...last, status, finishedAt: iso(lastRefreshEndMs), accounts, error };
+    log(
+      status === "failed"
+        ? `refresh failed: ${error ?? "no account updated"}`
+        : `refresh ${status} ${count}/${accounts.length}`
+    );
+    await publish();
+    return true;
+  }
+
+  async function drain(request) {
+    let next = request;
+    let refreshed = false;
+    while (next) {
+      pending = null;
+      try {
+        refreshed = (await serve(next, refreshed)) || refreshed;
+      } catch {
+        // An unexpected failure must not leave the refresh marked as running.
+        if (last?.requestVersion === next.version && last.status === "running") {
+          last = { ...last, status: "failed", finishedAt: iso(now()) };
+          await publish();
+        }
+        refreshed = true;
+        lastRefreshEndMs = now();
+        log("refresh failed: internal");
+      }
+      next = pending;
+    }
+    running = null;
+  }
+
+  /** Takes the store's current entry for the request key; `null` when it holds no value. */
+  function offer(entry) {
+    // Only the first read of the request key after a start applies the age limit, whatever
+    // was restored before it.
+    const wasPrimed = primed;
+    primed = true;
+    const version = typeof entry?.version === "string" ? entry.version : null;
+    if (version === null || !UUID_RE.test(version)) return;
+    if (lastSeen !== null && version <= lastSeen) return;
+    lastSeen = version;
+    const updatedAt = Number.isFinite(entry.updatedAt) ? entry.updatedAt : null;
+    if (entry.deleted || entry.value?.schema !== REFRESH_REQUEST_SCHEMA || updatedAt === null) {
+      return;
+    }
+    if (!wasPrimed && now() - updatedAt > STARTUP_REQUEST_MAX_AGE_MS) return;
+    log("refresh requested");
+    const request = { version, updatedAt };
+    if (running) {
+      pending = request;
+      return;
+    }
+    running = drain(request);
+  }
+
+  /**
+   * Takes back the state this service last published, before its first publish after a start,
+   * so a restart neither answers a request again nor reopens the interval. The published report
+   * lives in a store its viewers can write, so only well-formed values are kept and the interval
+   * is never pushed further than one interval from now. A refresh that was running when the
+   * service stopped is reported as failed and not repeated.
+   */
+  function restore(previous) {
+    const at = now();
+    const prior = previous?.last;
+    const version = typeof prior?.requestVersion === "string" ? prior.requestVersion : null;
+    if (version === null || !UUID_RE.test(version)) return;
+    // A UUIDv7 carries its write time; a version from the future could hide every request.
+    if (Number.parseInt(version.slice(0, 8) + version.slice(9, 13), 16) > at) return;
+    const time = (value) => {
+      const ms = typeof value === "string" ? Date.parse(value) : NaN;
+      return Number.isFinite(ms) && ms <= at + minIntervalMs ? ms : null;
+    };
+    const status = ["running", "done", "partial", "failed", "throttled"].includes(prior.status)
+      ? prior.status
+      : null;
+    if (status === null) return;
+    lastSeen = version;
+    const nextMs = time(previous.nextAllowedAt);
+    nextAllowedAtMs = nextMs !== null && nextMs > at ? nextMs : null;
+    const startedAtMs = time(prior.startedAt);
+    const finishedAtMs = time(prior.finishedAt);
+    const accounts = Array.isArray(prior.accounts)
+      ? prior.accounts
+          .filter(
+            (a) =>
+              typeof a?.shortId === "string" &&
+              /^[A-Za-z0-9-]{1,8}$/.test(a.shortId) &&
+              typeof a.updated === "boolean"
+          )
+          .slice(0, 64)
+          .map((a) => ({
+            shortId: a.shortId,
+            updated: a.updated,
+            reason: a.updated ? null : sanitizeReason(a.reason),
+          }))
+      : [];
+    const error =
+      typeof prior.error === "string" &&
+      /^(not_configured|gateway_unreachable|gateway_auth_failed|gateway_timeout|gateway_http_\d{3})$/.test(
+        prior.error
+      )
+        ? prior.error
+        : null;
+    last = {
+      requestVersion: version,
+      requestedAt: iso(time(prior.requestedAt)),
+      status,
+      startedAt: iso(startedAtMs),
+      finishedAt: iso(finishedAtMs),
+      accounts,
+      error,
+    };
+    if (startedAtMs !== null) lastRefreshEndMs = finishedAtMs ?? at;
+    if (status === "running") {
+      // The round may have timed out and pushed the interval past what was published; with
+      // no way to know, the gateway gets a whole interval from now.
+      nextAllowedAtMs = Math.max(nextAllowedAtMs ?? at, at + minIntervalMs);
+      last = { ...last, status: "failed", finishedAt: iso(at), error: null };
+      lastRefreshEndMs = at;
+      log("refresh interrupted by a restart");
+    }
+  }
+
+  return { offer, state, restore, idle: () => running ?? Promise.resolve() };
+}
+
+/**
+ * Node prints request options, headers included, on stderr when NODE_DEBUG names its network
+ * modules. With any NODE_DEBUG set, the gateway credential is not used at all.
+ */
+export function debugLogsRequests(env = process.env) {
+  return typeof env.NODE_DEBUG === "string" && env.NODE_DEBUG.trim() !== "";
+}
+
 function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
 }
@@ -262,6 +832,8 @@ function log(message) {
 async function main(configPath) {
   const config = loadConfig(configPath);
   const pollMs = config.pollIntervalMs ?? DEFAULT_POLL_MS;
+  const refresh = refreshSettings(config);
+  let refresher = null;
   const observer = createObserver({
     read: sqliteReader({
       dbPath: config.dbPath,
@@ -269,21 +841,112 @@ async function main(configPath) {
       gateway: config.gateway ?? {},
     }),
     pollMs,
+    refreshState: () => refresher?.state() ?? null,
   });
   const server = createUsageServer({ observer, token: readSecretFile(config.tokenFile) });
 
-  let publish = null;
+  let flush = null;
   if (config.happy?.artifactId) {
     const { socketPath, tokenFile, artifactId } = config.happy;
-    publish = createPublisher({
+    const publish = createPublisher({
       // The daemon token is read for each write, so a rotated token is picked up.
       write: ({ value, writeId }) =>
         putKv({ socketPath, token: readSecretFile(tokenFile), artifactId, value, writeId }),
       heartbeatMs: config.happy.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
     });
+    let lastPublishError = null;
+    flush = createPublishQueue({
+      publish,
+      payload: () => observer.payload(),
+      onResult: (error) => {
+        if (!error) {
+          if (lastPublishError) log("happy publish recovered");
+          lastPublishError = null;
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== lastPublishError) log(`happy publish failed: ${message}`);
+        lastPublishError = message;
+      },
+    });
   }
 
-  let lastPublishError = null;
+  let readRequest = null;
+  let ensureRestored = async () => true;
+  if (refresh && flush) {
+    const { socketPath, tokenFile, artifactId } = config.happy;
+    refresher = createRefresher({
+      observer,
+      connections: config.authorizedConnections,
+      // Read for each refresh, so a token created or rotated later is picked up.
+      readToken: () => {
+        if (debugLogsRequests()) throw new Error("NODE_DEBUG is set");
+        return readSecretFile(refresh.tokenFile);
+      },
+      callGateway: ({ token, connectionId, timeoutMs }) =>
+        gatewayUsageCall({ baseUrl: refresh.baseUrl, token, connectionId, timeoutMs }),
+      minIntervalMs: refresh.minIntervalMs,
+      spacingMs: refresh.spacingMs,
+      timeoutMs: refresh.timeoutMs,
+      onChange: flush,
+      log,
+    });
+    if (debugLogsRequests()) log("refresh disabled while NODE_DEBUG is set");
+    // The state published before a restart must be taken back before this process publishes
+    // anything or answers a request. A failed read is retried on every tick and request poll;
+    // only a read that succeeds, with or without a previous report, lets either go ahead.
+    let restored = false;
+    let lastRestoreError = null;
+    ensureRestored = coalesce(async () => {
+      if (restored) return true;
+      try {
+        const previous = await getKvEntry({
+          socketPath,
+          token: readSecretFile(tokenFile),
+          artifactId,
+          key: KV_KEY,
+        });
+        refresher.restore(previous?.deleted ? null : previous?.value?.refresh);
+        restored = true;
+        if (lastRestoreError) log("refresh state restored");
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== lastRestoreError) log(`refresh state not restored: ${message}`);
+        lastRestoreError = message;
+        return false;
+      }
+    });
+    let reading = false;
+    let lastReadError = null;
+    readRequest = async () => {
+      if (reading) return;
+      reading = true;
+      try {
+        if (!(await ensureRestored())) return;
+        const entry = await getKvEntry({
+          socketPath,
+          token: readSecretFile(tokenFile),
+          artifactId,
+          key: REFRESH_REQUEST_KEY,
+        });
+        if (lastReadError) log("refresh request read recovered");
+        lastReadError = null;
+        refresher.offer(entry);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== lastReadError) log(`refresh request read failed: ${message}`);
+        lastReadError = message;
+      } finally {
+        reading = false;
+      }
+    };
+  }
+
+  // At most one periodic publish waits in the queue: while the daemon is slow, later ticks
+  // join it instead of piling up. It takes the newest report when its turn comes. A failed
+  // write is logged by the queue; the next tick or heartbeat tries again.
+  const publishTick = flush ? coalesce(() => flush().catch(() => {})) : null;
   let lastPollError = null;
   const tick = async () => {
     observer.poll();
@@ -291,19 +954,16 @@ async function main(configPath) {
     if (pollError !== lastPollError)
       log(pollError ? `poll failed: ${pollError}` : "poll recovered");
     lastPollError = pollError;
-    if (!publish) return;
-    try {
-      await publish(observer.payload());
-      if (lastPublishError) log("happy publish recovered");
-      lastPublishError = null;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message !== lastPublishError) log(`happy publish failed: ${message}`);
-      lastPublishError = message;
-    }
+    if (publishTick && (await ensureRestored())) await publishTick();
   };
   await tick();
   const timer = setInterval(tick, pollMs);
+
+  let requestTimer = null;
+  if (readRequest) {
+    await readRequest();
+    requestTimer = setInterval(readRequest, refresh.requestPollMs);
+  }
 
   // A port in use or a refused bind ends the process, so the supervisor retries it.
   server.on("error", (error) => {
@@ -316,6 +976,7 @@ async function main(configPath) {
 
   const stop = () => {
     clearInterval(timer);
+    clearInterval(requestTimer);
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2_000).unref();
   };
