@@ -2107,3 +2107,35 @@ test("the service publishes nothing and answers nothing until its last state is 
   assert.match(service.stdout(), /refresh state not restored: happy kv read returned HTTP 503/);
   assert.match(service.stdout(), /refresh state restored/);
 });
+
+// Regression from the fifth independent review of PR #12.
+
+test("a restart after a late timeout whose result was not written keeps a whole interval", async () => {
+  // The round started 90 s ago and timed out just now; its result never reached the store, so
+  // the published state is still "running" with the interval counted from the start.
+  const slow = { kind: "ok", stale: false, delayMs: 29_000 };
+  let resultWritten = true;
+  const first = refreshHarness({
+    results: { [A]: slow, [B]: slow, [C]: { kind: "timeout", delayMs: 30_000 } },
+    failPublish: (payload) => !resultWritten && payload.refresh.last?.status !== "running",
+  });
+  resultWritten = false;
+  first.refresher.offer(null);
+  first.refresher.offer(first.entry(1));
+  await first.refresher.idle();
+  const published = first.published.at(-1).refresh;
+  assert.equal(published.last.status, "running");
+
+  // The service restarts 10 s later.
+  const h = refreshHarness();
+  h.advance(first.now() - NOW + 10_000);
+  const restartedAt = h.now();
+  h.refresher.restore(structuredClone(published));
+  assert.equal(h.refresher.state().nextAllowedAt, new Date(restartedAt + 120_000).toISOString());
+  h.advance(30_000);
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(2));
+  await h.refresher.idle();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.refresher.state().last.status, "throttled");
+});

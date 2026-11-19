@@ -656,11 +656,10 @@ export function createRefresher({
       const result = await callGateway({ token: credential, connectionId, timeoutMs });
       results.push(result);
       // Giving up on the answer does not stop Omni Route's own read, which may still be renewing
-      // that account's credentials. No other account is read in this round; the minimum interval,
-      // counted from the start, leaves it time to finish before the next one.
+      // that account's credentials. No other account is read in this round, and the interval
+      // starts again at the timeout, so the gateway keeps the whole margin even when the
+      // timeout came late in the round.
       if (result.kind === "timeout") {
-        // The interval starts again at the timeout, so the gateway keeps the whole margin
-        // even when the timeout came late in the round.
         nextAllowedAtMs = Math.max(nextAllowedAtMs, now() + minIntervalMs);
         break;
       }
@@ -806,6 +805,9 @@ export function createRefresher({
     };
     if (startedAtMs !== null) lastRefreshEndMs = finishedAtMs ?? at;
     if (status === "running") {
+      // The round may have timed out and pushed the interval past what was published; with
+      // no way to know, the gateway gets a whole interval from now.
+      nextAllowedAtMs = Math.max(nextAllowedAtMs ?? at, at + minIntervalMs);
       last = { ...last, status: "failed", finishedAt: iso(at), error: null };
       lastRefreshEndMs = at;
       log("refresh interrupted by a restart");

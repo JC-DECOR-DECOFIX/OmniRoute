@@ -248,7 +248,8 @@ process.
 When the service starts, before it publishes anything, it reads its own last report from the
 artifact and takes back the refresh state: the request it last answered is not answered again,
 and the interval stays where it was. A refresh that was running when the service stopped is
-reported `failed` and not repeated. That report sits in a store the artifact's viewers can write,
+reported `failed` and not repeated, and the next round waits a whole interval from the
+restart, since that round may have timed out late without its longer wait being written. That report sits in a store the artifact's viewers can write,
 so only well-formed values are taken back: a request version from the future, an interval more
 than one interval ahead, or an unknown status is ignored, and texts are sanitized again. Until
 that read succeeds (a store with no previous report counts), nothing is published and no
