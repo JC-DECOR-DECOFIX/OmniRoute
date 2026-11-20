@@ -23,7 +23,10 @@ import {
 } from "./base.ts";
 import { HTTP_STATUS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { getProviderPluginManifestHeader } from "../config/providerPluginManifestUrl.ts";
-import { cloakThirdPartyToolNames } from "../services/claudeCodeToolRemapper.ts";
+import {
+  cloakThirdPartyToolNames,
+  renameToolReferences,
+} from "../services/claudeCodeToolRemapper.ts";
 import { sanitizeClaudeToolSchemas } from "../translator/helpers/schemaCoercion.ts";
 
 const DEFAULT_PORT = 8317;
@@ -55,6 +58,7 @@ function rewriteMcpToolName(name: string): string | null {
  */
 function applyMcpToolNameRewrite(body: Record<string, unknown>): Map<string, string> {
   const reverseMap = new Map<string, string>();
+  const declared = new Map<string, string>(); // original -> rewritten, tools[] only
   const remember = (original: string, rewritten: string) => {
     reverseMap.set(rewritten, original);
   };
@@ -68,6 +72,7 @@ function applyMcpToolNameRewrite(body: Record<string, unknown>): Map<string, str
       const rewritten = rewriteMcpToolName(original);
       if (rewritten) {
         remember(original, rewritten);
+        declared.set(original, rewritten);
         return { ...t, name: rewritten };
       }
       return tool;
@@ -85,7 +90,12 @@ function applyMcpToolNameRewrite(body: Record<string, unknown>): Map<string, str
       const newContent = content.map((block) => {
         if (!block || typeof block !== "object") return block;
         const b = block as Record<string, unknown>;
-        if (b.type !== "tool_use") return block;
+        if (b.type !== "tool_use") {
+          // A ToolSearch reference must name the rewritten tool it loads.
+          const renamed = renameToolReferences(b, (name) => declared.get(name));
+          if (renamed !== b) mutated = true;
+          return renamed;
+        }
         const original = typeof b.name === "string" ? b.name : "";
         const rewritten = rewriteMcpToolName(original);
         if (rewritten) {
@@ -132,7 +142,9 @@ export function clearCliproxyapiUrlCache() {
     if (typeof settings.cliproxyapi_url === "string" && settings.cliproxyapi_url.trim()) {
       _cachedSettingsUrl = { url: settings.cliproxyapi_url.trim(), ts: Date.now() };
     }
-  } catch { /* env vars will be used as fallback */ }
+  } catch {
+    /* env vars will be used as fallback */
+  }
 })();
 
 /**
@@ -155,7 +167,9 @@ async function resolveCliproxyapiBaseUrl(): Promise<string> {
       _cachedSettingsUrl = { url, ts: Date.now() };
       return url;
     }
-  } catch { /* fall through to env vars */ }
+  } catch {
+    /* fall through to env vars */
+  }
 
   const host = process.env.CLIPROXYAPI_HOST || DEFAULT_HOST;
   const port = parseInt(process.env.CLIPROXYAPI_PORT || String(DEFAULT_PORT), 10);

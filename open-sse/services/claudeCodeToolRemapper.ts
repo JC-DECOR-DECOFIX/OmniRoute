@@ -110,10 +110,59 @@ function collectServerToolNames(tools: unknown): Set<string> {
   return names;
 }
 
+type ToolNameRename = (name: string) => string | undefined;
+
+/** Rename one reference list; returns the same array when nothing changed. */
+function renameReferenceList(list: unknown[], rename: ToolNameRename): unknown[] {
+  let next: unknown[] | null = null;
+  for (let i = 0; i < list.length; i++) {
+    const ref = list[i] as Record<string, unknown> | null;
+    if (!ref || ref.type !== "tool_reference" || typeof ref.tool_name !== "string") continue;
+    const renamed = rename(ref.tool_name);
+    if (!renamed || renamed === ref.tool_name) continue;
+    next ??= [...list];
+    next[i] = { ...ref, tool_name: renamed };
+  }
+  return next ?? list;
+}
+
+/**
+ * Rename the `tool_name` of the tool-search `tool_reference` blocks a message content
+ * block carries. Anthropic resolves each reference against `tools[]`, so any rename
+ * applied to tool definitions must reach the references too, otherwise the request
+ * fails with `Tool reference '<name>' not found in available tools`.
+ *
+ * Only the two documented shapes are read, one level deep: a client ToolSearch
+ * `tool_result.content[]` and a server `tool_search_tool_result.content.tool_references[]`.
+ * A `tool_use` input that merely looks like a reference is never touched.
+ *
+ * `rename` returns the new name, or undefined to keep it. Non-mutating: returns the
+ * same block when nothing changed and shallow clones along the changed path otherwise.
+ */
+export function renameToolReferences<T>(block: T, rename: ToolNameRename): T {
+  if (!block || typeof block !== "object") return block;
+  const node = block as Record<string, unknown>;
+  if (node.type === "tool_result" && Array.isArray(node.content)) {
+    const content = renameReferenceList(node.content, rename);
+    return (content === node.content ? block : { ...node, content }) as T;
+  }
+  if (node.type === "tool_search_tool_result") {
+    const result = node.content as Record<string, unknown> | null;
+    if (!result || typeof result !== "object" || !Array.isArray(result.tool_references)) {
+      return block;
+    }
+    const refs = renameReferenceList(result.tool_references, rename);
+    if (refs === result.tool_references) return block;
+    return { ...node, content: { ...result, tool_references: refs } } as T;
+  }
+  return block;
+}
+
 export function remapToolNamesInRequest(body: Record<string, unknown>): boolean {
   let hasLowercase = false;
   let hasTitleCase = false;
   const serverToolNames = collectServerToolNames(body.tools);
+  const declaredRenames = new Map<string, string>();
 
   // Remap tool definitions
   const tools = body.tools as Array<Record<string, unknown>> | undefined;
@@ -127,6 +176,7 @@ export function remapToolNamesInRequest(body: Record<string, unknown>): boolean 
       if (TOOL_RENAME_MAP[name]) {
         const mapped = TOOL_RENAME_MAP[name];
         tool.name = mapped;
+        declaredRenames.set(name, mapped);
         trackToolName(body, mapped, name);
         hasLowercase = true;
       } else if (REVERSE_MAP[name]) {
@@ -141,8 +191,12 @@ export function remapToolNamesInRequest(body: Record<string, unknown>): boolean 
     for (const msg of messages) {
       const content = msg.content as Array<Record<string, unknown>> | undefined;
       if (!Array.isArray(content)) continue;
-      for (const block of content) {
-        if (block.type === "tool_use" && typeof block.name === "string") {
+      for (let i = 0; i < content.length; i++) {
+        // A reference only loads a tool tools[] declares; the definition loop above
+        // owns the reverse map, so a stale history name must not overwrite it.
+        content[i] = renameToolReferences(content[i], (name) => declaredRenames.get(name));
+        const block = content[i];
+        if (block?.type === "tool_use" && typeof block.name === "string") {
           if (serverToolNames.has(block.name)) continue;
           const mapped = TOOL_RENAME_MAP[block.name];
           if (mapped) {
@@ -446,6 +500,9 @@ export function cloakThirdPartyToolNames(
       return tool;
     });
   }
+  // Snapshot before history is walked: tool_use blocks may mint aliases for tools
+  // tools[] no longer declares, and a reference must never resolve to one of those.
+  const declaredAliases = new Map(assigned);
 
   const messages = body.messages as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(messages)) {
@@ -463,7 +520,11 @@ export function cloakThirdPartyToolNames(
           changed = true;
           return { ...block, name: aliasFor(block.name) };
         }
-        return block;
+        // A ToolSearch reference must name the alias its tools[] definition now carries.
+        // It never mints an alias of its own, so it cannot touch the reverse map.
+        const renamed = renameToolReferences(block, (name) => declaredAliases.get(name));
+        if (renamed !== block) changed = true;
+        return renamed;
       });
       return changed ? { ...message, content: newContent } : message;
     });
