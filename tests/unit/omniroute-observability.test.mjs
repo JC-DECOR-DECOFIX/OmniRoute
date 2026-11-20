@@ -15,6 +15,9 @@ import {
 } from "../../scripts/ops/omniroute-observability/aggregate.mjs";
 import {
   coalesce,
+  excludedConnections,
+  LEASED_SQL,
+  RESERVED_SQL,
   createObserver,
   createPublisher,
   createPublishQueue,
@@ -214,14 +217,20 @@ test("never reads or returns credentials", () => {
   assert.equal(json.includes("SECRETSECRET"), false);
   for (const file of ["aggregate.mjs", "server.mjs"]) {
     const source = readFileSync(new URL(file, SERVICE_DIR), "utf8");
+    // Whole names: the lease check reads the `api_keys` table, never its credential columns.
     for (const column of [
       "access_token",
       "refresh_token",
       "id_token",
       "api_key",
+      "key_hash",
       "provider_specific_data",
     ]) {
-      assert.equal(source.includes(column), false, `${file} mentions ${column}`);
+      assert.equal(new RegExp(`\\b${column}\\b`).test(source), false, `${file} mentions ${column}`);
+    }
+    // No statement selects `key` (the key-value store's key is only compared, never read).
+    for (const [, columns] of source.matchAll(/SELECT\s+([\s\S]*?)\s+FROM/g)) {
+      assert.equal(/\bkey\b|(^|,)\s*\*/.test(columns), false, `${file} selects ${columns}`);
     }
   }
 });
@@ -866,11 +875,13 @@ function refreshHarness({
   result = { kind: "ok", errors: {} },
   updated = null,
   states = {},
+  excluded = [],
   token = GATEWAY_TOKEN,
   connections = [A, B, C],
   failPublish = () => false,
 } = {}) {
   let clock = NOW;
+  let excludedReadsBeforeCall = 0;
   const fetchedAt = new Map(connections.map((id) => [id, NOW - 3_600_000]));
   const calls = [];
   const published = [];
@@ -901,6 +912,11 @@ function refreshHarness({
     readToken: () => {
       if (token === null) throw new Error("ENOENT: /private/omniroute-access-token");
       return token;
+    },
+    readExcluded: () => {
+      if (calls.length === 0) excludedReadsBeforeCall += 1;
+      if (excluded === "throw") throw new Error("database is locked");
+      return new Set(excluded);
     },
     callGateway: async ({ token: sent, connections: asked, timeoutMs }) => {
       calls.push({ token: sent, connections: asked, timeoutMs, at: clock });
@@ -948,6 +964,7 @@ function refreshHarness({
     entry,
     hold,
     reads: () => reads,
+    excludedReadsBeforeCall: () => excludedReadsBeforeCall,
     advance: (ms) => (clock += ms),
     now: () => clock,
     statuses: () => published.map((p) => p.refresh.last?.status),
@@ -1019,14 +1036,17 @@ test("a sync that updates some accounts is partial and says why for the others",
   const E = "ffffffff-0000-4000-8000-000000000006";
   const G = "99999999-0000-4000-8000-000000000007";
   const H = "88888888-0000-4000-8000-000000000008";
+  const L = "77777777-0000-4000-8000-000000000009";
   const h = refreshHarness({
-    connections: [A, B, C, D, E, G, H],
+    connections: [A, B, C, D, E, G, H, L],
     result: {
       kind: "ok",
       errors: { [A]: "lease", [B]: "auth", [D]: "network", [E]: "other" },
     },
     updated: [C],
     states: { [G]: "inactive" },
+    // An active account an exclusive lease kept out of the sync when it started.
+    excluded: [L],
   });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
@@ -1046,9 +1066,55 @@ test("a sync that updates some accounts is partial and says why for the others",
       ["99999999", false, "não incluída no sync do Omni Route"],
       // Read without an error but with no new reading: Anthropic answered without quotas.
       ["88888888", false, probable],
+      ["77777777", false, "não incluída no sync do Omni Route"],
     ]
   );
-  assert.equal(h.logs.at(-1), "refresh partial 1/7");
+  assert.equal(h.logs.at(-1), "refresh partial 1/8");
+  assert.equal(h.excludedReadsBeforeCall(), 1, "leases are read before the sync starts");
+});
+
+test("an unreadable lease state falls back to the probable cause", async () => {
+  const h = refreshHarness({ updated: [A, B], excluded: "throw" });
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  const { last } = h.refresher.state();
+  assert.equal(last.status, "partial");
+  assert.equal(
+    last.accounts[2].reason,
+    "a Anthropic não devolveu a cota (provável limite de consultas)"
+  );
+});
+
+test("leased and reserved connections are read from the lease tables only", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`
+    CREATE TABLE exclusive_connection_leases (id INTEGER PRIMARY KEY, connection_id TEXT,
+      state TEXT, expires_at TEXT);
+    CREATE TABLE api_keys (id TEXT, key TEXT, allowed_connections TEXT, scopes TEXT,
+      is_active INTEGER, is_banned INTEGER, revoked_at TEXT, expires_at TEXT);
+  `);
+  const lease = db.prepare(
+    "INSERT INTO exclusive_connection_leases (connection_id, state, expires_at) VALUES (?, ?, ?)"
+  );
+  lease.run(A, "ACTIVE", at(-1));
+  lease.run(B, "ACTIVE", at(1)); // expired, not yet reconciled by the gateway
+  lease.run(C, "RELEASED", at(-1));
+  const key = db.prepare("INSERT INTO api_keys VALUES ('k', ?, ?, ?, ?, ?, ?, ?)");
+  const exclusive = JSON.stringify(["lease:exclusive"]);
+  key.run(SECRET, JSON.stringify([X]), exclusive, 1, 0, null, null);
+  key.run(SECRET, JSON.stringify([B]), JSON.stringify(["read"]), 1, 0, null, null);
+  key.run(SECRET, JSON.stringify([C]), exclusive, 0, 0, null, null);
+  key.run(SECRET, JSON.stringify([C]), exclusive, 1, 0, at(5), null);
+  key.run(SECRET, JSON.stringify([C]), exclusive, 1, 0, null, at(5));
+  key.run(SECRET, "not json", exclusive, 1, 0, null, null);
+  key.run(SECRET, JSON.stringify({ [C]: true }), exclusive, 1, 0, null, null);
+  assert.deepEqual([...excludedConnections(db, NOW)].sort(), [A, X].sort());
+  // Neither statement reads anything but the ids and the fields that decide the exclusion.
+  assert.match(LEASED_SQL, /^SELECT connection_id FROM exclusive_connection_leases WHERE /);
+  assert.match(RESERVED_SQL, /^SELECT allowed_connections FROM api_keys WHERE /);
+  // A database without these tables excludes nothing.
+  assert.deepEqual([...excludedConnections(new DatabaseSync(":memory:"), NOW)], []);
 });
 
 test("an account missing from the report was not in the sync", async () => {
@@ -1961,7 +2027,7 @@ test("a proxy configured for the process never receives a call or its credential
 
 // Regressions from the third independent review of PR #12.
 
-test("a timed-out sync reports the accounts it had already read", async () => {
+test("a timed-out sync counts the readings already in the database", async () => {
   const h = refreshHarness({ result: { kind: "timeout" } });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
@@ -1970,7 +2036,9 @@ test("a timed-out sync reports the accounts it had already read", async () => {
   assert.equal(last.status, "failed");
   assert.equal(last.error, "gateway_timeout");
   assert.ok(last.accounts.every((a) => a.reason === "tempo esgotado"));
-  // Readings the sync stored before the deadline count; the error is then not the round's.
+  // A newer reading already in the database when the wait ends counts, and the round is then
+  // partial without an error. This checks the panel's rule, not when the gateway writes: Omni
+  // Route stores the sync's cache entries together when the sync ends.
   const later = refreshHarness({ result: { kind: "timeout" }, updated: [A] });
   later.refresher.offer(null);
   later.refresher.offer(later.entry(1));

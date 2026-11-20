@@ -258,6 +258,46 @@ export function createObserver({
   return { poll, payload, hasReport: () => report !== null };
 }
 
+// The connections Omni Route keeps out of its provider-limits sync besides inactive ones
+// (`isConnectionUnavailableToAuxiliaryActivity`): an active exclusive lease, or a reservation by
+// an active key with the exclusive-lease scope. Neither statement names a credential column.
+export const LEASED_SQL =
+  "SELECT connection_id FROM exclusive_connection_leases WHERE state = 'ACTIVE' AND expires_at > ?";
+export const RESERVED_SQL =
+  "SELECT allowed_connections FROM api_keys WHERE is_active != 0 AND is_banned != 1 " +
+  "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) AND scopes LIKE ?";
+const EXCLUSIVE_LEASE_SCOPE_PATTERN = '%"lease:exclusive"%';
+
+/** Ids of the connections an exclusive lease keeps out of the sync at `now`. */
+export function excludedConnections(db, now) {
+  const at = new Date(now).toISOString();
+  const ids = new Set();
+  const rows = (sql, ...params) => {
+    try {
+      return db.prepare(sql).all(...params);
+    } catch {
+      // A build without the table has no such exclusion.
+      return [];
+    }
+  };
+  for (const row of rows(LEASED_SQL, at)) {
+    if (typeof row.connection_id === "string") ids.add(row.connection_id);
+  }
+  for (const row of rows(RESERVED_SQL, at, EXCLUSIVE_LEASE_SCOPE_PATTERN)) {
+    let list = null;
+    try {
+      list =
+        typeof row.allowed_connections === "string" ? JSON.parse(row.allowed_connections) : null;
+    } catch {
+      // Unreadable, as Omni Route itself treats it: no reservation.
+    }
+    if (Array.isArray(list)) {
+      for (const id of list) if (typeof id === "string") ids.add(id);
+    }
+  }
+  return ids;
+}
+
 export function sqliteReader({ dbPath, authorized, gateway }) {
   return (now) => {
     const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -544,13 +584,13 @@ export async function gatewaySyncCall({ baseUrl, token, timeoutMs, connections =
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-// The sync only reads active connections; an exclusive lease also keeps one out, but leases are
-// not in the tables this service reads, so such an account gets the probable-limit text.
+// The sync reads only active connections that no exclusive lease keeps out, and records no
+// error for the others.
 const NOT_IN_SYNC = "não incluída no sync do Omni Route";
 const PROBABLE_LIMIT = "a Anthropic não devolveu a cota (provável limite de consultas)";
 
 /** Why an account's quota was not read again, in words the panel shows as they are. */
-function refreshReason(result, connectionId, account) {
+function refreshReason(result, connectionId, account, excluded) {
   switch (result.kind) {
     case "ok":
       switch (result.errors?.[connectionId]) {
@@ -563,10 +603,13 @@ function refreshReason(result, connectionId, account) {
         case "other":
           return PROBABLE_LIMIT;
         default:
-          // No error recorded: the sync skipped the account, or Anthropic answered without
-          // quotas and Omni Route kept the previous reading. The installed build does not say
-          // why; a 429 from Anthropic's usage endpoint is the usual cause.
-          return !account || account.state === "inactive" ? NOT_IN_SYNC : PROBABLE_LIMIT;
+          if (!account || account.state === "inactive" || excluded.has(connectionId)) {
+            return NOT_IN_SYNC;
+          }
+          // Read without an error but with no new reading: Anthropic answered without quotas
+          // and Omni Route kept the previous reading. The installed build does not say why; a
+          // 429 from Anthropic's usage endpoint is the usual cause.
+          return PROBABLE_LIMIT;
       }
     case "timeout":
       return "tempo esgotado";
@@ -605,6 +648,7 @@ export function createRefresher({
   connections,
   readToken,
   callGateway,
+  readExcluded = () => new Set(),
   minIntervalMs = REFRESH_DEFAULTS.minIntervalMs,
   timeoutMs = REFRESH_DEFAULTS.timeoutMs,
   onChange = async () => {},
@@ -692,6 +736,13 @@ export function createRefresher({
       return false;
     }
 
+    // The sync picks its connections when it starts, so the leases are read just before it.
+    let excluded;
+    try {
+      excluded = readExcluded();
+    } catch {
+      excluded = new Set();
+    }
     const result = await callGateway({ token: credential, connections, timeoutMs });
     // Giving up on the answer does not stop Omni Route's sync, which goes on reading the
     // remaining providers. The interval starts again at the timeout, so the next sync waits a
@@ -709,7 +760,9 @@ export function createRefresher({
       return {
         shortId: connectionId.slice(0, 8),
         updated,
-        reason: updated ? null : sanitizeReason(refreshReason(result, connectionId, account)),
+        reason: updated
+          ? null
+          : sanitizeReason(refreshReason(result, connectionId, account, excluded)),
       };
     });
     const count = accounts.filter((a) => a.updated).length;
@@ -912,6 +965,14 @@ async function main(configPath) {
       },
       callGateway: ({ token, connections, timeoutMs }) =>
         gatewaySyncCall({ baseUrl: refresh.baseUrl, token, connections, timeoutMs }),
+      readExcluded: () => {
+        const db = new DatabaseSync(config.dbPath, { readOnly: true });
+        try {
+          return excludedConnections(db, Date.now());
+        } finally {
+          db.close();
+        }
+      },
       minIntervalMs: refresh.minIntervalMs,
       timeoutMs: refresh.timeoutMs,
       onChange: flush,

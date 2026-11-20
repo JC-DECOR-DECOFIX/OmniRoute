@@ -200,10 +200,19 @@ minutes**: it reads every active connection of a supported provider, not only th
 Claude accounts (on 2026-11-19, seven OAuth connections: three `claude`, one each of `agy`,
 `codex`, `cursor` and `kimi-coding`), OAuth ones strictly one at a time with
 `PROVIDER_LIMITS_SYNC_SPACING_MS` (1.5 s) between them, and stores the readings in
-`providerLimitsCache` with a new `fetchedAt` when the call ends. The only difference from the
-automatic run is that `source: "manual"` reads every connection, where the automatic run skips
-those whose cached reading is still recent, and that it does not move the automatic run's
-schedule. A connection with an exclusive lease is left out, as in the automatic run.
+`providerLimitsCache` with a new `fetchedAt` when the call ends. A connection with an exclusive
+lease is left out, as in the automatic run, and the automatic run's schedule does not move.
+
+It differs from the automatic run in one respect: `source: "manual"` passes `forceRefresh: true`
+for every connection, where the automatic run skips those whose cached reading is still recent
+and does not force. For Antigravity (`agy`) that matters: **when Omni Route runs with
+`ANTIGRAVITY_CREDITS=always`, a forced reading probes the account's credit balance with an
+inference call that spends Antigravity credits** (`probeAntigravityCreditBalance`,
+`open-sse/services/usage/antigravity.ts`); with the default (`off`) or `retry` it does not. On
+2026-11-19 the gateway's LaunchAgent did not set that variable; its `.env` was not read, so
+whether it is set there was not checked. Before relying on the button with an Antigravity
+connection active, the operator should confirm that mode is not `always`, or accept that each
+click may spend credits.
 
 The request carries an empty body, `content-type: application/json` and
 `Authorization: Bearer <token>`, where the token is an Omni Route access token (`oma_…`) of
@@ -220,8 +229,8 @@ leaks it is revoked in the dashboard (Settings → access tokens), which turns t
 (`x-omniroute-cli-token`) is not used: in the installed build (3.8.50, `09966db`) the compiled
 middleware cannot read the machine id, so the server rejects every CLI token.
 
-**What the gateway does on such a call.** Exactly what its automatic sync does, sooner; the
-observer itself writes nothing. The sync does **not** pass `allowRotatingRefresh`, so it never
+**What the gateway does on such a call.** What its automatic sync does, sooner and forced as
+described above; the observer itself writes nothing. The sync does **not** pass `allowRotatingRefresh`, so it never
 renews the OAuth credentials of a rotating-refresh provider (`claude`, `codex`, `kimi-coding`,
 `open-sse/services/refreshSerializer.ts`): the Claude accounts' tokens are not touched. For the
 other providers it renews a token near expiry, as the automatic run does. As in the automatic
@@ -265,12 +274,15 @@ call, to the daemon and to Omni Route, goes through an agent of its own, never t
 global agent, so a proxy set in the environment (`NODE_USE_ENV_PROXY` with `HTTP_PROXY`) never
 sees a request or its credential, and `localhost` in `baseUrl` is used as `127.0.0.1`.
 
-**Why at most one refresh every two minutes.** Omni Route already waits 180 s per token when
-`/api/oauth/usage` answers 429 (`open-sse/services/claudeUsageCooldown.ts`): Anthropic limits that
-endpoint on a scale of minutes. The automatic sync runs every 70 minutes with 1.5 s between
-accounts. Two minutes keeps the manual path at no more than three reads (one per account) every
-two minutes, about 90 an hour in the worst case, and the quota is a whole percentage that moves
-slowly. A request inside the interval does not call the gateway: the database is read again and
+**Why at most one refresh every two minutes.** Each click runs one whole sync: every active
+connection of a supported provider (seven on 2026-11-19) is read once, one at a time, 1.5 s
+apart by default — what the automatic sync already does every 70 minutes. With the default
+interval of 120 s there are at most 30 manual syncs an hour in the worst case, on top of the
+automatic one, so at most 30 manual reads an hour per account, and never two reads of one
+account at once. Omni Route already waits 180 s per token when `/api/oauth/usage` answers 429
+(`open-sse/services/claudeUsageCooldown.ts`): Anthropic limits that endpoint on a scale of
+minutes, and the quota is a whole percentage that moves slowly, so a shorter interval would
+mostly earn stale answers. A request inside the interval does not call the gateway: the database is read again and
 the request is answered as `throttled`. A request made while a refresh runs (by the store's
 `updatedAt`, whether it is seen during the refresh or only after it) is answered as `throttled`,
 even if the interval ran out meanwhile; since `last` holds one request, only the newest of them
@@ -312,13 +324,18 @@ message itself is never kept): `em uso exclusivo` (exclusive lease), `credencial
 recusada` (the account's credentials failed), `Anthropic inacessível` (network or proxy failure)
 or, for anything else, `a Anthropic não devolveu a cota (provável limite de consultas)`. An
 account without a recorded error is `não incluída no sync do Omni Route` when the report shows it
-inactive or does not list it, and otherwise `a Anthropic não devolveu a cota (provável limite de
-consultas)`: Omni Route answered without quotas and kept the previous reading. That cause cannot
-be told apart further: when `/api/oauth/usage` answers 429, the installed build falls back to a
-legacy endpoint and reports that endpoint's message without failing
-(`open-sse/services/usage/claude.ts`), so it is given as probable. An account kept out by an
-exclusive lease is not told apart either, since leases are not in the tables this service reads.
-When the call itself failed, every account gets `credencial do painel recusada` (401/403),
+inactive or does not list it, or when an exclusive lease kept it out of the sync. Leases are read
+from the database just before the call, with the same rule as Omni Route
+(`isConnectionUnavailableToAuxiliaryActivity`): an `ACTIVE` row of
+`exclusive_connection_leases` not yet expired, or a connection listed in `allowed_connections` of
+an active, unrevoked, unexpired key with the `lease:exclusive` scope in `api_keys`. Those two
+statements select only `connection_id` and `allowed_connections`; no credential column is read.
+If that read fails, no account is taken as leased. Any other account is `a Anthropic não devolveu
+a cota (provável limite de consultas)`: Omni Route answered without quotas and kept the previous
+reading. That cause cannot be told apart further: when `/api/oauth/usage` answers 429, the
+installed build falls back to a legacy endpoint and reports that endpoint's message without
+failing (`open-sse/services/usage/claude.ts`), so it is given as probable. When the call itself
+failed, every account gets `credencial do painel recusada` (401/403),
 `Omni Route respondeu HTTP <code>`, `tempo esgotado` or `Omni Route inacessível`. Without a `refresh`
 block the report carries `"refresh": null` and the request key is never read. The log records
 only events: `refresh requested`, `refresh done 3/3`, `refresh partial 1/3`,
@@ -372,6 +389,21 @@ listener on port 20128 must be the same before and after.
 
 ## Rollback
 
+To go back to the previous install (for example from the provider-limits sync to the
+per-account version), only the observability service changes; the gateway is not touched:
+
+```bash
+ln -sfn ~/.omniroute/observability/<previous-sha8> ~/.omniroute/observability/current
+cp <backup>/config.before.json ~/.omniroute/observability/config.json   # mode 0600
+launchctl kickstart -k gui/$(id -u)/com.jcdecor.omniroute-observability
+```
+
+Removing the `refresh` block from the configuration and restarting the service is enough to turn
+the button off (the panel then shows manual refresh as unavailable); revoke the access token in
+the Omni Route dashboard as well when it is no longer needed.
+
+## Uninstall
+
 ```bash
 launchctl bootout gui/$(id -u)/com.jcdecor.omniroute-observability
 rm ~/Library/LaunchAgents/com.jcdecor.omniroute-observability.plist
@@ -379,12 +411,3 @@ rm -r ~/.omniroute/observability
 ```
 
 The gateway is untouched either way.
-
-launchctl bootout gui/$(id -u)/com.jcdecor.omniroute-observability
-rm ~/Library/LaunchAgents/com.jcdecor.omniroute-observability.plist
-rm -r ~/.omniroute/observability
-
-```
-
-The gateway is untouched either way.
-```
