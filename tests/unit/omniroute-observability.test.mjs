@@ -1109,12 +1109,26 @@ test("leased and reserved connections are read from the lease tables only", () =
   key.run(SECRET, JSON.stringify([C]), exclusive, 1, 0, null, at(5));
   key.run(SECRET, "not json", exclusive, 1, 0, null, null);
   key.run(SECRET, JSON.stringify({ [C]: true }), exclusive, 1, 0, null, null);
+  // A banned key, and a lease or key that expires exactly now, as Omni Route treats them.
+  key.run(SECRET, JSON.stringify([C]), exclusive, 1, 1, null, null);
+  key.run(SECRET, JSON.stringify([C]), exclusive, 1, 0, null, at(0));
+  lease.run(C, "ACTIVE", at(0));
   assert.deepEqual([...excludedConnections(db, NOW)].sort(), [A, X].sort());
   // Neither statement reads anything but the ids and the fields that decide the exclusion.
   assert.match(LEASED_SQL, /^SELECT connection_id FROM exclusive_connection_leases WHERE /);
   assert.match(RESERVED_SQL, /^SELECT allowed_connections FROM api_keys WHERE /);
-  // A database without these tables excludes nothing.
+  // A database without these tables excludes nothing; without one, the other still counts.
   assert.deepEqual([...excludedConnections(new DatabaseSync(":memory:"), NOW)], []);
+  const leasesOnly = new DatabaseSync(":memory:");
+  leasesOnly.exec(
+    "CREATE TABLE exclusive_connection_leases (connection_id TEXT, state TEXT, expires_at TEXT)"
+  );
+  leasesOnly
+    .prepare("INSERT INTO exclusive_connection_leases VALUES (?, 'ACTIVE', ?)")
+    .run(A, at(-1));
+  assert.deepEqual([...excludedConnections(leasesOnly, NOW)], [A]);
+  db.exec("DROP TABLE exclusive_connection_leases");
+  assert.deepEqual([...excludedConnections(db, NOW)], [X]);
 });
 
 test("an account missing from the report was not in the sync", async () => {
@@ -2231,13 +2245,14 @@ test("after a restore the first request read still has to be recent", async () =
 });
 
 test("a late timeout restarts the interval at the timeout", async () => {
-  // The sync read A and B before the 60 s deadline and was still going when it passed.
-  const h = refreshHarness({ result: { kind: "timeout", delayMs: 60_000 }, updated: [A, B] });
+  // The sync was still going when the 60 s deadline passed; nothing new is in the database yet.
+  const h = refreshHarness({ result: { kind: "timeout", delayMs: 60_000 } });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
   await h.refresher.idle();
   const timedOutAt = h.now();
-  assert.equal(h.refresher.state().last.status, "partial");
+  assert.equal(h.refresher.state().last.status, "failed");
+  assert.equal(h.refresher.state().last.error, "gateway_timeout");
   assert.equal(h.refresher.state().nextAllowedAt, new Date(timedOutAt + 120_000).toISOString());
   h.advance(100_000);
   h.refresher.offer(h.entry(2));

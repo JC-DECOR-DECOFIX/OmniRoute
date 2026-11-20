@@ -203,12 +203,16 @@ Claude accounts (on 2026-11-19, seven OAuth connections: three `claude`, one eac
 `providerLimitsCache` with a new `fetchedAt` when the call ends. A connection with an exclusive
 lease is left out, as in the automatic run, and the automatic run's schedule does not move.
 
-It differs from the automatic run in one respect: `source: "manual"` passes `forceRefresh: true`
-for every connection, where the automatic run skips those whose cached reading is still recent
-and does not force. For Antigravity (`agy`) that matters: **when Omni Route runs with
-`ANTIGRAVITY_CREDITS=always`, a forced reading probes the account's credit balance with an
-inference call that spends Antigravity credits** (`probeAntigravityCreditBalance`,
-`open-sse/services/usage/antigravity.ts`); with the default (`off`) or `retry` it does not. On
+Both runs read every eligible connection. They differ in the `forceRefresh` flag passed to each
+reading (`fetchOne`): `source: "manual"` always passes `true`; the automatic run passes `true`
+only for a connection without cached quotas, or an Antigravity (`agy`) one whose cached reading
+must be rebuilt (`shouldRefreshProviderLimitsCache`), and `false` otherwise. The flag matters
+only to the Antigravity reader: with `true` it skips its short-lived caches of the vendor's
+answers and, **when Omni Route runs with `ANTIGRAVITY_CREDITS=always`, probes the account's credit
+balance with an inference call that spends Antigravity credits** (`probeAntigravityCreditBalance`,
+`open-sse/services/usage/antigravity.ts`); with the default (`off`) or `retry` it does not. So in
+`always` mode every click may spend credits, where the automatic run does so only when it has to
+rebuild that account's reading. On
 2026-11-19 the gateway's LaunchAgent did not set that variable; its `.env` was not read, so
 whether it is set there was not checked. Before relying on the button with an Antigravity
 connection active, the operator should confirm that mode is not `always`, or accept that each
@@ -276,10 +280,13 @@ sees a request or its credential, and `localhost` in `baseUrl` is used as `127.0
 
 **Why at most one refresh every two minutes.** Each click runs one whole sync: every active
 connection of a supported provider (seven on 2026-11-19) is read once, one at a time, 1.5 s
-apart by default — what the automatic sync already does every 70 minutes. With the default
-interval of 120 s there are at most 30 manual syncs an hour in the worst case, on top of the
-automatic one, so at most 30 manual reads an hour per account, and never two reads of one
-account at once. Omni Route already waits 180 s per token when `/api/oauth/usage` answers 429
+apart by default within the round — what the automatic sync already does every 70 minutes. With
+the default interval of 120 s the button starts at most 30 syncs an hour in the worst case, on top
+of the automatic one, so at most 30 manual reads an hour per account. The spacing holds only
+within one round: this service never starts a second round of its own while one runs, but the
+manual route does not share the automatic scheduler's lock, so a click can overlap the automatic
+run, a refresh from the dashboard, or a round that goes on in the gateway after a timeout (the
+interval restarting at the timeout makes the last case unlikely, not impossible). Omni Route already waits 180 s per token when `/api/oauth/usage` answers 429
 (`open-sse/services/claudeUsageCooldown.ts`): Anthropic limits that endpoint on a scale of
 minutes, and the quota is a whole percentage that moves slowly, so a shorter interval would
 mostly earn stale answers. A request inside the interval does not call the gateway: the database is read again and
