@@ -17,6 +17,64 @@ const vscodeSdkAgent = "claude-cli/2.1.325 (external, claude-vscode, agent-sdk/0
 const vscodeSdkBilling =
   "x-anthropic-billing-header: cc_version=2.1.325.6bf; cc_entrypoint=claude-vscode;";
 
+// Measured on 2026-11-20 from the 2.1.321 binary Happy embeds for its claude_code harness
+// (TypeScript Agent SDK 0.3.321), recording only identity metadata.
+const agentSdkAgent = "claude-cli/2.1.321 (external, sdk-ts, agent-sdk/0.3.321)";
+const agentSdkBilling = "x-anthropic-billing-header: cc_version=2.1.321.cf7; cc_entrypoint=sdk-ts;";
+
+test("the TypeScript Agent SDK identity is kept only in its measured form", () => {
+  const resolve = (userAgent: string, text: string) =>
+    resolveNativeClaudeCodeIdentity(
+      "claude",
+      { "user-agent": userAgent },
+      { system: [{ type: "text", text }] }
+    );
+  assert.deepEqual(resolve(agentSdkAgent, agentSdkBilling), {
+    userAgent: agentSdkAgent,
+    billingLine: agentSdkBilling,
+  });
+  const subagent = agentSdkBilling + " cc_is_subagent=true;";
+  assert.deepEqual(resolve(agentSdkAgent, subagent), {
+    userAgent: agentSdkAgent,
+    billingLine: subagent,
+  });
+  for (const badAgent of [
+    // The SDK always sends its version; a bare sdk-ts entrypoint was never measured.
+    "claude-cli/2.1.321 (external, sdk-ts)",
+    agentSdkAgent.replace("0.3.321", "0.3.next"),
+    agentSdkAgent.replace("0.3.321", "0.3.321.1"),
+    agentSdkAgent.replace("agent-sdk", "unrelated-sdk"),
+    agentSdkAgent.replace(")", ", extra)"),
+    agentSdkAgent.replace("sdk-ts", "sdk-py"),
+    agentSdkAgent.replace("sdk-ts", "sdk-ts-other"),
+    // Forcing CLAUDE_CODE_ENTRYPOINT=sdk-cli under the SDK keeps the suffix; still unmeasured.
+    agentSdkAgent.replace("sdk-ts", "sdk-cli"),
+    agentSdkAgent.replace("sdk-ts", "cli"),
+  ]) {
+    assert.equal(resolve(badAgent, agentSdkBilling), null, badAgent);
+  }
+  // The suffix stays bound to sdk-ts/claude-vscode even when the billing entrypoint matches.
+  for (const entrypoint of ["sdk-cli", "cli"]) {
+    assert.equal(
+      resolve(
+        agentSdkAgent.replace("sdk-ts", entrypoint),
+        agentSdkBilling.replace("cc_entrypoint=sdk-ts", `cc_entrypoint=${entrypoint}`)
+      ),
+      null,
+      entrypoint
+    );
+  }
+  for (const badBilling of [
+    agentSdkBilling.replace("2.1.321", "2.1.320"),
+    agentSdkBilling.replace("cc_entrypoint=sdk-ts", "cc_entrypoint=sdk-cli"),
+    agentSdkBilling.replace("cc_entrypoint=sdk-ts", "cc_entrypoint=cli"),
+    agentSdkBilling.replace("sdk-ts", "sdk-py"),
+    agentSdkBilling + " cc_is_subagent=false;",
+  ]) {
+    assert.equal(resolve(agentSdkAgent, badBilling), null, badBilling);
+  }
+});
+
 test("actual VS Code SDK suffix is bounded and still requires coherent native billing", () => {
   const body = { system: [{ type: "text", text: vscodeSdkBilling }] };
   assert.deepEqual(
@@ -189,6 +247,7 @@ for (const [clientAgent, clientBilling] of [
   [agent, billing],
   [vscodeAgent, vscodeBilling],
   [vscodeSdkAgent, vscodeSdkBilling],
+  [agentSdkAgent, agentSdkBilling],
 ]) {
   test(`executor keeps Fable version, selected account and tool context: ${clientAgent}`, async () => {
     const originalFetch = globalThis.fetch;
@@ -424,5 +483,25 @@ test("negotiated betas stay on the allowlist without the policy or without a nat
     for (const token of dropped) assert.ok(!wire.beta.includes(token), token);
     // Already forwarded for every client.
     assert.ok(wire.beta.includes("effort-2025-11-24"));
+  }
+});
+
+test("Happy's Agent SDK client keeps its own version on Opus 5.5, subagents included", async () => {
+  for (const billingLine of [agentSdkBilling, agentSdkBilling + " cc_is_subagent=true;"]) {
+    const wire = await nativeWire({
+      billingLine,
+      model: "claude-opus-5-5",
+      userAgent: agentSdkAgent,
+    });
+    // Before the fix this was claude-cli/2.1.220, which upstream refuses for Opus 5.5.
+    assert.equal(wire.headers.get("user-agent"), agentSdkAgent);
+    const billing = (wire.body.system as { text: string }[]).filter((block) =>
+      block.text.startsWith("x-anthropic-billing-header:")
+    );
+    assert.deepEqual(
+      billing.map((block) => block.text),
+      [billingLine]
+    );
+    assert.equal(wire.body.model, "claude-opus-5-5");
   }
 });
