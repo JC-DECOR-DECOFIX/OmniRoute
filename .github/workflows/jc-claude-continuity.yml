@@ -33,6 +33,7 @@ jobs:
           node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts
           --import ./tests/_setup/isolateDataDir.ts --test
           tests/integration/claude-account-continuity.test.ts
+          tests/integration/claude-opus-recovery.test.ts
           tests/integration/claude-terminal-fallback.test.ts
           tests/unit/claude-continuity-refresh.test.ts
           tests/unit/claude-continuity-client.test.mjs

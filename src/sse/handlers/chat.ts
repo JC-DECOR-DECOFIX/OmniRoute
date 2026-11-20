@@ -19,7 +19,6 @@ import {
 import {
   getRuntimeProviderProfile,
   shouldMarkAccountExhaustedFrom429,
-  clearModelLock,
   lockModel,
   recordModelLockoutFailure,
   isDailyQuotaExhausted,
@@ -27,12 +26,7 @@ import {
 import { getCombo, getComboForModel, getModelInfo } from "../services/model";
 import { stripContextWindowSuffix } from "@omniroute/open-sse/services/model.ts";
 import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
-import {
-  errorResponse,
-  buildErrorBody,
-  sanitizeErrorMessage,
-  unavailableResponse,
-} from "@omniroute/open-sse/utils/error.ts";
+import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import { applyNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
@@ -135,15 +129,22 @@ import {
   adaptRequestForFallbackModel,
   CLAUDE_TERMINAL_TARGET,
   isClaudeTerminalSource,
-  markClaudeTerminalPool,
   withClaudeModelFallback,
   type ClaudeModelFallback,
 } from "./claudeModelFallback.ts";
+import { buildClaudePoolReply } from "./claudePoolReply";
 import {
-  canExhaustClaudeAccount,
-  describeClaudeTerminalPool,
-} from "../services/claudeTerminalPool";
-import { isClaudeUpstreamAccountFailure } from "@omniroute/open-sse/utils/claudeUpstreamAccountFailure.ts";
+  getClaudeUpstreamRetryAt,
+  isClaudeUpstreamAccountFailure,
+  isOpusRecoveryRejected,
+} from "@omniroute/open-sse/utils/claudeUpstreamAccountFailure.ts";
+import { CLAUDE_RECOVERY_MODEL } from "../services/claudeOpusRecovery";
+import {
+  claimOpusRecovery,
+  clearRecoveredModelLock,
+  createOpusSendFence,
+  finishOpusRecoveryFailure,
+} from "./claudeRecoveryProbe";
 import { getTrustedLocalRateLimitResponse } from "@omniroute/open-sse/services/rateLimitManager/errors.ts";
 import { estimateFinalInputTokens } from "@omniroute/open-sse/handlers/chatCore/contextEstimation.ts";
 
@@ -1535,6 +1536,9 @@ async function handleSingleModelChat(
   })();
   const claudeAccountContinuityOnly =
     provider === "claude" && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true";
+  if (claudeAccountContinuityOnly && request?.signal.aborted) {
+    return errorResponse(499, "Request aborted");
+  }
   const terminalPoolEnabled =
     claudeAccountContinuityOnly &&
     runtimeOptions.terminalFallbackEnabled &&
@@ -1659,6 +1663,18 @@ async function handleSingleModelChat(
       runtimeOptions.emergencyFallbackTried === true
   );
   const requestSignal = request?.signal ?? null;
+  const allowOpusRecovery =
+    claudeAccountContinuityOnly &&
+    model === CLAUDE_RECOVERY_MODEL &&
+    !isCombo &&
+    !comboName &&
+    !forceLiveComboTest &&
+    !hasForcedConnection &&
+    !runtimeOptions.modelPinned &&
+    !runtimeOptions.managedLease &&
+    !runtimeOptions.allowRateLimitedConnection &&
+    !bypassProviderQuotaPolicy &&
+    Boolean(effectiveAllowedConnections?.length && apiKeyInfo?.allowedConnections?.length);
   // Cumulative cap across all waits for this request (#7360 follow-up) — mirrors
   // combo.ts's comboCooldownBudgetLeftMs. Declared outside requestAttemptLoop so
   // it persists (and only decreases) across `continue requestAttemptLoop` retries.
@@ -1697,7 +1713,7 @@ async function handleSingleModelChat(
     initialPreselectedCredentials = null;
 
     while (true) {
-      const credentials =
+      let credentials =
         preselectedCredentials && excludedConnectionIds.size === 0
           ? preselectedCredentials
           : await getProviderCredentialsWithQuotaPreflight(
@@ -1741,6 +1757,25 @@ async function handleSingleModelChat(
               }
             );
       preselectedCredentials = null;
+
+      const probeContext = { modelStr, signal: requestSignal, breaker };
+      const recovery = allowOpusRecovery
+        ? await claimOpusRecovery(
+            {
+              ...probeContext,
+              allowed: effectiveAllowedConnections,
+              sessionKey: occupancySessionKey,
+              attempts: continuityAttemptedConnections.size,
+            },
+            credentials
+          )
+        : null;
+      if (recovery) credentials = recovery.credentials;
+      const opusRecovery = Boolean(recovery);
+      if (claudeAccountContinuityOnly && requestSignal?.aborted) {
+        credentials?.releaseOAuthSession?.();
+        return errorResponse(499, "Request aborted");
+      }
 
       if (runtimeOptions.managedLease && credentials) {
         const leaseError = buildManagedLeaseSelectionErrorResponse(credentials);
@@ -1808,6 +1843,7 @@ async function handleSingleModelChat(
         if (
           !forceLiveComboTest &&
           credentials?.allRateLimited &&
+          (!claudeAccountContinuityOnly || continuityAttemptedConnections.size > 0) &&
           isProviderBreakerFailureStatus(breakerFailureStatus) &&
           !isNetworkError &&
           !isQueueTimeout &&
@@ -1826,128 +1862,23 @@ async function handleSingleModelChat(
               )
             : undefined;
         if (claudeAccountContinuityOnly) {
-          const upstreamStatus = Number(lastStatus || credentials?.lastErrorCode);
-          const terminalStatus =
-            credentials?.expiredStatus === "credits_exhausted"
-              ? 402
-              : credentials?.expiredStatus === "banned"
-                ? 403
-                : 401;
-          const status =
-            upstreamStatus >= 400 && upstreamStatus <= 599
-              ? upstreamStatus
-              : credentials?.allExpired
-                ? terminalStatus
-                : credentials?.allRateLimited
-                  ? 429
-                  : 503;
-          const reason = sanitizeErrorMessage(
-            String(
-              lastError ||
-                credentials?.lastError ||
-                (credentials?.allExpired
-                  ? `${credentials.expiredCount} authorized account(s) are ${credentials.expiredStatus}`
-                  : "No authorized healthy Claude account is available")
-            )
-          );
-          const subscriptionExpired =
-            /(?:subscription|assinatura|plan).{0,48}(?:expired|inactive|expirad[ao]|expirou|inativ[ao])|(?:renew|renov[ae]).{0,32}(?:subscription|assinatura|plan)/i.test(
-              reason
-            );
-          const recovery =
-            (credentials?.expiredStatus === "banned" && !lastError) ||
-            /\b(?:account|conta)\b.{0,24}\b(?:banned|suspended|banid[ao]|suspens[ao])\b/i.test(
-              reason
-            )
-              ? "Verify the Claude account restriction with Anthropic support before retrying."
-              : status === 429
-                ? "Wait for the account usage reset or cooldown, then retry the same model."
-                : status === 401
-                  ? "Re-authenticate the unavailable accounts through OmniRoute's official Claude OAuth flow."
-                  : subscriptionExpired
-                    ? "Verify or renew the Claude subscription with Anthropic before retrying the same model."
-                    : status === 403
-                      ? "Verify Claude account permissions and access to the requested model in Anthropic."
-                      : status === 402
-                        ? "Verify the account's Claude subscription, billing and available credits with Anthropic."
-                        : "Check upstream service health and account availability in OmniRoute before retrying the same model.";
-          const responseHeaders = new Headers({
-            "Content-Type": "application/json",
-            "x-omniroute-continuity-status": "accounts-unavailable",
-            "x-should-retry": "false",
+          return buildClaudePoolReply({
+            credentials,
+            lastStatus,
+            lastError,
+            model,
+            modelStr,
+            modelFallback: runtimeOptions.modelFallback,
+            noLog: apiKeyInfo?.noLog === true,
+            continuityAttemptedConnections,
+            terminalAttempts,
+            terminalPoolEnabled,
+            isCombo,
+            comboName,
+            hasForcedConnection,
+            requestSignal,
+            effectiveAllowedConnections,
           });
-          // Gateway authentication already succeeded. Do not label an exhausted
-          // upstream credential pool as an invalid client API key.
-          const responseStatus = status === 401 ? 502 : status;
-          if (credentials?.allRateLimited && credentials.retryAfter) {
-            const retryAfter = unavailableResponse(status, "", credentials.retryAfter).headers.get(
-              "Retry-After"
-            );
-            if (retryAfter) responseHeaders.set("Retry-After", retryAfter);
-          }
-          const continuity = {
-            provider: "claude",
-            requested_model: model,
-            upstream_status: status,
-            mode: hasForcedConnection ? "fixed" : "authorized-pool",
-            attempts: continuityAttemptedConnections.size,
-            attempted_connections: Array.from(
-              continuityAttemptedConnections,
-              (id) => `${id.slice(0, 8)}...`
-            ),
-            result: "unavailable",
-            ...(runtimeOptions.modelFallback
-              ? { model_fallback: runtimeOptions.modelFallback }
-              : {}),
-            recovery,
-            ...(responseHeaders.has("Retry-After")
-              ? {
-                  retry_after: Number(responseHeaders.get("Retry-After")),
-                  retry_after_at: credentials.retryAfter,
-                }
-              : {}),
-            ...(credentials?.poolRateLimit?.allRateLimited
-              ? {
-                  pool_rate_limited: true,
-                  pool_eligible_at: credentials.poolRateLimit.eligibleAt,
-                }
-              : {}),
-          };
-          log.warn("CLAUDE_CONTINUITY", JSON.stringify(continuity));
-          const errorBody = buildErrorBody(
-            responseStatus,
-            `Claude upstream accounts unavailable: ${reason}. ${recovery}`
-          );
-          const poolResponse = new Response(
-            JSON.stringify({
-              ...errorBody,
-              error: { ...errorBody.error, code: "upstream_accounts_unavailable" },
-              continuity,
-            }),
-            {
-              status: responseStatus,
-              headers: responseHeaders,
-            }
-          );
-          if (
-            terminalPoolEnabled &&
-            !isCombo &&
-            !comboName &&
-            !hasForcedConnection &&
-            !requestSignal?.aborted &&
-            effectiveAllowedConnections?.length &&
-            canExhaustClaudeAccount(status)
-          ) {
-            const verdict = await describeClaudeTerminalPool(
-              model,
-              modelStr,
-              effectiveAllowedConnections,
-              terminalAttempts,
-              credentials?.poolRateLimit?.allRateLimited === true
-            );
-            if (verdict) markClaudeTerminalPool(poolResponse, model, verdict);
-          }
-          return poolResponse;
         }
         const noCredsRes = handleNoCredentials(
           credentials,
@@ -2034,7 +1965,9 @@ async function handleSingleModelChat(
       }
       let refreshedCredentials;
       try {
-        refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+        refreshedCredentials = opusRecovery
+          ? credentials
+          : await checkAndRefreshToken(provider, credentials);
       } catch (error) {
         releaseOAuthSession();
         throw error;
@@ -2059,7 +1992,11 @@ async function handleSingleModelChat(
           ...(workspaceId ? { workspaceId } : {}),
         });
       }
-      if (runtimeOptions.sessionId && body?._omnirouteInternalRequest !== "context-handoff") {
+      if (
+        !opusRecovery &&
+        runtimeOptions.sessionId &&
+        body?._omnirouteInternalRequest !== "context-handoff"
+      ) {
         touchSession(runtimeOptions.sessionId, credentials.connectionId);
         startQuotaMonitor(
           runtimeOptions.sessionId,
@@ -2111,7 +2048,17 @@ async function handleSingleModelChat(
             modelTargetFormat: targetFormat,
             providerProfile,
             cachedSettings: runtimeOptions.cachedSettings,
-            skipUpstreamRetry: runtimeOptions.skipUpstreamRetry ?? false,
+            skipUpstreamRetry: opusRecovery || (runtimeOptions.skipUpstreamRetry ?? false),
+            opusRecovery,
+            beforeOpusRecoverySend: recovery
+              ? createOpusSendFence(
+                  probeContext,
+                  request,
+                  apiKeyInfo?.id,
+                  recovery.credentials,
+                  recovery.slot
+                )
+              : null,
             correlationId: runtimeOptions?.correlationId ?? null,
             conversationId: runtimeOptions?.conversationId ?? null,
             modelPinned: runtimeOptions?.modelPinned ?? false,
@@ -2135,8 +2082,23 @@ async function handleSingleModelChat(
         return execution.localResourcePressureResult.response;
       }
       const { result, tlsFingerprintUsed } = execution;
+      if (opusRecovery && isOpusRecoveryRejected(result.response)) {
+        releaseOAuthSession();
+        // A changed fence is not an account failure or permission to send any
+        // other request (including a model fallback) with the old policy snapshot.
+        return result.response;
+      }
       if (claudeAccountContinuityOnly) continuityAttemptedConnections.add(credentials.connectionId);
       if (!result.success) releaseOAuthSession();
+      if (opusRecovery && !result.success) {
+        await finishOpusRecoveryFailure(
+          probeContext,
+          result,
+          credentials.connectionId,
+          providerProfile
+        );
+        return withSelectedConnectionHeader(result.response, credentials.connectionId);
+      }
       if (!result.success && terminalPoolEnabled) {
         const status = Number(result.status);
         if (
@@ -2177,7 +2139,7 @@ async function handleSingleModelChat(
       });
 
       if (result.success) {
-        if (claudeAccountContinuityOnly) {
+        if (claudeAccountContinuityOnly && apiKeyInfo?.noLog !== true) {
           const attempts = Array.from(continuityAttemptedConnections);
           log.info(
             "CLAUDE_CONTINUITY",
@@ -2194,7 +2156,7 @@ async function handleSingleModelChat(
             })
           );
         }
-        clearModelLock(provider, credentials.connectionId, model);
+        clearRecoveredModelLock(provider, credentials.connectionId, model, recovery?.slot);
         if (!forceLiveComboTest) {
           breaker._onSuccess();
         }
@@ -2647,6 +2609,14 @@ async function handleSingleModelChat(
                 (failureKind === "rate_limit" || failureKind === "transient")
               ),
               isCombo,
+              confirmedClaude429:
+                claudeAccountContinuityOnly &&
+                result.status === 429 &&
+                effectiveModel === model &&
+                isClaudeUpstreamAccountFailure(result.response) &&
+                !requestSignal?.aborted,
+              claudeRetryAt: getClaudeUpstreamRetryAt(result.response),
+              allowOpusRecovery: allowOpusRecovery && continuityAttemptedConnections.size === 1,
             }
           );
 
