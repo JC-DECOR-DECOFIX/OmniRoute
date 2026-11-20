@@ -38,12 +38,14 @@ export function resolveNativeClaudeCodeIdentity(
   if (agents.length !== 1) return null;
   const userAgent = agents[0][1];
   const ua =
-    /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli|claude-vscode)(?:, agent-sdk\/(\d{1,4}\.\d{1,4}\.\d{1,4}))?\)$/.exec(
+    /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,4}) \(external, (cli|sdk-cli|sdk-ts|claude-vscode)(?:, agent-sdk\/(\d{1,4}\.\d{1,4}\.\d{1,4}))?\)$/.exec(
       userAgent
     );
-  // The VS Code extension adds its SDK version; reject unmeasured entrypoints
-  // and arbitrary suffixes while retaining the native version/billing checks.
-  if (!ua || (ua[3] && ua[2] !== "claude-vscode")) return null;
+  // The VS Code extension adds its SDK version, and the TypeScript Agent SDK (measured on
+  // the 2.1.321 binary Happy embeds, agent-sdk/0.3.321) always does; reject unmeasured
+  // pairings and arbitrary suffixes while retaining the native version/billing checks.
+  if (!ua) return null;
+  if (ua[3] ? ua[2] !== "claude-vscode" && ua[2] !== "sdk-ts" : ua[2] === "sdk-ts") return null;
   const lines = body.system.flatMap((block: unknown) => {
     if (!block || typeof block !== "object") return [];
     const text = (block as Record<string, unknown>).text;
@@ -54,7 +56,7 @@ export function resolveNativeClaudeCodeIdentity(
   // VS Code 2.1.325 binary). Without it here the subagent fell back to the pinned version,
   // which upstream refuses for models that require a newer client.
   const billing =
-    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli|claude-vscode);(?: cch=[a-f0-9]{5};)?(?: cc_is_subagent=true;)?$/.exec(
+    /^x-anthropic-billing-header: cc_version=(\d{1,4}\.\d{1,4}\.\d{1,4})\.([a-f0-9]{3}); cc_entrypoint=(cli|sdk-cli|sdk-ts|claude-vscode);(?: cch=[a-f0-9]{5};)?(?: cc_is_subagent=true;)?$/.exec(
       lines[0]
     );
   if (!billing || billing[1] !== ua[1] || billing[3] !== ua[2]) return null;
