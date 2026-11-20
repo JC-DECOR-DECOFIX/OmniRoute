@@ -14,15 +14,22 @@ const MAX_REASON_LENGTH = 160;
 
 const WINDOW_KEYS = { fiveHour: "session (5h)", weekly: "weekly (7d)" };
 // Order matters: a scheme with its credential is replaced as a whole before its parts.
-const SECRET_PATTERNS = [
+// Credentials by their recognizable form, which no model name or e-mail address takes.
+const CREDENTIAL_PATTERNS = [
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /sk-ant-[A-Za-z0-9_-]+/g,
+  /\boma_[A-Za-z0-9_-]+/g,
+  /\bsk-[A-Za-z0-9_-]{16,}/g,
   /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
   // Assignments such as `token=…`, `api-key: …`, `"secret":"…"`.
   /\b(?:token|secret|password|passwd|api[_-]?key|authorization|cookie|session)\b["']?\s*[:=]\s*["']?[^\s"',;}]+/gi,
-  // Any other long opaque run of key-like characters.
+];
+const HEX_RUN = /[0-9a-f]{24,}/gi;
+const SECRET_PATTERNS = [
+  ...CREDENTIAL_PATTERNS,
+  // In free text, also any other long opaque run of key-like characters.
   /[A-Za-z0-9_\-+/=.~]{32,}/g,
-  /[0-9a-f]{24,}/gi,
+  HEX_RUN,
 ];
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
@@ -73,9 +80,17 @@ function shortId(id) {
   return typeof id === "string" ? id.slice(0, 8) : null;
 }
 
+/** `text` with every credential in a recognizable form replaced by "[redacted]". */
+export function redactCredentials(text) {
+  let out = text;
+  for (const pattern of [...CREDENTIAL_PATTERNS, HEX_RUN]) out = out.replace(pattern, "[redacted]");
+  return out;
+}
+
 function model(value) {
   const name = matching(value, MODEL_RE);
-  if (name === null) return null;
+  // A name that holds a credential is no model name: it is dropped, not shown redacted.
+  if (name === null || redactCredentials(name) !== name) return null;
   return name.startsWith(`${PROVIDER}/`) ? name.slice(PROVIDER.length + 1) : name;
 }
 

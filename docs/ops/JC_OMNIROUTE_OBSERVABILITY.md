@@ -266,8 +266,11 @@ that read succeeds (a store with no previous report counts), nothing is publishe
 request is read; it is retried on every tick and request poll. The first read of the request key
 after a start still ignores a request older than 90 s, whatever was taken back.
 
-While `NODE_DEBUG` is set, Node may print request headers on stderr, so the gateway credential
-is not read at all and requests are answered `not_configured`.
+While `NODE_DEBUG` is set, Node may print request headers on stderr (with `net`, the options of
+every connection), so no credential is sent: the gateway credential is not read at all, and no
+request carrying the daemon token is sent either. The log says `daemon and gateway calls disabled
+while NODE_DEBUG is set`; nothing is published and no request is read until the service runs
+without it.
 
 The gateway is called only after the `running` state has been written to the artifact. When that
 write fails, nothing is called, the request is answered `failed` with `error: null`, and it does
@@ -370,17 +373,25 @@ holds a badge (`Atualizado · HH:MM`, `Desatualizado · lido …` or `Indisponí
 account's reading), the account in use with its model and last request, one table row per account
 of the pool (5 h and weekly use, when each window resets, state), the most recent switch and a
 footer. Without a report it holds one line saying the report is unavailable. The card shows
-nothing the panel does not already show.
+nothing the panel does not already show, and any text in it that has the form of a credential
+(`Bearer …`, `sk-ant-…`, `oma_…`, a JWT, `token=…`, a long hex run) is replaced by
+`[redacted]`; a model name of that form is already dropped from the report.
+
+The badge is the state when the version was published, not when it is viewed: the panel checks
+its data store's age live, the card cannot. A stale reading turns the badge to `Desatualizado`
+in the next version, but if the service stops, the last version keeps the badge it had. Its time
+(`Atualizado · HH:MM`) is the reading's own, so an old card shows an old time.
 
 A new version of the artifact is written only when the document differs from the one in its
-latest version **and** at least `minIntervalMs` has passed since the artifact last changed. At
+latest version (compared as JSON with every object's keys sorted) **and** at least `minIntervalMs` has passed since the artifact last changed. At
 start the service reads the artifact (`GET /v0/artifacts/:id`) and the `index.genui.json` of its
 numbered latest version, so a restart neither writes the same card again nor shortens the
 interval. The write is `PATCH /v0/artifacts/:id` through the daemon socket with the token of the
 `happy` block, `If-Match` carrying the artifact's version without quotes, and the body
 `{ mutationId, files: [{ path: "index.genui.json", text }] }`. A `409` or `412` makes the service
 read the artifact again before the next write; a `400` (a document the daemon refuses) is logged
-with its error code and the node paths it names, never values, and that same document is not sent
+with its error code and the node paths it names (only paths whose every name is a key or a
+component type of the document sent), never values, and no document refused that way is sent
 again. Any other failure is logged once and tried again on the next poll. The card never holds up
 the report: a failed or slow write does not touch the panel's data store. The log records
 `card published`, `card conflict: HTTP <code>, reloading`, `card refused: HTTP 400 …`,

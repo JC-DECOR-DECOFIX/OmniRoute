@@ -252,6 +252,32 @@ test("an unavailable or malformed report renders a single line", () => {
   }
 });
 
+test("no credential that reached the report is shown, in the card or its fallback", () => {
+  const r = copy();
+  r.current.requestedModel = "oma_abcdefghij0123456789";
+  r.current.effectiveModel = SECRET;
+  r.switches[0].requestedModel = "token=abc123";
+  r.switches[0].effectiveModel = "Bearer abc.def";
+  r.switches[0].reason = { status: 401, summary: `upstream said ${SECRET}` };
+  const doc = render(r, AT);
+  assertGenUi(doc);
+  const text = JSON.stringify(doc);
+  assert.doesNotMatch(text, /oma_|sk-ant|Bearer |token=/);
+  assert.match(text, /\[redacted\]/);
+  assert.doesNotMatch(doc.fallback, /oma_|sk-ant|Bearer |token=/);
+});
+
+test("without a confirmed reading the fallback does not change with each poll", () => {
+  const r = copy();
+  r.current = null;
+  const later = copy();
+  later.current = null;
+  later.generatedAt = new Date(AT + 15_000).toISOString();
+  const doc = render(r, AT);
+  assert.deepEqual(render(later, AT), doc);
+  assert.match(doc.fallback, /^Claude · Omni Route, sem leitura confirmada de cota: /);
+});
+
 test("the footer names the configured interval", () => {
   const text = (ms) => children(render(REPORT, AT, { minIntervalMs: ms }))[3].text;
   assert.match(text(300_000), /no máximo a cada 5 min$/);
@@ -362,6 +388,42 @@ test("a refused document is not sent again, and only its error code and paths ar
   assert.equal(await h.publish(docB), "written");
 });
 
+test("documents refused in turn are none of them sent again", async () => {
+  const refusal = { status: 400, errorCode: "invalid_request", paths: [] };
+  const h = publisherHarness({
+    latest: () => ({ version: VERSION_1, updatedAt: null, text: "" }),
+    results: [refusal, refusal],
+  });
+  assert.equal(await h.publish(docA), "refused");
+  assert.equal(await h.publish(docB), "refused");
+  h.advance(3_600_000);
+  assert.equal(await h.publish(docA), "refused");
+  assert.equal(await h.publish(docB), "refused");
+  assert.equal(h.writes.length, 2);
+});
+
+test("the same document with its keys in another order is unchanged", async () => {
+  const reversed = (value) => {
+    if (Array.isArray(value)) return value.map(reversed);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.keys(value)
+        .reverse()
+        .map((k) => [k, reversed(value[k])])
+    );
+  };
+  const text = JSON.stringify(reversed(docA), null, 2);
+  assert.notEqual(text, JSON.stringify(docA, null, 2));
+  assert.equal(canonical(text), canonical(JSON.stringify(docA)));
+  // Arrays keep their order.
+  assert.notEqual(canonical("[1,2]"), canonical("[2,1]"));
+  const h = publisherHarness({
+    latest: () => ({ version: VERSION_1, updatedAt: AT - 3_600_000, text }),
+  });
+  assert.equal(await h.publish(docA), "unchanged");
+  assert.equal(h.writes.length, 0);
+});
+
 test("failures are logged once, retried on the next call, and never thrown", async () => {
   const h = publisherHarness({
     latest: () => ({ version: VERSION_1, updatedAt: null, text: "not json" }),
@@ -382,18 +444,26 @@ test("failures are logged once, retried on the next call, and never thrown", asy
   assert.equal(canonical("not json"), null);
 });
 
-test("error paths keep node paths only", () => {
+test("error paths keep node paths of the sent document only", () => {
+  const sent = JSON.stringify(CARD_V1);
   const body = {
-    error: `bad ${SECRET}`,
+    error: `root<card>.children[1]<table>.rows[0].h5: expected string; root<card>.badge.${SECRET.replace(/-/g, "_")}: bad; root<card>.children[0]<keyvalue>.items[2].value: ${SECRET}`,
     code: "invalid_request",
     details: [
       { path: "/root/children/1/rows/0/h5", message: `value ${SECRET}` },
       { instancePath: "/root/badge", value: SECRET },
       { path: `x ${SECRET}` },
+      { pointer: "/root/SECRETSECRET" },
     ],
   };
-  assert.deepEqual(errorPaths(body), ["/root/children/1/rows/0/h5", "/root/badge"]);
-  assert.deepEqual(errorPaths(null), []);
+  assert.deepEqual(errorPaths(body, sent), [
+    "root<card>.children[1]<table>.rows[0].h5",
+    "root<card>.children[0]<keyvalue>.items[2].value",
+    "/root/children/1/rows/0/h5",
+    "/root/badge",
+  ]);
+  assert.deepEqual(errorPaths(body, "not json"), []);
+  assert.deepEqual(errorPaths(null, sent), []);
 });
 
 // Configuration and the daemon calls.

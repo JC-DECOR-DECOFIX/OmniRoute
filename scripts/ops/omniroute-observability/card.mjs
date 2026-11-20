@@ -6,6 +6,8 @@
 // decides when a new version of the card's artifact is written: only when the document changed,
 // and at most once per minimum interval. Both are pure apart from what is injected.
 
+import { redactCredentials } from "./aggregate.mjs";
+
 export const CARD_FILE = "index.genui.json";
 
 const MAX_ROWS = 30;
@@ -250,13 +252,23 @@ function intervalText(ms) {
 
 /**
  * The Gen UI document for `report` at `now`. `timeZone` formats every time; `minIntervalMs` is
- * the publishing interval named in the footer. The document has no actions.
+ * the publishing interval named in the footer. The document has no actions, and no text of it
+ * carries a credential: any that reached the report is replaced by "[redacted]".
  */
-export function render(
-  report,
-  now,
-  { timeZone = "America/Sao_Paulo", minIntervalMs = 300_000 } = {}
-) {
+export function render(report, now, options) {
+  return redacted(draw(report, now, options));
+}
+
+function redacted(value) {
+  if (typeof value === "string") return redactCredentials(value);
+  if (Array.isArray(value)) return value.map(redacted);
+  if (isObj(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redacted(child)]));
+  }
+  return value;
+}
+
+function draw(report, now, { timeZone = "America/Sao_Paulo", minIntervalMs = 300_000 } = {}) {
   const fmt = clock(timeZone)(now);
   const title = "Claude · Omni Route";
   if (!validReport(report) || str(report.observer.status) === "unavailable") {
@@ -409,9 +421,11 @@ export function render(
 
   // Fallback: the same facts in one or two sentences.
   const shownAt = curQuota.known ? curQuota.oldestAt || curQuota.readAt : null;
+  // Without a confirmed reading the stamp names none, so the time of each poll does not make a
+  // new document.
   const stamp = shownAt
     ? `lido ${fmt.hm(shownAt)} de ${fmt.dm(shownAt)}`
-    : `atualizado ${fmt.hm(time(r.generatedAt))} de ${fmt.dm(time(r.generatedAt))}`;
+    : "sem leitura confirmada de cota";
   let head;
   if (!cur) head = "nenhuma requisição recente";
   else {
@@ -449,14 +463,28 @@ export function render(
   };
 }
 
-/** Identity of a document: its JSON, compact, or null when the text is not JSON. */
+const sortedKeys = (value) => {
+  if (Array.isArray(value)) return value.map(sortedKeys);
+  if (!isObj(value)) return value;
+  const out = {};
+  for (const key of Object.keys(value).sort()) out[key] = sortedKeys(value[key]);
+  return out;
+};
+
+/**
+ * Identity of a document: its JSON, compact, with every object's keys in sorted order (arrays
+ * keep theirs), or null when the text is not JSON.
+ */
 export function canonical(text) {
   try {
-    return JSON.stringify(JSON.parse(text));
+    return JSON.stringify(sortedKeys(JSON.parse(text)));
   } catch {
     return null;
   }
 }
+
+// Documents the daemon refused, by identity; the oldest is forgotten past this many.
+const MAX_REFUSED = 32;
 
 /**
  * Publishes the card when its document changes, at most once per `minIntervalMs`.
@@ -465,7 +493,7 @@ export function canonical(text) {
  * the first publish and again after a conflict, so the card that is already there is not written
  * again and a restart does not shorten the interval. `write({ version, text, mutationId })`
  * resolves with `{ status, version?, errorCode?, paths? }`. A 409 or 412 reloads the artifact on
- * the next call; a 400 marks the document refused, so the same document is not sent again. A
+ * the next call; a 400 marks the document refused, so no refused document is sent again. A
  * failure is logged and tried again on the next call; it never throws.
  */
 export function createCardPublisher({
@@ -476,7 +504,7 @@ export function createCardPublisher({
   log = () => {},
 }) {
   let state = null;
-  let refused = null;
+  const refused = new Set();
   let inFlight = false;
   let sequence = 0;
   let lastLog = null;
@@ -501,9 +529,9 @@ export function createCardPublisher({
           return "failed";
         }
       }
-      const text = JSON.stringify(doc);
+      const text = canonical(JSON.stringify(doc));
       if (text === state.canonical) return "unchanged";
-      if (text === refused) return "refused";
+      if (refused.has(text)) return "refused";
       if (state.publishedAt !== null && now() - state.publishedAt < minIntervalMs) return "waiting";
       sequence += 1;
       let result;
@@ -529,7 +557,8 @@ export function createCardPublisher({
         return "conflict";
       }
       if (result.status === 400) {
-        refused = text;
+        refused.add(text);
+        if (refused.size > MAX_REFUSED) refused.delete(refused.values().next().value);
         const paths = (result.paths ?? []).join(", ");
         note(
           `card refused: HTTP 400${result.errorCode ? ` ${result.errorCode}` : ""}${paths ? ` at ${paths}` : ""}`

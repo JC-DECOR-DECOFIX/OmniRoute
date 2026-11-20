@@ -393,9 +393,18 @@ export function reportFingerprint(payload) {
  * with the status and the body text. Rejects, with `kind` "timeout" or "network", when the
  * deadline passes, the body is too large, or the connection fails or closes before the response
  * ends. Error messages carry only the label and a system error code, never a path or a body.
+ * With NODE_DEBUG set, a request that carries a credential is not sent at all (see
+ * debugLogsRequests).
  */
 export function exchange({ client = http, url, options, body, deadlineMs, label }) {
   return new Promise((resolve, reject) => {
+    const headers = Object.keys(options?.headers ?? {});
+    if (debugLogsRequests() && headers.some((name) => name.toLowerCase() === "authorization")) {
+      reject(
+        Object.assign(new Error(`${label} not sent while NODE_DEBUG is set`), { kind: "network" })
+      );
+      return;
+    }
     let settled = false;
     let req = null;
     const fail = (kind, detail) => {
@@ -596,23 +605,51 @@ export async function readCardArtifact({ socketPath, token, artifactId }) {
   return { version: artifact.version, updatedAt: artifact.updatedAt, text: file.text };
 }
 
-/** Where a refused document is wrong: node paths named in the error, never values. */
-export function errorPaths(body) {
+// A node path as the daemon names it in a refusal (`root<card>.children[0]<stat>.value`), or
+// as a JSON pointer (`/root/children/0/value`).
+const GENUI_PATH_RE =
+  /root(?:<[a-z_]{1,24}>)?(?:\.[A-Za-z_][A-Za-z0-9_]{0,31}|\[\d{1,4}\]|<[a-z_]{1,24}>){0,24}/g;
+const POINTER_RE = /^(?:\/[A-Za-z0-9_]{1,32}){1,24}$/;
+
+/**
+ * Where a refused document is wrong: the node paths the error names, never values. A path is
+ * kept only when each of its names is a key or a component type of the document that was sent,
+ * so nothing else the daemon returned can reach the log.
+ */
+export function errorPaths(body, sent) {
+  const names = new Set();
+  const collect = (value, depth) => {
+    if (depth > 32 || !value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (!Array.isArray(value)) names.add(key);
+      if (key === "type" && typeof child === "string") names.add(child);
+      collect(child, depth + 1);
+    }
+  };
+  try {
+    collect(JSON.parse(sent), 0);
+  } catch {
+    return [];
+  }
+  const known = (path) =>
+    (path.match(/[A-Za-z_][A-Za-z0-9_]*|\d+/g) ?? []).every(
+      (part) => /^\d+$/.test(part) || names.has(part)
+    );
   const paths = [];
+  const keep = (path) => {
+    if (paths.length < 10 && path.length <= 160 && known(path) && !paths.includes(path))
+      paths.push(path);
+  };
   const visit = (value, depth) => {
     if (paths.length >= 10 || depth > 6 || !value || typeof value !== "object") return;
     for (const [key, child] of Object.entries(value)) {
-      if (
-        ["path", "instancePath", "pointer"].includes(key) &&
-        typeof child === "string" &&
-        /^[A-Za-z0-9_./#[\]-]{1,120}$/.test(child) &&
-        !paths.includes(child)
-      ) {
-        paths.push(child);
+      if (typeof child === "string") {
+        if (["path", "instancePath", "pointer"].includes(key) && POINTER_RE.test(child))
+          keep(child);
+        else for (const match of child.match(GENUI_PATH_RE) ?? []) keep(match);
       } else {
         visit(child, depth + 1);
       }
-      if (paths.length >= 10) return;
     }
   };
   visit(body, 0);
@@ -663,7 +700,7 @@ export async function writeCardArtifact({
   if (status === 400) {
     const code =
       typeof parsed?.code === "string" && /^[a-z_]{1,40}$/.test(parsed.code) ? parsed.code : null;
-    return { status, errorCode: code, paths: errorPaths(parsed) };
+    return { status, errorCode: code, paths: errorPaths(parsed, text) };
   }
   return { status };
 }
@@ -1056,7 +1093,8 @@ export function createRefresher({
 
 /**
  * Node prints request options, headers included, on stderr when NODE_DEBUG names its network
- * modules. With any NODE_DEBUG set, the gateway credential is not used at all.
+ * modules. With any NODE_DEBUG set, no credential is sent: neither the gateway's nor the
+ * daemon's, so the report and the card are not published either.
  */
 export function debugLogsRequests(env = process.env) {
   return typeof env.NODE_DEBUG === "string" && env.NODE_DEBUG.trim() !== "";
@@ -1068,6 +1106,7 @@ function log(message) {
 
 async function main(configPath) {
   const config = loadConfig(configPath);
+  if (debugLogsRequests()) log("daemon and gateway calls disabled while NODE_DEBUG is set");
   const pollMs = config.pollIntervalMs ?? DEFAULT_POLL_MS;
   const refresh = refreshSettings(config);
   let refresher = null;
