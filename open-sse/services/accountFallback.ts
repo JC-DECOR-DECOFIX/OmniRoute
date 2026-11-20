@@ -102,6 +102,8 @@ export type ModelLockoutEntry = {
   reason: string;
   until: number;
   lockedAt: number;
+  confirmedClaude429?: true;
+  opusRecovery?: { used: boolean };
   failureCount: number;
   lastFailureAt: number;
   resetAfterMs: number;
@@ -637,6 +639,8 @@ export function lockModel(
     reason,
     until: newUntil,
     lockedAt: now,
+    ...(metadata.confirmedClaude429 ? { confirmedClaude429: true } : {}),
+    ...(metadata.opusRecovery && !existing ? { opusRecovery: metadata.opusRecovery } : {}),
     failureCount: metadata.failureCount ?? existing?.failureCount ?? 1,
     lastFailureAt: metadata.lastFailureAt ?? now,
     resetAfterMs: metadata.resetAfterMs ?? existing?.resetAfterMs ?? 0,
@@ -930,6 +934,8 @@ export function getModelLockoutInfo(
     remainingMs: entry.until - Date.now(),
     lockedAt: new Date(entry.lockedAt).toISOString(),
     failureCount: entry.failureCount,
+    ...(entry.confirmedClaude429 ? { confirmedClaude429: true } : {}),
+    ...(entry.opusRecovery ? { opusRecovery: entry.opusRecovery } : {}),
   };
 }
 

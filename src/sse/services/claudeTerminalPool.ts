@@ -16,8 +16,7 @@ export async function describeClaudeTerminalPool(
   model: string,
   modelStr: string,
   allowedIds: string[],
-  attempts: ReadonlyMap<string, number>,
-  poolRateLimited: boolean
+  attempts: ReadonlyMap<string, number>
 ): Promise<TerminalReason | null> {
   const rows = (
     await getRawProviderConnections({ provider: "claude" }, undefined, undefined, [
@@ -25,8 +24,6 @@ export async function describeClaudeTerminalPool(
       "default_model",
       "is_active",
       "test_status",
-      "error_code",
-      "last_error",
       "rate_limited_until",
       "provider_specific_data",
     ])
@@ -44,23 +41,14 @@ export async function describeClaudeTerminalPool(
     if (attempted !== undefined) return attempted;
     if (TERMINAL_STATES.has(String(row.testStatus))) return 401;
     if (!row.isActive) return 0;
-    const status = Number(row.errorCode);
     if (Date.parse(String(row.rateLimitedUntil)) > Date.now()) {
-      // Quarantines left by local limiter failures are not upstream evidence.
-      if (
-        /RATE_LIMIT_(?:QUEUE|EXECUTION)|semaphore|renewal|proxy_unreachable|timeout/i.test(
-          String(row.lastError ?? "")
-        )
-      )
-        return 0;
-      // Persisted 5xx does not distinguish a gateway timeout or proxy failure
-      // from an upstream HTTP response. Require request-scoped provenance for it.
-      if ([401, 402, 403, 429].includes(status)) return status;
+      // Stored account cooldowns do not distinguish local policy from provider HTTP.
       return 0;
     }
     const lock = getModelLockoutInfo("claude", String(row.id), model);
-    if (lock && lock.remainingMs > 0 && QUOTA_LOCKS.has(lock.reason)) return 429;
-    return poolRateLimited ? 429 : 0;
+    return lock?.confirmedClaude429 && lock.remainingMs > 0 && QUOTA_LOCKS.has(lock.reason)
+      ? 429
+      : 0;
   });
   if (!statuses.every(canExhaustClaudeAccount)) return null;
   return statuses.every((status) => status === 429)

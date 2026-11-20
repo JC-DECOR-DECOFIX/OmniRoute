@@ -1,4 +1,6 @@
 import { HTTP_STATUS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
+import { errorResponse } from "../utils/error.ts";
+import { markOpusRecoveryRejected } from "../utils/claudeUpstreamAccountFailure.ts";
 import { getRegistryEntry } from "../config/providerRegistry.ts";
 import {
   resolveAlternateFormat,
@@ -213,6 +215,8 @@ export type ExecuteInput = {
   ) => Promise<void> | void;
   /** When true, skip the intra-URL 429 retry in execute() so the caller handles fallback. */
   skipUpstreamRetry?: boolean;
+  /** Internal fence for a single Opus recovery dispatch. */
+  beforeOpusRecoverySend?: (() => Promise<boolean>) | null;
   /** Delegated Context Editing (Claude only): when enabled, attach the
    * `context_management.clear_tool_uses` strategy so the provider clears stale
    * tool-use blocks server-side. Honored only on the genuine `claude` path. */
@@ -717,6 +721,7 @@ export class BaseExecutor {
       upstreamExtraHeaders,
       clientHeaders,
       skipUpstreamRetry = false,
+      beforeOpusRecoverySend,
       onCredentialsRefreshed,
       contextEditing,
     } = input;
@@ -730,7 +735,7 @@ export class BaseExecutor {
     // Probe-origin dispatches must not consume a refresh-token rotation —
     // routing state untouched; the reactive 401/403 path is probe-guarded
     // in chatCore (#9817).
-    if (!isProbeContext() && this.needsRefresh(credentials)) {
+    if (!beforeOpusRecoverySend && !isProbeContext() && this.needsRefresh(credentials)) {
       try {
         // Fix A: wire onCredentialsRefreshed through runWithOnPersist so it runs
         // INSIDE the per-connection mutex inside getAccessToken. Not every
@@ -1473,6 +1478,17 @@ export class BaseExecutor {
           await gateOutboundRequest(`agentrouter:${url}`);
         }
 
+        if (beforeOpusRecoverySend) {
+          const permitted = await beforeOpusRecoverySend();
+          const aborted = signal?.aborted;
+          const response =
+            permitted && !aborted
+              ? await fetchWithStartTimeout(url, { ...fetchOptions, redirect: "manual" })
+              : markOpusRecoveryRejected(
+                  errorResponse(aborted ? 499 : 503, "Opus cooldown recovery is no longer eligible")
+                );
+          return { response, url, headers: finalHeaders, transformedBody: serializedBody };
+        }
         let response = await fetchWithStartTimeout(url, fetchOptions);
 
         if (openrouterFreeWindowAccountKey) {
