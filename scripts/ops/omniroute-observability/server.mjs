@@ -586,13 +586,15 @@ export async function readCardArtifact({ socketPath, token, artifactId }) {
   } catch {
     throw new Error("happy card read returned invalid JSON");
   }
+  if (artifact?.status !== "active" || artifact.type !== "gen_ui") {
+    throw new Error("happy card artifact is not active Gen UI");
+  }
   if (
-    artifact?.status !== "active" ||
     typeof artifact.version !== "string" ||
     !ARTIFACT_VERSION_RE.test(artifact.version) ||
     !Number.isInteger(artifact.latestVersion)
   ) {
-    throw new Error("happy card artifact is not an active artifact");
+    throw new Error("happy card artifact has invalid version metadata");
   }
   // The numbered version, so the document read belongs to the concurrency version above.
   const file = await get(

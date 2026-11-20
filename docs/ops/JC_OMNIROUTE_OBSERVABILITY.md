@@ -383,16 +383,18 @@ in the next version, but if the service stops, the last version keeps the badge 
 (`Atualizado · HH:MM`) is the reading's own, so an old card shows an old time.
 
 A new version of the artifact is written only when the document differs from the one in its
-latest version (compared as JSON with every object's keys sorted) **and** at least `minIntervalMs` has passed since the artifact last changed. At
-start the service reads the artifact (`GET /v0/artifacts/:id`) and the `index.genui.json` of its
-numbered latest version, so a restart neither writes the same card again nor shortens the
-interval. The write is `PATCH /v0/artifacts/:id` through the daemon socket with the token of the
+latest version (compared as JSON with every object's keys sorted) **and** at least
+`minIntervalMs` has passed since the artifact last changed. At start the service checks that
+the target is an active `gen_ui` artifact (`GET /v0/artifacts/:id`) before reading
+`index.genui.json` from its numbered latest version. A restart neither writes the latest
+published card again nor shortens the interval. The write is `PATCH /v0/artifacts/:id` through the daemon socket with the token of the
 `happy` block, `If-Match` carrying the artifact's version without quotes, and the body
 `{ mutationId, files: [{ path: "index.genui.json", text }] }`. A `409` or `412` makes the service
 read the artifact again before the next write; a `400` (a document the daemon refuses) is logged
 with its error code and the node paths it names (only paths whose every name is a key or a
-component type of the document sent), never values, and no document refused that way is sent
-again. Any other failure is logged once and tried again on the next poll. The card never holds up
+component type of the document sent), never values. The running publisher keeps a SHA-256 hash
+of each refused canonical document, without eviction, so it does not try any of them again.
+Any other failure is logged once and tried again on the next poll. The card never holds up
 the report: a failed or slow write does not touch the panel's data store. The log records
 `card published`, `card conflict: HTTP <code>, reloading`, `card refused: HTTP 400 …`,
 `card publish failed: …` and `card state not read: …`.

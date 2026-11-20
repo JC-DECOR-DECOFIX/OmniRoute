@@ -402,6 +402,21 @@ test("documents refused in turn are none of them sent again", async () => {
   assert.equal(h.writes.length, 2);
 });
 
+test("more than 32 refusals never cause the first document to be retried", async () => {
+  const refusal = { status: 400, errorCode: "invalid_request" };
+  const documents = Array.from({ length: 33 }, (_, i) => ({ ...docA, fallback: `Cota ${i}` }));
+  const h = publisherHarness({
+    latest: () => ({ version: VERSION_1, updatedAt: null, text: "" }),
+    results: documents.map(() => refusal),
+  });
+  for (const doc of documents) assert.equal(await h.publish(doc), "refused");
+
+  const { fallback, ...first } = documents[0];
+  assert.equal(await h.publish({ fallback, ...first }), "refused");
+  assert.equal(h.writes.length, 33);
+  assert.equal(await h.publish(docB), "written");
+});
+
 test("the same document with its keys in another order is unchanged", async () => {
   const reversed = (value) => {
     if (Array.isArray(value)) return value.map(reversed);
@@ -666,6 +681,28 @@ test("the service publishes the card once and then only when it changes", async 
   for (const needle of ["daemon-token", "oma_", "sk-ant", "Bearer "]) {
     assert.equal(logs.includes(needle), false, needle);
   }
+});
+
+test("an active non-Gen UI artifact is never patched and does not stop panel publishing", async (t) => {
+  const { dir, write } = privateDir(t);
+  const daemon = await fakeDaemon(t, dir);
+  daemon.artifact.type = "html";
+  const configPath = serviceConfig(write, dir, daemon.socketPath, { artifactId: "card1" });
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  config.listen.port = await freePort();
+  writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
+  const service = startService(t, configPath);
+  const rejected = () => service.stdout().includes("happy card artifact is not active Gen UI");
+  await waitFor(() => rejected() || daemon.requests.some((r) => r.method === "PATCH"));
+  assert.ok(rejected());
+  await waitFor(() =>
+    daemon.requests.some((r) => r.method === "PUT" && r.url.includes("omni-route%2Fusage"))
+  );
+  assert.ok(
+    daemon.requests
+      .filter((r) => r.url.startsWith("/v0/artifacts/card1"))
+      .every((r) => r.method === "GET" && r.url === "/v0/artifacts/card1")
+  );
 });
 
 test("after a restart the card is not written before the interval from its last change", async (t) => {

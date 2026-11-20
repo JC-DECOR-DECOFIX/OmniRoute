@@ -6,6 +6,7 @@
 // decides when a new version of the card's artifact is written: only when the document changed,
 // and at most once per minimum interval. Both are pure apart from what is injected.
 
+import { createHash } from "node:crypto";
 import { redactCredentials } from "./aggregate.mjs";
 
 export const CARD_FILE = "index.genui.json";
@@ -483,9 +484,6 @@ export function canonical(text) {
   }
 }
 
-// Documents the daemon refused, by identity; the oldest is forgotten past this many.
-const MAX_REFUSED = 32;
-
 /**
  * Publishes the card when its document changes, at most once per `minIntervalMs`.
  *
@@ -493,8 +491,8 @@ const MAX_REFUSED = 32;
  * the first publish and again after a conflict, so the card that is already there is not written
  * again and a restart does not shorten the interval. `write({ version, text, mutationId })`
  * resolves with `{ status, version?, errorCode?, paths? }`. A 409 or 412 reloads the artifact on
- * the next call; a 400 marks the document refused, so no refused document is sent again. A
- * failure is logged and tried again on the next call; it never throws.
+ * the next call; a 400 marks the document refused for the life of this publisher. Other
+ * failures are logged and retried on the next call.
  */
 export function createCardPublisher({
   read,
@@ -504,6 +502,8 @@ export function createCardPublisher({
   log = () => {},
 }) {
   let state = null;
+  // Retain only fixed-size identities, never the refused documents. Don't evict old hashes:
+  // a recurring report can reproduce any earlier document.
   const refused = new Set();
   let inFlight = false;
   let sequence = 0;
@@ -529,16 +529,18 @@ export function createCardPublisher({
           return "failed";
         }
       }
-      const text = canonical(JSON.stringify(doc));
+      const json = JSON.stringify(doc, null, 2);
+      const text = canonical(json);
       if (text === state.canonical) return "unchanged";
-      if (refused.has(text)) return "refused";
+      const identity = createHash("sha256").update(text).digest("hex");
+      if (refused.has(identity)) return "refused";
       if (state.publishedAt !== null && now() - state.publishedAt < minIntervalMs) return "waiting";
       sequence += 1;
       let result;
       try {
         result = await write({
           version: state.version,
-          text: `${JSON.stringify(doc, null, 2)}\n`,
+          text: `${json}\n`,
           mutationId: `card-${now()}-${sequence}`,
         });
       } catch (error) {
@@ -557,8 +559,7 @@ export function createCardPublisher({
         return "conflict";
       }
       if (result.status === 400) {
-        refused.add(text);
-        if (refused.size > MAX_REFUSED) refused.delete(refused.values().next().value);
+        refused.add(identity);
         const paths = (result.paths ?? []).join(", ");
         note(
           `card refused: HTTP 400${result.errorCode ? ` ${result.errorCode}` : ""}${paths ? ` at ${paths}` : ""}`
