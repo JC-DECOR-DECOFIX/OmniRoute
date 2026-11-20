@@ -14,6 +14,7 @@ import {
   CLAUDE_CODE_CLIENT_VERSION,
   CLAUDE_CODE_SDK_PACKAGE_VERSION,
 } from "@/shared/constants/claudeCodeClient";
+import { renameToolReferences } from "../services/claudeCodeToolRemapper.ts";
 
 // ---------- Versions ------------------------------------------------------
 
@@ -494,7 +495,11 @@ export function stripProxyToolPrefix(body: Record<string, unknown>): void {
     for (const m of messages) {
       const content = m.content;
       if (!Array.isArray(content)) continue;
-      for (const block of content as Array<Record<string, unknown>>) {
+      const blocks = content as Array<Record<string, unknown>>;
+      for (let i = 0; i < blocks.length; i++) {
+        // ToolSearch references must keep naming the tool they load.
+        blocks[i] = renameToolReferences(blocks[i], stripName);
+        const block = blocks[i];
         if (block?.type === "tool_use") {
           const stripped = stripName(block.name);
           if (stripped !== undefined) block.name = stripped;

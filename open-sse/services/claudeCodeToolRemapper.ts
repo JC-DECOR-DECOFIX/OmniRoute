@@ -110,6 +110,54 @@ function collectServerToolNames(tools: unknown): Set<string> {
   return names;
 }
 
+// Containers a tool_reference can sit in: a client ToolSearch `tool_result.content[]`
+// and a server `tool_search_tool_result.content.tool_references[]`. Nothing else is
+// walked, so a tool_use `input` that merely looks like a reference is never rewritten.
+const TOOL_REFERENCE_CONTAINER_KEYS = ["content", "tool_references"] as const;
+const MAX_TOOL_REFERENCE_DEPTH = 4;
+
+/**
+ * Rename the `tool_name` of every tool-search `tool_reference` block under a message
+ * content block. Anthropic resolves each reference against `tools[]`, so any rename
+ * applied to tool definitions must reach the references too — otherwise the request
+ * fails with `Tool reference '<name>' not found in available tools`.
+ *
+ * `rename` returns the new name, or undefined to keep it. Non-mutating: returns the
+ * same value when nothing changed and shallow clones along the changed path otherwise.
+ */
+export function renameToolReferences<T>(
+  value: T,
+  rename: (name: string) => string | undefined,
+  depth = 0
+): T {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item) => {
+      const renamed = renameToolReferences(item, rename, depth);
+      if (renamed !== item) changed = true;
+      return renamed;
+    });
+    return (changed ? next : value) as T;
+  }
+  if (!value || typeof value !== "object" || depth > MAX_TOOL_REFERENCE_DEPTH) return value;
+  const node = value as Record<string, unknown>;
+  if (node.type === "tool_reference") {
+    if (typeof node.tool_name !== "string") return value;
+    const renamed = rename(node.tool_name);
+    return (renamed && renamed !== node.tool_name ? { ...node, tool_name: renamed } : value) as T;
+  }
+  let next = node;
+  for (const key of TOOL_REFERENCE_CONTAINER_KEYS) {
+    const child = node[key];
+    if (!child || typeof child !== "object") continue;
+    const renamed = renameToolReferences(child, rename, depth + 1);
+    if (renamed === child) continue;
+    if (next === node) next = { ...node };
+    next[key] = renamed;
+  }
+  return next as T;
+}
+
 export function remapToolNamesInRequest(body: Record<string, unknown>): boolean {
   let hasLowercase = false;
   let hasTitleCase = false;
@@ -141,8 +189,18 @@ export function remapToolNamesInRequest(body: Record<string, unknown>): boolean 
     for (const msg of messages) {
       const content = msg.content as Array<Record<string, unknown>> | undefined;
       if (!Array.isArray(content)) continue;
-      for (const block of content) {
-        if (block.type === "tool_use" && typeof block.name === "string") {
+      for (let i = 0; i < content.length; i++) {
+        content[i] = renameToolReferences(content[i], (name) => {
+          if (serverToolNames.has(name)) return undefined;
+          const mapped = TOOL_RENAME_MAP[name];
+          if (mapped) {
+            trackToolName(body, mapped, name);
+            hasLowercase = true;
+          }
+          return mapped;
+        });
+        const block = content[i];
+        if (block?.type === "tool_use" && typeof block.name === "string") {
           if (serverToolNames.has(block.name)) continue;
           const mapped = TOOL_RENAME_MAP[block.name];
           if (mapped) {
@@ -463,7 +521,12 @@ export function cloakThirdPartyToolNames(
           changed = true;
           return { ...block, name: aliasFor(block.name) };
         }
-        return block;
+        // A ToolSearch reference must name the cloaked alias its tool now carries.
+        const renamed = renameToolReferences(block, (name) =>
+          !serverToolNames.has(name) && shouldCloak(name) ? aliasFor(name) : undefined
+        );
+        if (renamed !== block) changed = true;
+        return renamed;
       });
       return changed ? { ...message, content: newContent } : message;
     });
