@@ -427,6 +427,8 @@ export async function executeChatWithBreaker({
   managedLease = null,
   requestedModel = null,
   terminalClaudeFallback = false,
+  opusRecovery = false,
+  beforeOpusRecoverySend = null,
 }: ExecuteChatWithBreakerOptions): Promise<ExecuteChatWithBreakerResult> {
   let tlsFingerprintUsed = false;
   const normalizedTrafficType: TrafficType =
@@ -488,6 +490,8 @@ export async function executeChatWithBreaker({
             reasoningTransportFallback,
             managedLease,
             terminalClaudeFallback,
+            opusRecovery,
+            beforeOpusRecoverySend,
             skipResourcePressureGuard: true,
             onCredentialsRefreshed: async (newCreds: any) => {
               await updateProviderCredentials(credentials.connectionId, {
@@ -579,7 +583,9 @@ export async function executeChatWithBreaker({
       return { result, tlsFingerprintUsed: false };
     }
 
-    if (bypassCircuitBreaker) {
+    // Opus recovery checks the live breaker at its send fence. Do not score a
+    // local fence refusal as breaker success (which could close an OPEN breaker).
+    if (bypassCircuitBreaker || opusRecovery) {
       if (tlsFingerprintActive) {
         const tracked = await runWithTlsTracking(tlsTrackingIdentity, chatFn);
         return { result: tracked.result, tlsFingerprintUsed: tracked.tlsFingerprintUsed };

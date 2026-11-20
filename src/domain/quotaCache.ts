@@ -58,6 +58,7 @@ interface QuotaCacheEntry {
   provider: string;
   quotas: Record<string, QuotaInfo>;
   fetchedAt: number;
+  observedLive?: true;
   exhausted: boolean;
   nextResetAt: string | null;
   windowDurationMs?: number | null; // T08: optional rolling window duration
@@ -472,6 +473,7 @@ export function setQuotaCache(
     provider,
     quotas,
     fetchedAt: Date.now(),
+    observedLive: true,
     exhausted,
     nextResetAt: exhausted ? earliestResetAt(quotas) : null,
   };

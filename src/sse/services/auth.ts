@@ -34,7 +34,6 @@ import {
   type ProviderConnectionView,
 } from "@/lib/db/providers/lazyConnectionView";
 import {
-  DEFAULT_QUOTA_THRESHOLD_PERCENT,
   getQuotaCache,
   getQuotaWindowStatus,
   hydrateCodexQuotaCacheForRequest,
@@ -146,7 +145,26 @@ import {
 } from "@/shared/utils/shuffleDeck";
 import { shouldIsolateProbeFailures } from "@/shared/utils/probeOrigin";
 import { isClaudeModelScopedRateLimit } from "@omniroute/open-sse/services/quotaTextCooldowns.ts";
+import {
+  evaluateQuotaLimitPolicy,
+  resolveQuotaLimitPolicy,
+  type QuotaLimitPolicy,
+  normalizeWindowName,
+  uniqueWindows,
+  parseFutureDateMs,
+  getEarliestFutureDate,
+} from "./accountQuotaPolicy";
+export { evaluateQuotaLimitPolicy, resolveQuotaLimitPolicy };
 import { describePoolRateLimit } from "./claudePoolRateLimit";
+import {
+  isOpusRecoveryCandidate,
+  modelScoped429Evidence,
+  opusRecoverySelectionAllowed,
+  opusRetryWaitMs,
+  type Claude429Evidence,
+  type OpusRecoverySelection,
+} from "./claudeOpusRecovery";
+import { isTerminalConnectionStatus } from "./connectionTerminalStatus";
 import {
   applyExclusiveConnectionLeasePolicy,
   invalidateManagedConnectionLease,
@@ -170,6 +188,8 @@ interface RecoverableConnectionState {
   lastErrorSource?: string | null;
 }
 export interface CredentialSelectionOptions {
+  /** Direct, explicitly authorized Opus recovery only; never bypasses another filter. */
+  opusRecovery?: OpusRecoverySelection;
   allowSuppressedConnections?: boolean;
   allowRateLimitedConnections?: boolean;
   bypassQuotaPolicy?: boolean;
@@ -199,8 +219,6 @@ interface CooldownInspectionState {
   codexScopeCooldownMs: number | null;
   retryableModelCooldownMs: number | null;
 }
-const MIN_QUOTA_THRESHOLD_PERCENT = 1;
-const MAX_QUOTA_THRESHOLD_PERCENT = 100;
 const NON_RETRYABLE_MODEL_LOCKOUT_REASONS = new Set(["not_found", "not_found_local"]);
 // Antigravity Gemini family 429 with no parseable upstream hint: seed the backoff at
 // this base. Real upstream Retry-After hints still win — they flow through
@@ -216,9 +234,6 @@ function toNullableNumber(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   const parsed = toNumber(value, Number.NaN);
   return Number.isFinite(parsed) ? parsed : null;
-}
-function toBooleanOrDefault(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
 }
 function normalizeSessionKey(value: unknown, prefix: string): string | null {
   if (typeof value !== "string" || value.trim().length === 0) return null;
@@ -295,21 +310,6 @@ export function extractSessionAffinityKey(
   if (!inputText || inputText.trim().length === 0) return null;
   return `input:sha256:${createHash("sha256").update(inputText.slice(0, 4096)).digest("hex")}`;
 }
-function getCodexLimitPolicy(providerSpecificData: JsonRecord): {
-  use5h: boolean;
-  useWeekly: boolean;
-} {
-  const policy = asRecord(providerSpecificData.codexLimitPolicy);
-  return {
-    use5h: toBooleanOrDefault(policy.use5h, true),
-    useWeekly: toBooleanOrDefault(policy.useWeekly, true),
-  };
-}
-interface QuotaLimitPolicy {
-  enabled: boolean;
-  thresholdPercent: number;
-  windows: string[];
-}
 interface QuotaCacheView {
   quotas?: Record<
     string,
@@ -319,57 +319,9 @@ interface QuotaCacheView {
     }
   >;
 }
-function normalizeQuotaThreshold(
-  value: unknown,
-  fallback = DEFAULT_QUOTA_THRESHOLD_PERCENT
-): number {
-  const parsed = toNumber(value, fallback);
-  return Math.min(MAX_QUOTA_THRESHOLD_PERCENT, Math.max(MIN_QUOTA_THRESHOLD_PERCENT, parsed));
-}
-function normalizeWindowName(windowName: unknown): string | null {
-  if (typeof windowName !== "string") return null;
-  const normalized = windowName.trim().toLowerCase();
-  return normalized.length > 0 ? normalized : null;
-}
-function uniqueWindows(windows: string[]): string[] {
-  return [...new Set(windows)];
-}
-function normalizeCodexWindowName(windowName: unknown): string | null {
-  if (typeof windowName !== "string") return null;
-  const normalized = windowName.trim().toLowerCase();
-  if (normalized === "session (5h)" || normalized === "5h" || normalized === "five_hour") {
-    return "session";
-  }
-  if (normalized === "weekly (7d)" || normalized === "7d" || normalized === "seven_day") {
-    return "weekly";
-  }
-  return toCodexBaseQuotaWindowName(normalized);
-}
-function applyCodexWindowPolicy(rawWindows: string[], providerSpecificData: JsonRecord): string[] {
-  const codexPolicy = getCodexLimitPolicy(providerSpecificData);
-  const normalizedRaw = rawWindows.map(normalizeCodexWindowName).filter(Boolean) as string[];
-
-  // Preserve explicitly configured custom windows, but enforce canonical Codex windows
-  // from toggles so weekly exhaustion is never skipped when useWeekly=true.
-  let windows = [...normalizedRaw];
-  windows = windows.filter((windowName) => {
-    if (windowName === "session") return codexPolicy.use5h;
-    if (windowName === "weekly") return codexPolicy.useWeekly;
-    return true;
-  });
-  if (codexPolicy.use5h) windows.push("session");
-  if (codexPolicy.useWeekly) windows.push("weekly");
-
-  return uniqueWindows(windows);
-}
 function normalizeStatus(value: string | null): string {
   return (value || "").trim().toLowerCase();
 }
-function isTerminalConnectionStatus(connection: ProviderConnectionView): boolean {
-  const status = normalizeStatus(connection.testStatus);
-  return status === "credits_exhausted" || status === "banned" || status === "expired";
-}
-
 // OpenRouter's paid balance and its `:free`-suffixed models are billed
 // separately — a 402 from a paid model call correctly locks the whole
 // connection as credits_exhausted (see openrouter-quota-6842.test.ts), but
@@ -439,82 +391,6 @@ function resolveTerminalConnectionStatus(
     return "expired";
   }
   return null;
-}
-export function resolveQuotaLimitPolicy(
-  provider: string,
-  providerSpecificData: JsonRecord
-): QuotaLimitPolicy {
-  const rawPolicy = asRecord(providerSpecificData.limitPolicy);
-  const rawWindows = Array.isArray(rawPolicy.windows) ? rawPolicy.windows : [];
-  const windows = rawWindows.map(normalizeWindowName).filter(Boolean) as string[];
-
-  if (provider === "codex") {
-    const defaultWindows = applyCodexWindowPolicy(windows, providerSpecificData);
-    const enabled = toBooleanOrDefault(rawPolicy.enabled, defaultWindows.length > 0);
-
-    return {
-      enabled,
-      thresholdPercent: normalizeQuotaThreshold(rawPolicy.thresholdPercent),
-      windows: defaultWindows,
-    };
-  }
-
-  return {
-    enabled: toBooleanOrDefault(rawPolicy.enabled, false),
-    thresholdPercent: normalizeQuotaThreshold(rawPolicy.thresholdPercent),
-    windows,
-  };
-}
-export function evaluateQuotaLimitPolicy(
-  provider: string,
-  connection: ProviderConnectionView,
-  requestedModel: string | null = null
-): { blocked: boolean; reasons: string[]; resetAt: string | null } {
-  const policy = resolveQuotaLimitPolicy(provider, connection.providerSpecificData);
-  if (!policy.enabled || policy.windows.length === 0) {
-    return { blocked: false, reasons: [], resetAt: null };
-  }
-
-  const reasons: string[] = [];
-  const resetCandidates: Array<string | null> = [];
-
-  for (const windowName of policy.windows) {
-    const effectiveWindowName =
-      provider === "codex" ? toCodexScopedQuotaWindowName(windowName, requestedModel) : windowName;
-    const status = getQuotaWindowStatus(
-      connection.id,
-      effectiveWindowName,
-      policy.thresholdPercent
-    );
-    if (!status?.reachedThreshold) continue;
-    reasons.push(`${effectiveWindowName} usage ${Math.round(status.usedPercentage)}%`);
-    resetCandidates.push(status.resetAt);
-  }
-
-  return {
-    blocked: reasons.length > 0,
-    reasons,
-    resetAt: getEarliestFutureDate(resetCandidates),
-  };
-}
-function parseFutureDateMs(value: string | null): number | null {
-  if (!value) return null;
-  // Tolerate numeric-epoch strings (e.g. "1781696905131.0") as well as ISO
-  // strings — the rate_limited_until TEXT column can hold either (#3954).
-  const ms = cooldownUntilMs(value);
-  if (!Number.isFinite(ms) || ms <= Date.now()) return null;
-  return ms;
-}
-function getEarliestFutureDate(candidates: Array<string | null>): string | null {
-  return (
-    candidates
-      .map((candidate) => ({
-        raw: candidate,
-        ms: parseFutureDateMs(candidate),
-      }))
-      .filter((entry) => entry.ms !== null)
-      .sort((a, b) => (a.ms as number) - (b.ms as number))[0]?.raw || null
-  );
 }
 function getCachedQuotaResetAt(connectionId: string): string | null {
   const entry = getQuotaCache(connectionId);
@@ -1284,6 +1160,19 @@ export async function getProviderCredentials(
     const allowRateLimitedConnections =
       allowSuppressedConnections || options.allowRateLimitedConnections === true;
     const bypassQuotaPolicy = options.bypassQuotaPolicy === true;
+    const recovery = options.opusRecovery;
+    if (
+      recovery &&
+      !opusRecoverySelectionAllowed(
+        provider,
+        requestedModel,
+        allowedConnections,
+        options,
+        allowRateLimitedConnections,
+        bypassQuotaPolicy
+      )
+    )
+      return null;
     let forcedConnectionId =
       typeof options.forcedConnectionId === "string" && options.forcedConnectionId.trim().length > 0
         ? options.forcedConnectionId.trim()
@@ -1337,7 +1226,7 @@ export async function getProviderCredentials(
 
     // #5903: an active session-affinity pin outranks a per-request reset-aware
     // forcedConnectionId (see sessionAffinityPin leaf for the full rationale).
-    if (!options.lease && !options.strictForcedConnection) {
+    if (!options.lease && !options.strictForcedConnection && !recovery) {
       forcedConnectionId =
         applySessionAffinityPin({
           forcedConnectionId,
@@ -1568,9 +1457,10 @@ export async function getProviderCredentials(
           } else {
             modelLockedCount += 1;
           }
-          return false;
+          return Boolean(recovery && isOpusRecoveryCandidate(c, recovery));
         }
       }
+      if (recovery) return false;
       connectionFilterStatus.set(c.id, "available");
       return true;
     });
@@ -1892,6 +1782,14 @@ export async function getProviderCredentials(
             freeCount: 0,
           }
         : null;
+    }
+
+    if (recovery) {
+      // No affinity mutations, speculative attempts on siblings, or lock clearing here.
+      const candidate = [...leasePolicy.connections].sort(
+        (a, b) => (a.priority ?? 999) - (b.priority ?? 999)
+      )[0];
+      return materializeConnection(candidate, options);
     }
 
     const orderedConnections = [...leasePolicy.connections].sort((a, b) => {
@@ -2549,7 +2447,7 @@ export async function markAccountUnavailable(
   provider: string | null = null,
   model: string | null = null,
   providerProfile = null,
-  options: {
+  options: Claude429Evidence & {
     persistUnavailableState?: boolean;
     /** Caller is the combo engine — it records its own model-level lockouts. */
     isCombo?: boolean;
@@ -3021,11 +2919,13 @@ export async function markAccountUnavailable(
         ? getCachedQuotaResetAt(connectionId)
         : null;
     const cachedQuotaResetMs = parseFutureDateMs(cachedQuotaResetAt);
+    const claudeHintMs = opusRetryWaitMs(provider, model, status, options.claudeRetryAt);
     const cooldownMs = terminalStatus
       ? 0
-      : cachedQuotaResetMs
-        ? cachedQuotaResetMs - Date.now()
-        : rawCooldownMs;
+      : Math.max(
+          claudeHintMs,
+          cachedQuotaResetMs ? cachedQuotaResetMs - Date.now() : rawCooldownMs
+        );
 
     // ── #3027: per-model subscription/permission 403 → model-only lockout ──
     if (
@@ -3147,13 +3047,20 @@ export async function markAccountUnavailable(
     const persistUnavailableState = options.persistUnavailableState !== false;
 
     // disableCooling (#2997) opts the connection out of this lock as well.
-    if (!persistUnavailableState || (modelScopedLimit && !disableCooling)) {
+    if (!terminalStatus && (!persistUnavailableState || (modelScopedLimit && !disableCooling))) {
       // Combo-managed transient failure (e.g. 429): keep the connection clean in
       // the DB, but record an in-memory model lockout so credential selection
       // skips this exact provider+connection+model while it cools down — other
       // models on the same connection stay usable.
       if (provider && model && cooldownMs > 0) {
-        lockModel(provider, connectionId, model, reason || "unknown", cooldownMs);
+        lockModel(
+          provider,
+          connectionId,
+          model,
+          reason || "unknown",
+          cooldownMs,
+          modelScoped429Evidence(modelScopedLimit, model, options)
+        );
       }
       await updateProviderConnection(connectionId, {
         ...baseUpdate,

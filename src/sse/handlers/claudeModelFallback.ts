@@ -87,7 +87,11 @@ async function readPoolRateLimit(response: Response): Promise<PoolRateLimit | nu
     return null;
   }
   const pool = await readPoolAnswer(response);
-  if (pool?.continuity.upstream_status !== 429 || pool.continuity.pool_rate_limited !== true) {
+  if (
+    !pool ||
+    (pool.continuity.local_status ?? pool.continuity.upstream_status) !== 429 ||
+    pool.continuity.pool_rate_limited !== true
+  ) {
     return null;
   }
   return pool;

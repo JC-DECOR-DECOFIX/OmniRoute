@@ -8,7 +8,13 @@ import { resolveChatCoreRequestSetup } from "./chatCore/requestSetup.ts";
 import { normalizeOpenAICompatibleTools } from "./chatCore/openAICompatibleTools.ts";
 import { buildFailureUsageRecord } from "./chatCore/failureUsage.ts";
 import { estimateFinalInputTokens } from "./chatCore/contextEstimation.ts";
-import { markClaudeUpstreamAccountFailure } from "../utils/claudeUpstreamAccountFailure.ts";
+import {
+  markOpusRecoveryRejected,
+  isOpusRecoveryRejected,
+  markClaudeUpstreamAccountFailure,
+} from "../utils/claudeUpstreamAccountFailure.ts";
+import { getClaude429RetryAt } from "./chatCore/claudeRetryHint.ts";
+import { getExecutor } from "../executors/index.ts";
 import {
   extractSystemRoleMessages,
   relocateDirectiveOnlyMessages,
@@ -502,6 +508,8 @@ export async function handleChatCore({
   reasoningTransportFallback = "drop",
   managedLease = null,
   terminalClaudeFallback = false,
+  opusRecovery = false,
+  beforeOpusRecoverySend = null,
 }) {
   let { provider, model, extendedContext } = modelInfo;
   if (!skipResourcePressureGuard) {
@@ -2916,6 +2924,11 @@ export async function handleChatCore({
   }
   // Get executor for this provider (with optional upstream proxy routing)
   const executor = await resolveExecutorWithProxy(provider);
+  if (opusRecovery && executor !== getExecutor(provider)) {
+    const result = createErrorResult(503, "Opus cooldown recovery requires the native executor");
+    markOpusRecoveryRejected(result.response);
+    return result;
+  }
   const getExecutionCredentials = () =>
     resolveExecutionCredentialsFor({
       credentials,
@@ -2964,7 +2977,7 @@ export async function handleChatCore({
   });
 
   const dedupRequestBody = { ...translatedBody, model: `${provider}/${model}`, stream };
-  const dedupEnabled = shouldDeduplicate(dedupRequestBody);
+  const dedupEnabled = !opusRecovery && shouldDeduplicate(dedupRequestBody);
   const dedupHash = dedupEnabled ? computeRequestHash(dedupRequestBody) : null;
 
   const executeProviderRequest = async (modelToCall = effectiveModel, allowDedup = false) => {
@@ -3091,6 +3104,7 @@ export async function handleChatCore({
                           clientResponseFormat,
                           onCredentialsRefreshed,
                           skipUpstreamRetry,
+                          beforeOpusRecoverySend,
                           contextEditing: { enabled: contextEditingEnabled },
                         })
                       ),
@@ -3100,6 +3114,10 @@ export async function handleChatCore({
               );
               const res = normalizeExecutorResult(rawExecutorResult);
               trace("post_executor", { status: res?.response?.status });
+              if (opusRecovery && isOpusRecoveryRejected(res.response)) {
+                releaseAccountSemaphore();
+                return res;
+              }
 
               if (
                 provider === "codex" &&
@@ -3332,7 +3350,7 @@ export async function handleChatCore({
                 let continueMidStreamEnabled = false;
                 let throughputWatchdog =
                   resolveResilienceSettings(null).streamRecovery.throughputWatchdog;
-                if (okStatus) {
+                if (okStatus && !opusRecovery) {
                   try {
                     // Reuse the request-consolidated settings read (see line ~2076) — no
                     // second DB/cache hit. Default OFF when the setting is absent.
@@ -3362,7 +3380,7 @@ export async function handleChatCore({
                 }
 
                 let clientBody: ReadableStream<Uint8Array>;
-                if (streamRecoveryEnabled || throughputWatchdog.enabled) {
+                if (!opusRecovery && (streamRecoveryEnabled || throughputWatchdog.enabled)) {
                   // Run the SAME upstream (same account/creds) with a given body and return
                   // its 2xx stream, or null. Used both by the early-retry re-open (same body)
                   // and the mid-stream continuation (assistant-prefilled body).
@@ -3490,6 +3508,7 @@ export async function handleChatCore({
           return rawResult;
         }
 
+        if (opusRecovery && isOpusRecoveryRejected(rawResult.response)) return rawResult;
         // Non-stream: release semaphore immediately after reading full response body.
         const status = rawResult.response.status;
 
@@ -3656,6 +3675,16 @@ export async function handleChatCore({
     const result = await executeProviderRequest(effectiveModel, true);
 
     providerResponse = result.response;
+    if (opusRecovery && isOpusRecoveryRejected(providerResponse)) {
+      trackPendingRequest(model, provider, connectionId, false);
+      return {
+        ...createErrorResult(
+          providerResponse.status,
+          "Opus cooldown recovery is no longer eligible"
+        ),
+        response: providerResponse,
+      };
+    }
     providerUrl = result.url;
     providerHeaders = result.headers;
     finalBody = providerRequestCapture.body(result.transformedBody);
@@ -3838,6 +3867,7 @@ export async function handleChatCore({
   // the normal providerFailure classification (record-only in probe mode).
   if (
     !terminalClaudeFallback &&
+    !opusRecovery &&
     (providerResponse.status === HTTP_STATUS.UNAUTHORIZED ||
       providerResponse.status === HTTP_STATUS.FORBIDDEN) &&
     !hadStreamOptions && // Skip refresh if failure may be from stream_options removal, not auth
@@ -4058,18 +4088,20 @@ export async function handleChatCore({
       );
     }
 
-    const signatureRecovery = await recoverAnthropicThinkingSignature({
-      provider,
-      statusCode,
-      message,
-      body: translatedBody,
-      execute: async (recoveryBody) => {
-        translatedBody = recoveryBody as typeof translatedBody;
-        return executeProviderRequest(currentModel, false);
-      },
-      parseError: (response) => parseUpstreamError(response, provider),
-    });
-    if (signatureRecovery.attempted && signatureRecovery.execution) {
+    const signatureRecovery =
+      !opusRecovery &&
+      (await recoverAnthropicThinkingSignature({
+        provider,
+        statusCode,
+        message,
+        body: translatedBody,
+        execute: async (recoveryBody) => {
+          translatedBody = recoveryBody as typeof translatedBody;
+          return executeProviderRequest(currentModel, false);
+        },
+        parseError: (response) => parseUpstreamError(response, provider),
+      }));
+    if (signatureRecovery && signatureRecovery.attempted && signatureRecovery.execution) {
       providerResponse = signatureRecovery.execution.response;
       if (signatureRecovery.succeeded) {
         providerUrl = signatureRecovery.execution.url;
@@ -4138,7 +4170,7 @@ export async function handleChatCore({
       );
     }
     const errorConnectionId = getCurrentConnectionId();
-    if (errorConnectionId && errorType) {
+    if (errorConnectionId && errorType && !(opusRecovery && [401, 403].includes(statusCode))) {
       try {
         if (errorType === PROVIDER_ERROR_TYPES.FORBIDDEN) {
           {
@@ -4539,7 +4571,7 @@ export async function handleChatCore({
           { passthrough: sourceFormat === FORMATS.CLAUDE }
         );
       }
-    } else if (isContextOverflowError(statusCode, message)) {
+    } else if (!opusRecovery && isContextOverflowError(statusCode, message)) {
       const familyCandidates = getModelFamily(currentModel, provider).filter(
         (m) => m !== currentModel && !triedModels.has(m)
       );
@@ -4658,7 +4690,17 @@ export async function handleChatCore({
         provider === "claude" &&
         !/proxy[_ ]unreachable/i.test(`${upstreamErrorCode ?? ""} ${errMsg}`)
       ) {
-        markClaudeUpstreamAccountFailure(upstreamFailure.response);
+        markClaudeUpstreamAccountFailure(
+          upstreamFailure.response,
+          statusCode === 429
+            ? getClaude429RetryAt(
+                providerResponse.headers,
+                message,
+                upstreamErrorBody,
+                retryAfterMs
+              )
+            : null
+        );
       }
       return upstreamFailure;
     }
@@ -4809,7 +4851,9 @@ export async function handleChatCore({
       persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "empty_content");
 
       // Trigger non-recursive fallback for empty content
-      const nextModel = getNextFamilyFallback(currentModel, triedModels, provider);
+      const nextModel = opusRecovery
+        ? null
+        : getNextFamilyFallback(currentModel, triedModels, provider);
       if (nextModel) {
         triedModels.add(nextModel);
         currentModel = nextModel;
