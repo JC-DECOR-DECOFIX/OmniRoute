@@ -22,7 +22,7 @@ import {
   createUsageServer,
   debugLogsRequests,
   exchange,
-  gatewayUsageCall,
+  gatewaySyncCall,
   loadConfig,
   readFailure,
   readPrivateFile,
@@ -31,6 +31,7 @@ import {
   REFRESH_REQUEST_KEY,
   REFRESH_REQUEST_SCHEMA,
   sqliteReader,
+  syncErrorKind,
   USAGE_PATH,
 } from "../../scripts/ops/omniroute-observability/server.mjs";
 
@@ -856,11 +857,15 @@ const GATEWAY_TOKEN = "oma_FAKEGATEWAYTOKEN0123456789abcdef";
 const version = (n) => `019a${String(n).padStart(4, "0")}-0000-7000-8000-000000000000`;
 
 /**
- * A refresher over a fake gateway and a report whose quota times move when a call succeeds.
- * `results` maps a connection id to what its gateway call returns; the default succeeds.
+ * A refresher over a fake gateway sync and a report whose quota times move when the sync reads
+ * an account. `result` is what the sync call returns (default: it ran without errors);
+ * `updated` lists the accounts it reads again (default: all, when it ran); `states` sets an
+ * account's state in the report.
  */
 function refreshHarness({
-  results = {},
+  result = { kind: "ok", errors: {} },
+  updated = null,
+  states = {},
   token = GATEWAY_TOKEN,
   connections = [A, B, C],
   failPublish = () => false,
@@ -881,6 +886,7 @@ function refreshHarness({
         generatedAt: new Date(now).toISOString(),
         accounts: connections.map((id) => ({
           connectionId: id,
+          state: states[id] ?? "active",
           quota: { fetchedAt: new Date(fetchedAt.get(id)).toISOString() },
         })),
       };
@@ -896,18 +902,18 @@ function refreshHarness({
       if (token === null) throw new Error("ENOENT: /private/omniroute-access-token");
       return token;
     },
-    callGateway: async ({ token: sent, connectionId, timeoutMs }) => {
-      calls.push({ token: sent, connectionId, timeoutMs, at: clock });
+    callGateway: async ({ token: sent, connections: asked, timeoutMs }) => {
+      calls.push({ token: sent, connections: asked, timeoutMs, at: clock });
       if (gate) await gate.promise;
-      const result = results[connectionId] ?? { kind: "ok", stale: false };
+      // The sync stamps each reading as it takes it, before the call returns.
       clock += result.delayMs ?? 500;
-      if (result.kind === "ok" && !result.stale && !result.noWrite)
-        fetchedAt.set(connectionId, clock);
+      for (const id of updated ?? (result.kind === "ok" ? connections : [])) {
+        fetchedAt.set(id, clock - 100);
+      }
       return result;
     },
     minIntervalMs: 120_000,
-    spacingMs: 1_500,
-    timeoutMs: 30_000,
+    timeoutMs: 60_000,
     onChange: async () => {
       const payload = structuredClone(observer.payload());
       if (failPublish(payload)) throw new Error("happy kv write returned HTTP 503");
@@ -915,9 +921,6 @@ function refreshHarness({
     },
     log: (message) => logs.push(message),
     now: () => clock,
-    sleep: async (ms) => {
-      clock += ms;
-    },
   });
   const entry = (n, ageMs = 0, value = { schema: REFRESH_REQUEST_SCHEMA }) => ({
     key: REFRESH_REQUEST_KEY,
@@ -951,7 +954,7 @@ function refreshHarness({
   };
 }
 
-test("a refresh publishes running, then done, calling each account in turn", async () => {
+test("a refresh publishes running, then done, after one sync call", async () => {
   const h = refreshHarness();
   h.refresher.offer(null);
   const start = h.now();
@@ -972,13 +975,10 @@ test("a refresh publishes running, then done, calling each account in turn", asy
     { shortId: "bbbbbbbb", updated: true, reason: null },
     { shortId: "cccccccc", updated: true, reason: null },
   ]);
-  assert.deepEqual(
-    h.calls.map((c) => c.connectionId),
-    [A, B, C]
-  );
-  // One call at a time, spaced, each with its own timeout and the token from the file.
-  assert.equal(h.calls[1].at - h.calls[0].at, 2_000);
-  assert.ok(h.calls.every((c) => c.token === GATEWAY_TOKEN && c.timeoutMs === 30_000));
+  // One sync for all accounts, with the token from the file and the configured timeout.
+  assert.deepEqual(h.calls, [
+    { token: GATEWAY_TOKEN, connections: [A, B, C], timeoutMs: 60_000, at: start },
+  ]);
   assert.deepEqual(h.logs, ["refresh requested", "refresh done 3/3"]);
 });
 
@@ -992,7 +992,7 @@ test("a request inside the minimum interval is throttled without calling the gat
   h.advance(30_000);
   h.refresher.offer(h.entry(2));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
   assert.equal(h.reads(), readsBefore + 1, "the database is read again");
   const last = h.published.at(-1).refresh;
   assert.equal(last.nextAllowedAt, nextAllowedAt);
@@ -1010,16 +1010,23 @@ test("a request inside the minimum interval is throttled without calling the gat
   h.advance(120_000);
   h.refresher.offer(h.entry(3));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 6);
+  assert.equal(h.calls.length, 2);
   assert.equal(h.published.at(-1).refresh.last.status, "done");
 });
 
-test("a refresh that updates some accounts is partial and says why for the others", async () => {
+test("a sync that updates some accounts is partial and says why for the others", async () => {
+  const D = "eeeeeeee-0000-4000-8000-000000000005";
+  const E = "ffffffff-0000-4000-8000-000000000006";
+  const G = "99999999-0000-4000-8000-000000000007";
+  const H = "88888888-0000-4000-8000-000000000008";
   const h = refreshHarness({
-    results: {
-      [A]: { kind: "http", status: 409 },
-      [B]: { kind: "ok", stale: true },
+    connections: [A, B, C, D, E, G, H],
+    result: {
+      kind: "ok",
+      errors: { [A]: "lease", [B]: "auth", [D]: "network", [E]: "other" },
     },
+    updated: [C],
+    states: { [G]: "inactive" },
   });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
@@ -1027,23 +1034,43 @@ test("a refresh that updates some accounts is partial and says why for the other
   const { last } = h.published.at(-1).refresh;
   assert.equal(last.status, "partial");
   assert.equal(last.error, null);
-  assert.deepEqual(last.accounts, [
-    { shortId: "aaaaaaaa", updated: false, reason: "em uso exclusivo" },
-    {
-      shortId: "bbbbbbbb",
-      updated: false,
-      reason: "a Anthropic não devolveu a cota (provável limite de consultas)",
-    },
-    { shortId: "cccccccc", updated: true, reason: null },
-  ]);
-  assert.equal(h.logs.at(-1), "refresh partial 1/3");
+  const probable = "a Anthropic não devolveu a cota (provável limite de consultas)";
+  assert.deepEqual(
+    last.accounts.map((a) => [a.shortId, a.updated, a.reason]),
+    [
+      ["aaaaaaaa", false, "em uso exclusivo"],
+      ["bbbbbbbb", false, "credencial da conta recusada"],
+      ["cccccccc", true, null],
+      ["eeeeeeee", false, "Anthropic inacessível"],
+      ["ffffffff", false, probable],
+      ["99999999", false, "não incluída no sync do Omni Route"],
+      // Read without an error but with no new reading: Anthropic answered without quotas.
+      ["88888888", false, probable],
+    ]
+  );
+  assert.equal(h.logs.at(-1), "refresh partial 1/7");
 });
 
-test("a refresh rejected by the gateway for every account fails with the common cause", async () => {
-  const unauthorized = { kind: "http", status: 401 };
-  const h = refreshHarness({
-    results: { [A]: unauthorized, [B]: unauthorized, [C]: unauthorized },
+test("an account missing from the report was not in the sync", async () => {
+  const h = refreshHarness({ updated: [A, B] });
+  // The report lists only A and B; C has no connection row any more.
+  const read = h.observer.payload;
+  h.observer.payload = () => {
+    const p = read();
+    return { ...p, accounts: p.accounts.filter((a) => a.connectionId !== C) };
+  };
+  h.refresher.offer(null);
+  h.refresher.offer(h.entry(1));
+  await h.refresher.idle();
+  assert.deepEqual(h.refresher.state().last.accounts[2], {
+    shortId: "cccccccc",
+    updated: false,
+    reason: "não incluída no sync do Omni Route",
   });
+});
+
+test("a sync rejected by the gateway fails with its cause", async () => {
+  const h = refreshHarness({ result: { kind: "http", status: 401 } });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
   await h.refresher.idle();
@@ -1055,36 +1082,33 @@ test("a refresh rejected by the gateway for every account fails with the common 
   assert.equal(h.logs.at(-1), "refresh failed: gateway_auth_failed");
 });
 
-test("other common causes are reported by kind", async () => {
+test("other failures of the sync call are reported by kind", async () => {
   const cases = [
     [{ kind: "network" }, "gateway_unreachable", "Omni Route inacessível"],
     [{ kind: "timeout" }, "gateway_timeout", "tempo esgotado"],
+    [{ kind: "http", status: 403 }, "gateway_auth_failed", "credencial do painel recusada"],
     [{ kind: "http", status: 502 }, "gateway_http_502", "Omni Route respondeu HTTP 502"],
   ];
   for (const [result, error, reason] of cases) {
-    const h = refreshHarness({ results: { [A]: result, [B]: result, [C]: result } });
+    const h = refreshHarness({ result });
     h.refresher.offer(null);
     h.refresher.offer(h.entry(1));
     await h.refresher.idle();
     const { last } = h.published.at(-1).refresh;
+    assert.equal(last.status, "failed");
     assert.equal(last.error, error);
-    assert.equal(last.accounts[0].reason, reason);
+    assert.ok(last.accounts.every((a) => a.reason === reason));
+    assert.equal(h.logs.at(-1), `refresh failed: ${error}`);
   }
-  // Different causes have no common one; a call accepted without a new reading says so.
-  const mixed = refreshHarness({
-    results: {
-      [A]: { kind: "network" },
-      [B]: { kind: "http", status: 409 },
-      [C]: { kind: "ok", stale: false, noWrite: true },
-    },
-  });
-  mixed.refresher.offer(null);
-  mixed.refresher.offer(mixed.entry(1));
-  await mixed.refresher.idle();
-  const { last } = mixed.published.at(-1).refresh;
+  // A sync that ran but read nothing again has no single cause.
+  const none = refreshHarness({ updated: [] });
+  none.refresher.offer(null);
+  none.refresher.offer(none.entry(1));
+  await none.refresher.idle();
+  const { last } = none.published.at(-1).refresh;
   assert.equal(last.status, "failed");
   assert.equal(last.error, null);
-  assert.equal(last.accounts[2].reason, "leitura nova não encontrada no banco");
+  assert.equal(none.logs.at(-1), "refresh failed: no account updated");
 });
 
 test("without the gateway token file a request fails as not configured and calls nothing", async () => {
@@ -1113,7 +1137,7 @@ test("at start an old request is marked seen without being served", async () => 
   h.refresher.offer(h.entry(1, 91_000));
   h.refresher.offer(h.entry(2));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
   assert.equal(h.refresher.state().last.requestVersion, version(2));
 });
 
@@ -1123,7 +1147,7 @@ test("at start a recent request is served once", async () => {
   await h.refresher.idle();
   h.refresher.offer(h.entry(1, 10_000));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
   assert.deepEqual(h.statuses(), ["running", "done"]);
 });
 
@@ -1138,7 +1162,7 @@ test("a request that arrives during a refresh is answered when it ends", async (
   h.refresher.offer(h.entry(3));
   release();
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3, "one refresh at a time");
+  assert.equal(h.calls.length, 1, "one refresh at a time");
   assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
   assert.equal(h.refresher.state().last.requestVersion, version(3));
 });
@@ -1236,9 +1260,20 @@ test("refresh configuration is validated", (t) => {
     tokenFile: refresh.tokenFile,
     minIntervalMs: 120_000,
     requestPollMs: 2_000,
-    timeoutMs: 30_000,
-    spacingMs: 1_500,
+    timeoutMs: 60_000,
   });
+  // The sync spaces its own reads; a spacing left from the per-account version is ignored.
+  assert.equal(
+    Object.hasOwn(
+      refreshSettings(config({ ...base, refresh: { ...refresh, spacingMs: 1 } })),
+      "spacingMs"
+    ),
+    false
+  );
+  assert.equal(
+    refreshSettings(config({ ...base, refresh: { ...refresh, timeoutMs: 120_000 } })).timeoutMs,
+    120_000
+  );
   for (const baseUrl of ["http://localhost:20128", "https://[::1]:20128/"]) {
     assert.equal(config({ ...base, refresh: { ...refresh, baseUrl } }).refresh.baseUrl, baseUrl);
   }
@@ -1259,14 +1294,12 @@ test("refresh configuration is validated", (t) => {
     [{ requestPollMs: 499 }, /requestPollMs/],
     [{ requestPollMs: 10_001 }, /requestPollMs/],
     [{ timeoutMs: 4_999 }, /timeoutMs/],
-    [{ timeoutMs: 60_001 }, /timeoutMs/],
-    [{ spacingMs: -1 }, /spacingMs/],
+    [{ timeoutMs: 120_001 }, /timeoutMs/],
     [{ tokenFile: "token" }, /tokenFile/],
     // An explicit null is not the default: it would remove the interval or the poll delay.
     [{ minIntervalMs: null }, /minIntervalMs/],
     [{ requestPollMs: null }, /requestPollMs/],
     [{ timeoutMs: null }, /timeoutMs/],
-    [{ spacingMs: null }, /spacingMs/],
     [{ baseUrl: null }, /baseUrl/],
     [{ baseUrl: 20128 }, /baseUrl/],
     [{ minIntervalMs: 120_000.5 }, /minIntervalMs/],
@@ -1294,8 +1327,18 @@ test("without refresh configured the report carries refresh: null", () => {
 async function fakeGateway(t, respond) {
   const seen = [];
   const server = http.createServer((req, res) => {
-    seen.push({ url: req.url, authorization: req.headers.authorization });
-    respond(req, res);
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      seen.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        contentType: req.headers["content-type"],
+        body,
+      });
+      respond(req, res);
+    });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => {
@@ -1305,65 +1348,103 @@ async function fakeGateway(t, respond) {
   return { baseUrl: `http://127.0.0.1:${server.address().port}`, seen };
 }
 
-test("the gateway call keeps only the status and the stale marker", async (t) => {
+test("the sync call keeps only the status and the kind of error of the given accounts", async (t) => {
   const secretBody = `upstream 429 rate limited ${SECRET} Bearer ${GATEWAY_TOKEN}`;
-  const { baseUrl, seen } = await fakeGateway(t, (req, res) => {
+  let mode = "ok";
+  const { baseUrl, seen } = await fakeGateway(t, (_req, res) => {
     const json = (status, body) => {
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    if (req.url.endsWith("/ok")) {
+    // What the route answers: the sync's counts and errors, then every provider's cache.
+    if (mode === "ok") {
       return json(200, {
-        plan: "Claude Max 20x",
-        quotas: { "weekly (7d)": { used: 41, resetAt: "2026-11-23T06:00:00.000Z" } },
+        total: 7,
+        succeeded: 5,
+        failed: 2,
+        errors: {
+          [A]: "Failed to refresh credentials. Please re-authorize the connection.",
+          [X]: `codex ${secretBody}`,
+        },
+        caches: {
+          [B]: { fetchedAt: "2026-11-19T19:00:00.000Z", plan: "max", accessToken: SECRET },
+          codex: { message: secretBody },
+        },
+        intervalMinutes: 70,
+        lastAutoSyncAt: "2026-11-19T18:00:00.000Z",
       });
     }
-    // What the installed build answers after a 429 from /api/oauth/usage: the legacy fallback's
-    // message becomes the stale reason, and the previous quotas are served.
-    if (req.url.endsWith("/limited")) {
-      return json(200, {
-        message: null,
-        quotas: { "weekly (7d)": { used: 40 } },
-        _stale: true,
-        _staleSince: "2026-11-19T18:00:00.000Z",
-        _staleReason: "Claude connected. Usage API requires admin permissions.",
-      });
+    if (mode === "noerrors") return json(200, { total: 1, caches: {} });
+    if (mode === "notjson") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      return res.end(secretBody);
     }
-    if (req.url.endsWith("/busy")) return json(409, { error: secretBody });
-    if (req.url.endsWith("/denied")) return json(401, { error: secretBody });
-    if (req.url.endsWith("/huge")) return json(200, { pad: "x".repeat(1_200_000) });
-    if (req.url.endsWith("/cut")) {
+    if (mode === "denied") return json(401, { error: secretBody });
+    if (mode === "scope") return json(403, { error: secretBody });
+    if (mode === "broken") return json(500, { error: "Failed to refresh provider limits" });
+    if (mode === "huge") {
+      return json(200, { errors: { [A]: "fetch failed" }, pad: "x".repeat(1_200_000) });
+    }
+    if (mode === "cut") {
       res.writeHead(200, { "content-type": "application/json", "content-length": "100" });
-      res.write('{"quotas":');
+      res.write('{"errors":');
       setTimeout(() => res.socket.destroy(), 20);
       return;
     }
-    if (req.url.endsWith("/trickle")) {
+    if (mode === "trickle") {
       // Headers and a byte every 50 ms, forever: no inactivity timeout would fire.
       res.writeHead(200, { "content-type": "application/json" });
       const timer = setInterval(() => res.write(" "), 50);
       res.on("close", () => clearInterval(timer));
       return;
     }
-    // "/slow" never answers.
+    // "slow" never answers.
   });
-  const call = (connectionId, timeoutMs = 5_000) =>
-    gatewayUsageCall({ baseUrl, token: GATEWAY_TOKEN, connectionId, timeoutMs });
-  assert.deepEqual(await call("ok"), { kind: "ok", stale: false });
-  assert.deepEqual(await call("limited"), { kind: "ok", stale: true });
-  assert.deepEqual(await call("busy"), { kind: "http", status: 409 });
+  const call = (next, timeoutMs = 5_000) => {
+    mode = next;
+    return gatewaySyncCall({ baseUrl, token: GATEWAY_TOKEN, connections: [A, B, C], timeoutMs });
+  };
+  // Only the authorized accounts' errors are kept, as a kind; nothing else of the body.
+  const ok = await call("ok");
+  assert.deepEqual(ok, { kind: "ok", errors: { [A]: "auth" } });
+  assert.equal(JSON.stringify(ok).includes("sk-ant"), false);
+  assert.deepEqual(await call("noerrors"), { kind: "ok", errors: {} });
+  assert.deepEqual(await call("notjson"), { kind: "ok", errors: {} });
   assert.deepEqual(await call("denied"), { kind: "http", status: 401 });
+  assert.deepEqual(await call("scope"), { kind: "http", status: 403 });
+  assert.deepEqual(await call("broken"), { kind: "http", status: 500 });
   assert.deepEqual(await call("huge"), { kind: "network" });
   assert.deepEqual(await call("cut"), { kind: "network" });
   assert.deepEqual(await call("slow", 200), { kind: "timeout" });
   const started = Date.now();
   assert.deepEqual(await call("trickle", 300), { kind: "timeout" });
   assert.ok(Date.now() - started < 2_000, "the deadline covers the whole exchange");
-  assert.equal(seen[0].url, "/api/usage/ok");
-  assert.equal(seen[0].authorization, `Bearer ${GATEWAY_TOKEN}`);
-  // A connection id cannot leave the usage path.
-  await call("../../api/providers");
-  assert.equal(seen.at(-1).url, "/api/usage/..%2F..%2Fapi%2Fproviders");
+  // One POST to the sync route, with an empty JSON body and the access token.
+  assert.deepEqual(seen[0], {
+    method: "POST",
+    url: "/api/usage/provider-limits",
+    authorization: `Bearer ${GATEWAY_TOKEN}`,
+    contentType: "application/json",
+    body: "",
+  });
+  assert.ok(seen.every((r) => r.method === "POST" && r.url === "/api/usage/provider-limits"));
+});
+
+test("errors recorded by the sync are classified by their fixed texts", () => {
+  const cases = [
+    ["Usage refresh deferred while an exclusive lease is active", "lease"],
+    ["Failed to refresh credentials. Please re-authorize the connection.", "auth"],
+    ["Token expired, please re-authenticate", "auth"],
+    ["HTTP 403 Forbidden", "auth"],
+    ["fetch failed", "network"],
+    ["connect ECONNREFUSED 127.0.0.1:8080", "network"],
+    ["Provider-limits proxy request failed", "network"],
+    ["Usage not available for this connection", "other"],
+    ["Failed to refresh provider limits", "other"],
+    [null, "other"],
+    [{ message: "fetch failed" }, "other"],
+  ];
+  for (const [message, kind] of cases) assert.equal(syncErrorKind(message), kind, message);
 });
 
 test("an unreachable gateway is a network failure", async () => {
@@ -1371,10 +1452,10 @@ test("an unreachable gateway is a network failure", async () => {
   await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
   const { port } = blocker.address();
   await new Promise((resolve) => blocker.close(resolve));
-  const result = await gatewayUsageCall({
+  const result = await gatewaySyncCall({
     baseUrl: `http://127.0.0.1:${port}`,
     token: GATEWAY_TOKEN,
-    connectionId: A,
+    connections: [A],
     timeoutMs: 5_000,
   });
   assert.deepEqual(result, { kind: "network" });
@@ -1519,17 +1600,107 @@ test("the service reads refresh requests through the daemon and answers them", a
 });
 
 test("no gateway token appears in a published refresh or its log", async () => {
-  const h = refreshHarness({
-    results: {
-      [A]: { kind: "http", status: 401 },
-      [B]: { kind: "ok", stale: true },
-    },
+  for (const result of [
+    { kind: "http", status: 401 },
+    { kind: "ok", errors: { [A]: "auth", [B]: "other" } },
+  ]) {
+    const h = refreshHarness({ result, updated: [C] });
+    h.refresher.offer(null);
+    h.refresher.offer(h.entry(1));
+    await h.refresher.idle();
+    const everything = JSON.stringify([h.published, h.logs]);
+    for (const needle of [GATEWAY_TOKEN, "oma_", "Bearer ", "sk-ant"]) {
+      assert.equal(everything.includes(needle), false, needle);
+    }
+  }
+});
+
+test("the service runs one sync per request and publishes nothing of its answer", async (t) => {
+  const { dir, write } = privateDir(t);
+  // The gateway's database, as the sync leaves it: A and C read again, B kept its old reading.
+  const dbPath = join(dir, "storage.sqlite");
+  const seed = fixture();
+  seed.exec(`VACUUM INTO '${dbPath}'`);
+  seed.close();
+  const secretBody = `Bearer ${GATEWAY_TOKEN} ${SECRET}`;
+  const gateway = await fakeGateway(t, (_req, res) => {
+    const db = new DatabaseSync(dbPath);
+    const fresh = new Date().toISOString();
+    for (const id of [A, C]) {
+      db.prepare(
+        `UPDATE key_value SET value = json_set(value, '$.fetchedAt', ?)
+         WHERE namespace = 'providerLimitsCache' AND key = ?`
+      ).run(fresh, id);
+    }
+    db.close();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        total: 7,
+        succeeded: 6,
+        failed: 1,
+        errors: { [B]: "Failed to refresh credentials. Please re-authorize the connection." },
+        caches: { [B]: { message: secretBody }, codex: { note: secretBody } },
+      })
+    );
   });
-  h.refresher.offer(null);
-  h.refresher.offer(h.entry(1));
-  await h.refresher.idle();
-  const everything = JSON.stringify([h.published, h.logs]);
-  for (const needle of [GATEWAY_TOKEN, "oma_", "Bearer ", "sk-ant"]) {
+  const entry = {
+    key: REFRESH_REQUEST_KEY,
+    value: { schema: REFRESH_REQUEST_SCHEMA },
+    deleted: false,
+    version: version(11),
+    updatedAt: Date.now(),
+  };
+  const daemon = await fakeDaemon(t, dir, () => entry);
+  const configPath = write(
+    "config.json",
+    JSON.stringify({
+      dbPath,
+      tokenFile: write("token", "local-token"),
+      authorizedConnections: [A, B, C],
+      listen: { port: await freePort() },
+      happy: {
+        socketPath: daemon.socketPath,
+        tokenFile: write("happy", "daemon-token"),
+        artifactId: "art1",
+      },
+      refresh: {
+        baseUrl: gateway.baseUrl,
+        tokenFile: write("omniroute-access-token", GATEWAY_TOKEN),
+        requestPollMs: 500,
+      },
+    })
+  );
+  const service = startService(t, configPath);
+  const answered = () =>
+    daemon.requests.find(
+      (r) =>
+        r.method === "PUT" &&
+        ["done", "partial", "failed"].includes(r.body.value.refresh?.last?.status)
+    );
+  await waitFor(answered);
+  // The same request read again on later polls is not served again.
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(gateway.seen.length, 1);
+  assert.equal(gateway.seen[0].method, "POST");
+  assert.equal(gateway.seen[0].url, "/api/usage/provider-limits");
+  const { last } = answered().body.value.refresh;
+  assert.equal(last.status, "partial");
+  assert.deepEqual(
+    last.accounts.map((a) => [a.shortId, a.updated, a.reason]),
+    [
+      ["aaaaaaaa", true, null],
+      ["bbbbbbbb", false, "credencial da conta recusada"],
+      ["cccccccc", true, null],
+    ]
+  );
+  await waitFor(() => service.stdout().includes("refresh partial 2/3"));
+  // What was published (the daemon's own credential is in the request headers, not the body).
+  const everything =
+    JSON.stringify(daemon.requests.filter((r) => r.method === "PUT").map((r) => r.body)) +
+    service.stdout() +
+    service.stderr();
+  for (const needle of [GATEWAY_TOKEN, "oma_", "Bearer ", "sk-ant", "re-authorize", "codex"]) {
     assert.equal(everything.includes(needle), false, needle);
   }
 });
@@ -1558,7 +1729,7 @@ test("the gateway is not called when the running state cannot be published", asy
   h.refresher.offer(h.entry(2));
   await h.refresher.idle();
   assert.deepEqual(h.statuses(), ["failed", "running", "done"]);
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
 });
 
 test("a request seen during a refresh is throttled even when the interval ends meanwhile", async () => {
@@ -1572,14 +1743,14 @@ test("a request seen during a refresh is throttled even when the interval ends m
   h.advance(200_000);
   release();
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3, "the gateway is read once");
+  assert.equal(h.calls.length, 1, "the gateway is read once");
   assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
   assert.equal(h.refresher.state().last.requestVersion, version(2));
   // A request made after that refresh ended is a new refresh.
   h.advance(1_000);
   h.refresher.offer(h.entry(3));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 6);
+  assert.equal(h.calls.length, 2);
 });
 
 test("an exchange fails on a rejected, interrupted or endless response", async (t) => {
@@ -1676,13 +1847,13 @@ test("a request made during a refresh but first seen after it is throttled", asy
   await h.refresher.idle();
   h.refresher.offer(h.entry(2, 1_000));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
   assert.deepEqual(h.statuses(), ["running", "done", "throttled"]);
   // A request written after the refresh ended, with the interval over, reads the vendor again.
   h.advance(1_000);
   h.refresher.offer(h.entry(3));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 6);
+  assert.equal(h.calls.length, 2);
 });
 
 test("periodic publishes join the one already waiting", async () => {
@@ -1744,14 +1915,14 @@ test("a proxy configured for the process never receives a call or its credential
   const serverUrl = new URL("server.mjs", SERVICE_DIR).href;
   const script = `
     import http from "node:http";
-    const { gatewayUsageCall } = await import(${JSON.stringify(serverUrl)});
+    const { gatewaySyncCall } = await import(${JSON.stringify(serverUrl)});
     const via = await new Promise((resolve) => {
       http.get(${JSON.stringify(`${baseUrl}/global`)}, (res) => { res.resume(); resolve(res.statusCode); })
         .on("error", () => resolve("error"));
     });
-    const direct = await gatewayUsageCall({
+    const direct = await gatewaySyncCall({
       baseUrl: ${JSON.stringify(baseUrl)}, token: ${JSON.stringify(GATEWAY_TOKEN)},
-      connectionId: "a", timeoutMs: 5000,
+      connections: ["a"], timeoutMs: 5000,
     });
     process.stdout.write(JSON.stringify({ via, direct }));`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
@@ -1773,10 +1944,10 @@ test("a proxy configured for the process never receives a call or its credential
   const { via, direct } = JSON.parse(stdout);
   // The global agent does go through the proxy, so the check below means something.
   assert.equal(via, 502);
-  assert.deepEqual(direct, { kind: "ok", stale: false });
+  assert.deepEqual(direct, { kind: "ok", errors: {} });
   assert.deepEqual(
     seen.map((r) => r.url),
-    ["/api/usage/a"]
+    ["/api/usage/provider-limits"]
   );
   assert.equal(
     proxied.some((r) => r.authorization?.includes(GATEWAY_TOKEN)),
@@ -1790,32 +1961,23 @@ test("a proxy configured for the process never receives a call or its credential
 
 // Regressions from the third independent review of PR #12.
 
-test("a timed-out account ends the round without reading the others", async () => {
-  const h = refreshHarness({ results: { [A]: { kind: "timeout" } } });
+test("a timed-out sync reports the accounts it had already read", async () => {
+  const h = refreshHarness({ result: { kind: "timeout" } });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
   await h.refresher.idle();
-  assert.deepEqual(
-    h.calls.map((c) => c.connectionId),
-    [A]
-  );
   const { last } = h.refresher.state();
   assert.equal(last.status, "failed");
   assert.equal(last.error, "gateway_timeout");
-  assert.deepEqual(
-    last.accounts.map((a) => a.reason),
-    [
-      "tempo esgotado",
-      "não consultada: rodada interrompida por tempo esgotado",
-      "não consultada: rodada interrompida por tempo esgotado",
-    ]
-  );
-  const later = refreshHarness({ results: { [B]: { kind: "timeout" } } });
+  assert.ok(last.accounts.every((a) => a.reason === "tempo esgotado"));
+  // Readings the sync stored before the deadline count; the error is then not the round's.
+  const later = refreshHarness({ result: { kind: "timeout" }, updated: [A] });
   later.refresher.offer(null);
   later.refresher.offer(later.entry(1));
   await later.refresher.idle();
-  assert.equal(later.calls.length, 2);
+  assert.equal(later.calls.length, 1);
   assert.equal(later.refresher.state().last.status, "partial");
+  assert.equal(later.refresher.state().last.error, null);
 });
 
 test("after a restart a request already answered is not answered again", async () => {
@@ -1882,7 +2044,7 @@ test("restored state that is not well formed is not trusted", async () => {
   assert.equal(h.refresher.state().last, null);
   h.refresher.offer(h.entry(2));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
   // An interval pushed far ahead is dropped; foreign fields and text are cleaned.
   const odd = restored({
     nextAllowedAt: "2999-01-01T00:00:00.000Z",
@@ -1997,14 +2159,12 @@ test("after a restore the first request read still has to be recent", async () =
   assert.equal(h.refresher.state().last.requestVersion, version(1));
   h.refresher.offer(h.entry(3));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
 });
 
 test("a late timeout restarts the interval at the timeout", async () => {
-  const slow = { kind: "ok", stale: false, delayMs: 29_000 };
-  const h = refreshHarness({
-    results: { [A]: slow, [B]: slow, [C]: { kind: "timeout", delayMs: 30_000 } },
-  });
+  // The sync read A and B before the 60 s deadline and was still going when it passed.
+  const h = refreshHarness({ result: { kind: "timeout", delayMs: 60_000 }, updated: [A, B] });
   h.refresher.offer(null);
   h.refresher.offer(h.entry(1));
   await h.refresher.idle();
@@ -2014,7 +2174,7 @@ test("a late timeout restarts the interval at the timeout", async () => {
   h.advance(100_000);
   h.refresher.offer(h.entry(2));
   await h.refresher.idle();
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 1);
   assert.equal(h.refresher.state().last.status, "throttled");
 });
 
@@ -2111,12 +2271,11 @@ test("the service publishes nothing and answers nothing until its last state is 
 // Regression from the fifth independent review of PR #12.
 
 test("a restart after a late timeout whose result was not written keeps a whole interval", async () => {
-  // The round started 90 s ago and timed out just now; its result never reached the store, so
-  // the published state is still "running" with the interval counted from the start.
-  const slow = { kind: "ok", stale: false, delayMs: 29_000 };
+  // The sync timed out 60 s after it started; its result never reached the store, so the
+  // published state is still "running" with the interval counted from the start.
   let resultWritten = true;
   const first = refreshHarness({
-    results: { [A]: slow, [B]: slow, [C]: { kind: "timeout", delayMs: 30_000 } },
+    result: { kind: "timeout", delayMs: 60_000 },
     failPublish: (payload) => !resultWritten && payload.refresh.last?.status !== "running",
   });
   resultWritten = false;
@@ -2132,7 +2291,8 @@ test("a restart after a late timeout whose result was not written keeps a whole 
   const restartedAt = h.now();
   h.refresher.restore(structuredClone(published));
   assert.equal(h.refresher.state().nextAllowedAt, new Date(restartedAt + 120_000).toISOString());
-  h.advance(30_000);
+  // Past the interval counted from the start, inside the one counted from the restart.
+  h.advance(60_000);
   h.refresher.offer(null);
   h.refresher.offer(h.entry(2));
   await h.refresher.idle();

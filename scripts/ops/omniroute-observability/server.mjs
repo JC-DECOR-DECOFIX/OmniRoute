@@ -6,8 +6,8 @@
 // phone apps can show it through the daemon's own authenticated connection.
 //
 // With a `refresh` block it also answers the panel's "refresh" button: the panel writes a request
-// to the artifact's data store, and the service asks Omni Route to read each authorized account's
-// quota again, at most once per minimum interval.
+// to the artifact's data store, and the service asks Omni Route to run its provider-limits sync
+// now, the same one it runs on its own every 70 minutes, at most once per minimum interval.
 //
 // Usage: node server.mjs /absolute/path/to/config.json
 
@@ -24,6 +24,7 @@ export const USAGE_PATH = "/internal/omni-route/usage";
 export const KV_KEY = "omni-route/usage";
 export const REFRESH_REQUEST_KEY = "omni-route/refresh-request";
 export const REFRESH_REQUEST_SCHEMA = "omni-route-refresh-request/v1";
+export const PROVIDER_LIMITS_PATH = "/api/usage/provider-limits";
 
 const DEFAULT_POLL_MS = 15_000;
 const DEFAULT_PORT = 20141;
@@ -37,8 +38,8 @@ const REFRESH_DEFAULTS = {
   baseUrl: "http://127.0.0.1:20128",
   minIntervalMs: 120_000,
   requestPollMs: 2_000,
-  timeoutMs: 30_000,
-  spacingMs: 1_500,
+  // One call reads every supported provider of the gateway in turn, 1.5 s apart.
+  timeoutMs: 60_000,
 };
 // A request already in the store when the service starts is served only if it is this recent;
 // an older one was made while the service was down and its viewer has moved on.
@@ -153,8 +154,7 @@ function validateRefresh(config) {
   const limits = {
     minIntervalMs: [60_000, 24 * 60 * 60_000],
     requestPollMs: [500, 10_000],
-    timeoutMs: [5_000, 60_000],
-    spacingMs: [0, 10_000],
+    timeoutMs: [5_000, 120_000],
   };
   for (const [name, [min, max]] of Object.entries(limits)) {
     if (!integerIn(refresh[name], min, max)) {
@@ -170,7 +170,10 @@ export function refreshSettings(config) {
   const url = new URL(merged.baseUrl);
   // A name is resolved by the system and could point elsewhere; the loopback address cannot.
   if (url.hostname === "localhost") url.hostname = "127.0.0.1";
-  return { ...merged, baseUrl: url.origin };
+  // Only the known settings; a `spacingMs` left from the per-account version is not used, since
+  // the sync spaces its own reads.
+  const { minIntervalMs, requestPollMs, timeoutMs, tokenFile } = merged;
+  return { baseUrl: url.origin, tokenFile, minIntervalMs, requestPollMs, timeoutMs };
 }
 
 function sameSecret(provided, expected) {
@@ -469,69 +472,116 @@ async function getKvEntry({ socketPath, token, artifactId, key }) {
 }
 
 /**
- * Asks Omni Route to read one account's quota from the vendor now (GET /api/usage/:id, which
- * persists the reading). Only the status and the `_stale` marker of the answer are kept; the
- * body is not returned, logged or published.
+ * What kind of failure the sync recorded for one connection. The sync keeps only the thrown
+ * error's message, so the kind is read from the fixed texts Omni Route throws; the text itself
+ * is not kept.
  */
-export async function gatewayUsageCall({ baseUrl, token, connectionId, timeoutMs }) {
-  const url = new URL(`/api/usage/${encodeURIComponent(connectionId)}`, baseUrl);
+export function syncErrorKind(message) {
+  const text = typeof message === "string" ? message.slice(0, 2_000) : "";
+  if (/exclusive lease/i.test(text)) return "lease";
+  if (
+    /re-?authori[sz]e|re-?authenticate|credential|unauthori[sz]ed|forbidden|access denied|invalid_grant|token expired|\b40[13]\b/i.test(
+      text
+    )
+  ) {
+    return "auth";
+  }
+  if (
+    /fetch failed|network|proxy|socket|timed? ?out|\bE(?:CONN[A-Z]+|TIMEDOUT|NOTFOUND|AI_AGAIN|HOSTUNREACH|NETUNREACH|PIPE)\b|UND_ERR/i.test(
+      text
+    )
+  ) {
+    return "network";
+  }
+  return "other";
+}
+
+/**
+ * Asks Omni Route to run its provider-limits sync now (POST /api/usage/provider-limits, the
+ * dashboard's "refresh all"). The sync reads every active supported connection of the gateway,
+ * OAuth ones one at a time 1.5 s apart, and stores each reading in `providerLimitsCache`. Only
+ * the status and, for the given connections, the kind of error the sync recorded are kept; the
+ * body, which carries the cached limits of every provider, is not returned, logged or published.
+ */
+export async function gatewaySyncCall({ baseUrl, token, timeoutMs, connections = [] }) {
+  const url = new URL(PROVIDER_LIMITS_PATH, baseUrl);
   let response;
   try {
     response = await exchange({
       client: url.protocol === "https:" ? https : http,
       url,
       options: {
-        method: "GET",
-        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/json",
+          "content-type": "application/json",
+          "content-length": "0",
+        },
       },
       deadlineMs: timeoutMs,
-      label: "omni route usage",
+      label: "omni route sync",
     });
   } catch (error) {
     return { kind: error.kind === "timeout" ? "timeout" : "network" };
   }
   const { status, text } = response;
   if (status < 200 || status >= 300) return { kind: "http", status };
-  let body = null;
+  let recorded = null;
   try {
-    body = JSON.parse(text);
+    recorded = JSON.parse(text)?.errors;
   } catch {
-    // A success without a readable body still says the call was accepted.
+    // A success without a readable body still says the sync ran.
   }
-  // Omni Route marks `_stale` when Anthropic answered without quotas and the previous reading
-  // was kept. Its `_staleReason` does not say why: after a 429 the build falls back to a legacy
-  // endpoint and reports that endpoint's message instead.
-  return { kind: "ok", stale: body?._stale === true };
+  const errors = {};
+  if (recorded && typeof recorded === "object" && !Array.isArray(recorded)) {
+    for (const id of connections) {
+      if (Object.hasOwn(recorded, id)) errors[id] = syncErrorKind(recorded[id]);
+    }
+  }
+  return { kind: "ok", errors };
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+// The sync only reads active connections; an exclusive lease also keeps one out, but leases are
+// not in the tables this service reads, so such an account gets the probable-limit text.
+const NOT_IN_SYNC = "não incluída no sync do Omni Route";
+const PROBABLE_LIMIT = "a Anthropic não devolveu a cota (provável limite de consultas)";
+
 /** Why an account's quota was not read again, in words the panel shows as they are. */
-function refreshReason(result) {
-  if (!result) return "não consultada";
+function refreshReason(result, connectionId, account) {
   switch (result.kind) {
     case "ok":
-      // The installed build does not say why a stale answer came back; a 429 from Anthropic's
-      // usage endpoint, or Omni Route's 3-minute wait after one, is the usual cause.
-      if (result.stale) return "a Anthropic não devolveu a cota (provável limite de consultas)";
-      return "leitura nova não encontrada no banco";
+      switch (result.errors?.[connectionId]) {
+        case "lease":
+          return "em uso exclusivo";
+        case "auth":
+          return "credencial da conta recusada";
+        case "network":
+          return "Anthropic inacessível";
+        case "other":
+          return PROBABLE_LIMIT;
+        default:
+          // No error recorded: the sync skipped the account, or Anthropic answered without
+          // quotas and Omni Route kept the previous reading. The installed build does not say
+          // why; a 429 from Anthropic's usage endpoint is the usual cause.
+          return !account || account.state === "inactive" ? NOT_IN_SYNC : PROBABLE_LIMIT;
+      }
     case "timeout":
       return "tempo esgotado";
     case "network":
       return "Omni Route inacessível";
     case "http":
-      if (result.status === 409) return "em uso exclusivo";
-      if (result.status === 429) return "limite de consultas da Anthropic";
       if (result.status === 401 || result.status === 403) return "credencial do painel recusada";
-      if (result.status === 404) return "conta não encontrada no Omni Route";
       return `Omni Route respondeu HTTP ${result.status}`;
     default:
       return "falha desconhecida";
   }
 }
 
-function resultKind(result) {
-  if (!result) return null;
+/** The cause of a sync call that failed as a whole; null when the sync ran. */
+function callError(result) {
   if (result.kind === "http") {
     return result.status === 401 || result.status === 403
       ? "gateway_auth_failed"
@@ -540,12 +590,6 @@ function resultKind(result) {
   if (result.kind === "network") return "gateway_unreachable";
   if (result.kind === "timeout") return "gateway_timeout";
   return null;
-}
-
-/** The cause shared by every failed call, when there is one. */
-function commonError(results) {
-  const kinds = new Set(results.map(resultKind));
-  return kinds.size === 1 ? [...kinds][0] : null;
 }
 
 /**
@@ -562,12 +606,10 @@ export function createRefresher({
   readToken,
   callGateway,
   minIntervalMs = REFRESH_DEFAULTS.minIntervalMs,
-  spacingMs = REFRESH_DEFAULTS.spacingMs,
   timeoutMs = REFRESH_DEFAULTS.timeoutMs,
   onChange = async () => {},
   log = () => {},
   now = Date.now,
-  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   let primed = false;
   let lastSeen = null;
@@ -650,44 +692,29 @@ export function createRefresher({
       return false;
     }
 
-    const results = [];
-    for (const [index, connectionId] of connections.entries()) {
-      if (index > 0) await sleep(spacingMs);
-      const result = await callGateway({ token: credential, connectionId, timeoutMs });
-      results.push(result);
-      // Giving up on the answer does not stop Omni Route's own read, which may still be renewing
-      // that account's credentials. No other account is read in this round, and the interval
-      // starts again at the timeout, so the gateway keeps the whole margin even when the
-      // timeout came late in the round.
-      if (result.kind === "timeout") {
-        nextAllowedAtMs = Math.max(nextAllowedAtMs, now() + minIntervalMs);
-        break;
-      }
+    const result = await callGateway({ token: credential, connections, timeoutMs });
+    // Giving up on the answer does not stop Omni Route's sync, which goes on reading the
+    // remaining providers. The interval starts again at the timeout, so the next sync waits a
+    // whole interval after it.
+    if (result.kind === "timeout") {
+      nextAllowedAtMs = Math.max(nextAllowedAtMs, now() + minIntervalMs);
     }
     observer.poll();
     const report = observer.payload();
-    const accounts = connections.map((connectionId, index) => {
-      const quota = report.accounts?.find((a) => a.connectionId === connectionId)?.quota;
-      const fetchedAtMs = typeof quota?.fetchedAt === "string" ? Date.parse(quota.fetchedAt) : NaN;
+    const accounts = connections.map((connectionId) => {
+      const account = report.accounts?.find((a) => a.connectionId === connectionId);
+      const fetchedAt = account?.quota?.fetchedAt;
+      const fetchedAtMs = typeof fetchedAt === "string" ? Date.parse(fetchedAt) : NaN;
       const updated = Number.isFinite(fetchedAtMs) && fetchedAtMs >= startedAtMs;
       return {
         shortId: connectionId.slice(0, 8),
         updated,
-        reason: updated
-          ? null
-          : index < results.length
-            ? sanitizeReason(refreshReason(results[index]))
-            : "não consultada: rodada interrompida por tempo esgotado",
+        reason: updated ? null : sanitizeReason(refreshReason(result, connectionId, account)),
       };
     });
     const count = accounts.filter((a) => a.updated).length;
     const status = count === accounts.length ? "done" : count > 0 ? "partial" : "failed";
-    const error =
-      status !== "failed"
-        ? null
-        : results.length < connections.length
-          ? "gateway_timeout"
-          : commonError(results);
+    const error = status === "failed" ? callError(result) : null;
     lastRefreshEndMs = now();
     last = { ...last, status, finishedAt: iso(lastRefreshEndMs), accounts, error };
     log(
@@ -883,10 +910,9 @@ async function main(configPath) {
         if (debugLogsRequests()) throw new Error("NODE_DEBUG is set");
         return readSecretFile(refresh.tokenFile);
       },
-      callGateway: ({ token, connectionId, timeoutMs }) =>
-        gatewayUsageCall({ baseUrl: refresh.baseUrl, token, connectionId, timeoutMs }),
+      callGateway: ({ token, connections, timeoutMs }) =>
+        gatewaySyncCall({ baseUrl: refresh.baseUrl, token, connections, timeoutMs }),
       minIntervalMs: refresh.minIntervalMs,
-      spacingMs: refresh.spacingMs,
       timeoutMs: refresh.timeoutMs,
       onChange: flush,
       log,

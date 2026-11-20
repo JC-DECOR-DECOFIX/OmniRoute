@@ -168,8 +168,8 @@ to those apps. The block stays absent until the panel itself has been approved.
 
 ### Manual refresh (the panel's "Atualizar" button)
 
-With a `refresh` block as well, the panel can ask for a new vendor reading of every authorized
-account. The service reads the key `omni-route/refresh-request` of the same artifact through the
+With a `refresh` block as well, the panel can ask Omni Route for a new vendor reading of the
+quotas. The service reads the key `omni-route/refresh-request` of the same artifact through the
 daemon socket every `requestPollMs` (2 s). The value is
 `{ "schema": "omni-route-refresh-request/v1" }`; other fields are ignored and the value is not
 trusted. A request is identified by the entry's `version` (a UUIDv7, newer than the last one
@@ -182,68 +182,65 @@ store is answered only if it is at most 90 s old; an older one is marked seen.
   "tokenFile": "/Users/giovanni/.omniroute/observability/omniroute-access-token",
   "minIntervalMs": 120000,
   "requestPollMs": 2000,
-  "timeoutMs": 30000,
-  "spacingMs": 1500
+  "timeoutMs": 60000
 }
 ```
 
 `baseUrl` must be an `http(s)` loopback origin (`127.0.0.1`, `localhost`, `[::1]`) with no
 credentials, path or query; `tokenFile` is an absolute path; `minIntervalMs` is at least 60000,
-`requestPollMs` 500–10000, `timeoutMs` 5000–60000, `spacingMs` 0–10000; an explicit `null` is refused. The block needs the `happy`
-block and a non-empty `authorizedConnections`.
+`requestPollMs` 500–10000, `timeoutMs` 5000–120000; an explicit `null` is refused. The block
+needs the `happy` block and a non-empty `authorizedConnections`. A `spacingMs` left from the
+earlier per-account version is ignored: Omni Route spaces its own reads.
 
-To read an account again, the service calls Omni Route's own endpoint
-`GET /api/usage/{connectionId}` (`src/app/api/usage/[connectionId]/route.ts`), the one the
-dashboard's quota page uses. It runs `fetchAndPersistProviderLimits(…, "manual")`, which reads
-`/api/oauth/usage` for that account and stores the reading in `providerLimitsCache` with a new
-`fetchedAt`. The call is authenticated with an Omni Route access token (`oma_…`) of scope `read`
-(a `GET` needs only `read`, `src/server/authz/accessScopes.ts`), sent as
-`Authorization: Bearer`. The token is created by the operator in the Omni Route dashboard and kept
-in `tokenFile`, mode 0600; it is read again for every refresh and never logged or published. While
-the file is missing or not owner-only, a request is answered with `error: "not_configured"` and
-nothing is called. The machine CLI token (`x-omniroute-cli-token`) is not used: in the installed
-build (3.8.50, `09966db`) the compiled middleware cannot read the machine id, so the server
-rejects every CLI token.
+To read the quotas again, the service makes **one** call to Omni Route's own provider-limits
+sync, `POST /api/usage/provider-limits` (`src/app/api/usage/provider-limits/route.ts`), the
+dashboard's "refresh all". It runs `syncAllProviderLimits({ source: "manual" })`
+(`src/lib/usage/providerLimits.ts`), **the same sync Omni Route runs on its own every 70
+minutes**: it reads every active connection of a supported provider, not only the authorized
+Claude accounts (on 2026-11-19, seven OAuth connections: three `claude`, one each of `agy`,
+`codex`, `cursor` and `kimi-coding`), OAuth ones strictly one at a time with
+`PROVIDER_LIMITS_SYNC_SPACING_MS` (1.5 s) between them, and stores the readings in
+`providerLimitsCache` with a new `fetchedAt` when the call ends. The only difference from the
+automatic run is that `source: "manual"` reads every connection, where the automatic run skips
+those whose cached reading is still recent, and that it does not move the automatic run's
+schedule. A connection with an exclusive lease is left out, as in the automatic run.
 
-**What the gateway does on such a call.** The endpoint is Omni Route's, and what it changes is
-Omni Route's own behavior, not the observer's; the observer itself writes nothing. Before
-turning the block on, the operator must accept these effects of
-`fetchLiveProviderLimitsWithOptions` (`src/lib/usage/providerLimits.ts`) on the account read:
+The request carries an empty body, `content-type: application/json` and
+`Authorization: Bearer <token>`, where the token is an Omni Route access token (`oma_…`) of
+scope **`write`**: a `POST` needs `write` (`src/server/authz/accessScopes.ts`); a `read` token is
+answered 403. The token is created by the operator in the Omni Route dashboard and kept in
+`tokenFile`, mode 0600, owned by this user; it is read again for every refresh and never logged
+or published. While the file is missing or not owner-only, a request is answered with
+`error: "not_configured"` and nothing is called. **A `write` token is more than this service
+needs**: it is accepted by every non-admin management route of Omni Route that changes
+something, so whoever obtains it can change Omni Route's configuration short of the admin-only
+surfaces (access tokens, OAuth flows, providers, policy). It lives only in that file, and if it
+leaks it is revoked in the dashboard (Settings → access tokens), which turns the button into
+`gateway_auth_failed` until a new one is written to the file. The machine CLI token
+(`x-omniroute-cli-token`) is not used: in the installed build (3.8.50, `09966db`) the compiled
+middleware cannot read the machine id, so the server rejects every CLI token.
 
-- **It may renew the account's OAuth credentials.** The route passes `allowRotatingRefresh:
-true`, and Claude is a rotating-refresh provider (`anthropic-oauth` group,
-  `open-sse/services/refreshSerializer.ts`). When the access token is near expiry, or when the
-  usage read answers 401, Omni Route mints new tokens (serialized per group inside the gateway)
-  and stores them on the connection (`refreshAndUpdateCredentials`). The automatic 70-minute sync
-  (`syncAllProviderLimits`) never does this for Claude.
-- **It may clear a recovered account's transient error state** (`maybeClearRecoveredQuotaState`):
-  `testStatus`, error fields and an ended or quota-recovered cooldown. The automatic sync does the
-  same.
+**What the gateway does on such a call.** Exactly what its automatic sync does, sooner; the
+observer itself writes nothing. The sync does **not** pass `allowRotatingRefresh`, so it never
+renews the OAuth credentials of a rotating-refresh provider (`claude`, `codex`, `kimi-coding`,
+`open-sse/services/refreshSerializer.ts`): the Claude accounts' tokens are not touched. For the
+other providers it renews a token near expiry, as the automatic run does. As in the automatic
+run, a reading may clear a recovered account's transient error state
+(`maybeClearRecoveredQuotaState`) and update the account's Claude bootstrap and extra-usage state
+(`syncClaudeBootstrapIfNeeded`, `syncClaudeExtraUsageStateIfNeeded`; with the extra-usage block
+policy on and extra usage queued, that puts the account in a cooldown until the reported reset).
+When a read fails, Omni Route keeps the previous reading with its old `fetchedAt`.
 
-- **It may update the account record from the reading**: the Claude bootstrap metadata kept in
-  `providerSpecificData` (`syncClaudeBootstrapIfNeeded`), and the extra-usage state
-  (`syncClaudeExtraUsageStateIfNeeded`). When the extra-usage block policy is on for the account
-  and the reading shows extra usage queued, that **puts the account in a cooldown**
-  (`testStatus: "unavailable"`, `rateLimitedUntil`) until the reported reset; with the policy
-  off, it clears that state. The automatic sync does the same.
+`timeoutMs` (60 s) bounds the whole call, response body included (at most 1 MiB). After it the
+database is read again, and an authorized account counts as updated when its quota `fetchedAt`
+is at or after the start of the refresh. From Omni Route's answer only the status code and, for
+the authorized accounts, the kind of error the sync recorded are used; the rest of the body
+(which carries the cached limits of every provider) is not logged or published.
 
-The `refresh` block therefore stays absent until the operator has accepted those effects in
-writing. The token file existing is not that acceptance: creating the token and turning the
-block on are separate decisions.
-
-The accounts are called one at a time, `spacingMs` apart; `timeoutMs` bounds each whole call,
-response body included. After the last call the database is read again, and an account counts as
-updated when its quota `fetchedAt` is at or after the start of the refresh. Only the status code
-and the `_stale` marker of Omni Route's answer are used; its body is not logged or published.
-
-A timeout only ends the wait: the route does not cancel its own read, which may still be
-renewing that account's credentials. So a timeout ends the round, the accounts after it are not
-read (`não consultada: rodada interrompida por tempo esgotado`), and with no account updated the
-round fails with `gateway_timeout`. The minimum interval then starts again at the timeout, and
-`nextAllowedAt` says so, so the next round waits a whole `minIntervalMs` (120 s) after it. That
-lowers the chance of two reads of the same account overlapping in the gateway; it does not prove
-the first one ended. Omni Route also serializes credential renewals of Claude accounts in its own
-process.
+A timeout only ends the wait: the sync goes on in the gateway and stores its readings when it
+ends. The accounts not yet updated then read `tempo esgotado`, and with none updated the round
+fails with `gateway_timeout`. The minimum interval starts again at the timeout, and
+`nextAllowedAt` says so, so the next sync waits a whole `minIntervalMs` (120 s) after it.
 
 When the service starts, before it publishes anything, it reads its own last report from the
 artifact and takes back the refresh state: the request it last answered is not answered again,
@@ -300,23 +297,29 @@ The result goes out in the published report (and in `GET /internal/omni-route/us
 
 | `status`    | Meaning                                                                                      |
 | ----------- | -------------------------------------------------------------------------------------------- |
-| `running`   | Published before the first call; `startedAt` set, `finishedAt` null                          |
+| `running`   | Published before the sync call; `startedAt` set, `finishedAt` null                           |
 | `done`      | Every authorized account has a new reading                                                   |
 | `partial`   | Some accounts have one; the others carry a short `reason`                                    |
-| `failed`    | None has; `error` holds the cause when all calls share it                                    |
+| `failed`    | None has; `error` holds the cause when the sync call itself failed                           |
 | `throttled` | Inside the interval; `startedAt` null, `accounts` empty, `nextAllowedAt` is when it opens up |
 
 `error` is `null` or one of `not_configured`, `gateway_unreachable`, `gateway_auth_failed` (401 or
-403 for every account), `gateway_timeout` or `gateway_http_<code>`. Per-account reasons are
-fixed Portuguese texts shown by the panel as they are: `em uso exclusivo` (409, the account holds
-an exclusive lease), `limite de consultas da Anthropic` (a 429 from Omni Route itself),
-`a Anthropic não devolveu a cota (provável limite de consultas)` (a stale answer),
-`credencial do painel recusada` (401/403), `conta não encontrada no Omni Route` (404),
-`Omni Route respondeu HTTP <code>`, `tempo esgotado`, `Omni Route inacessível`, and
-`leitura nova não encontrada no banco` (the call was accepted but the database shows no newer
-reading). A stale answer cannot be told apart further: when `/api/oauth/usage` answers 429, the
-installed build falls back to a legacy endpoint and reports that endpoint's message
-(`open-sse/services/usage/claude.ts`), so the cause is given as probable. Without a `refresh`
+403: the access token is wrong, revoked or not `write`), `gateway_timeout` or
+`gateway_http_<code>`; it is `null` when the sync ran but read no account again. Per-account
+reasons are fixed Portuguese texts shown by the panel as they are. When the sync ran, an account
+the sync recorded an error for gets a text chosen from the fixed messages Omni Route throws (the
+message itself is never kept): `em uso exclusivo` (exclusive lease), `credencial da conta
+recusada` (the account's credentials failed), `Anthropic inacessível` (network or proxy failure)
+or, for anything else, `a Anthropic não devolveu a cota (provável limite de consultas)`. An
+account without a recorded error is `não incluída no sync do Omni Route` when the report shows it
+inactive or does not list it, and otherwise `a Anthropic não devolveu a cota (provável limite de
+consultas)`: Omni Route answered without quotas and kept the previous reading. That cause cannot
+be told apart further: when `/api/oauth/usage` answers 429, the installed build falls back to a
+legacy endpoint and reports that endpoint's message without failing
+(`open-sse/services/usage/claude.ts`), so it is given as probable. An account kept out by an
+exclusive lease is not told apart either, since leases are not in the tables this service reads.
+When the call itself failed, every account gets `credencial do painel recusada` (401/403),
+`Omni Route respondeu HTTP <code>`, `tempo esgotado` or `Omni Route inacessível`. Without a `refresh`
 block the report carries `"refresh": null` and the request key is never read. The log records
 only events: `refresh requested`, `refresh done 3/3`, `refresh partial 1/3`,
 `refresh throttled`, `refresh failed: <error>`.
@@ -376,3 +379,12 @@ rm -r ~/.omniroute/observability
 ```
 
 The gateway is untouched either way.
+
+launchctl bootout gui/$(id -u)/com.jcdecor.omniroute-observability
+rm ~/Library/LaunchAgents/com.jcdecor.omniroute-observability.plist
+rm -r ~/.omniroute/observability
+
+```
+
+The gateway is untouched either way.
+```
