@@ -1,3 +1,7 @@
+---
+title: "Claude continuity: terminal GPT-6.2 Sol fallback"
+---
+
 # Claude continuity: terminal GPT-6.2 Sol fallback
 
 This route is **off by default**. With Claude continuity enabled, only Messages requests
@@ -14,8 +18,9 @@ Only requests resolved to the canonical Claude subscription IDs `claude-opus-5-5
 `claude-fable-5-2` can reach Sol. Existing aliases and context hints qualify only if they
 resolve to one of those exact IDs and the key already permits the alias. A connection
 default that changes the dispatched model cannot count as proof of exhaustion. Fable
-cannot skip Opus: a disabled or divergent chain, or a grant that denies Opus, blocks the
-terminal hop. A direct Opus request does not require a Fable attempt. Other models and
+cannot skip Opus. For an enrolled key, a disabled chain or a grant that denies Opus blocks
+the terminal hop; an unexpected next model is never dispatched and also blocks the hop.
+A direct Opus request does not require a Fable attempt. Other models and
 keys not enrolled in terminal fallback keep the configured Claude-only routing behavior.
 An ambiguous account selection failure (including a provider breaker with no per-account
 verdict for this request) fails closed. If Codex rejects the request before it starts
