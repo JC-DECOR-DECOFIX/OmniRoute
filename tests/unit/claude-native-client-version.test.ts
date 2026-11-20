@@ -53,6 +53,17 @@ test("the TypeScript Agent SDK identity is kept only in its measured form", () =
   ]) {
     assert.equal(resolve(badAgent, agentSdkBilling), null, badAgent);
   }
+  // The suffix stays bound to sdk-ts/claude-vscode even when the billing entrypoint matches.
+  for (const entrypoint of ["sdk-cli", "cli"]) {
+    assert.equal(
+      resolve(
+        agentSdkAgent.replace("sdk-ts", entrypoint),
+        agentSdkBilling.replace("cc_entrypoint=sdk-ts", `cc_entrypoint=${entrypoint}`)
+      ),
+      null,
+      entrypoint
+    );
+  }
   for (const badBilling of [
     agentSdkBilling.replace("2.1.321", "2.1.320"),
     agentSdkBilling.replace("cc_entrypoint=sdk-ts", "cc_entrypoint=sdk-cli"),
