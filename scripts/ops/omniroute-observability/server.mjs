@@ -19,6 +19,7 @@ import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { buildUsageReport, sanitizeReason } from "./aggregate.mjs";
+import { CARD_FILE, createCardPublisher, render } from "./card.mjs";
 
 export const USAGE_PATH = "/internal/omni-route/usage";
 export const KV_KEY = "omni-route/usage";
@@ -36,7 +37,8 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 const REFRESH_DEFAULTS = {
   baseUrl: "http://127.0.0.1:20128",
-  minIntervalMs: 120_000,
+  // Anthropic's usage endpoint refused 1–2 of 3 accounts on 2026-11-20 at a 2-minute interval.
+  minIntervalMs: 300_000,
   requestPollMs: 2_000,
   // One call reads every supported provider of the gateway in turn, 1.5 s apart.
   timeoutMs: 60_000,
@@ -99,6 +101,7 @@ export function loadConfig(path) {
     throw new Error("config.pollIntervalMs must be at least 1000");
   }
   if (config.refresh !== undefined) validateRefresh(config);
+  if (config.card !== undefined) validateCard(config);
   return config;
 }
 
@@ -161,6 +164,39 @@ function validateRefresh(config) {
       throw new Error(`config.refresh.${name} must be an integer from ${min} to ${max}`);
     }
   }
+}
+
+const CARD_DEFAULTS = { minIntervalMs: 300_000, timeZone: "America/Sao_Paulo" };
+
+/** The card is written through the daemon socket, so it needs the Happy block. */
+function validateCard(config) {
+  if (!config.card || typeof config.card !== "object" || Array.isArray(config.card)) {
+    throw new Error("config.card must be an object");
+  }
+  const card = { ...CARD_DEFAULTS, ...config.card };
+  const happy = config.happy ?? {};
+  if (typeof happy.socketPath !== "string" || typeof happy.tokenFile !== "string") {
+    throw new Error("config.card needs the happy block (socketPath, tokenFile)");
+  }
+  if (typeof card.artifactId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(card.artifactId)) {
+    throw new Error("config.card.artifactId must be an artifact id");
+  }
+  if (!integerIn(card.minIntervalMs, 60_000, 24 * 60 * 60_000)) {
+    throw new Error("config.card.minIntervalMs must be an integer from 60000 to 86400000");
+  }
+  try {
+    if (typeof card.timeZone !== "string") throw new TypeError("not a string");
+    new Intl.DateTimeFormat("pt-BR", { timeZone: card.timeZone });
+  } catch {
+    throw new Error("config.card.timeZone must be an IANA time zone");
+  }
+}
+
+/** The card settings with their defaults applied, or null when the block is absent. */
+export function cardSettings(config) {
+  if (config.card === undefined) return null;
+  const { artifactId, minIntervalMs, timeZone } = { ...CARD_DEFAULTS, ...config.card };
+  return { artifactId, minIntervalMs, timeZone };
 }
 
 /** The refresh settings with their defaults applied, or null when the block is absent. */
@@ -509,6 +545,127 @@ async function getKvEntry({ socketPath, token, artifactId, key }) {
   } catch {
     throw new Error("happy kv read returned invalid JSON");
   }
+}
+
+function artifactPath(artifactId, rest = "") {
+  return `/v0/artifacts/${encodeURIComponent(artifactId)}${rest}`;
+}
+
+const ARTIFACT_VERSION_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The card artifact's concurrency version, its last change time and the text of its document in
+ * the latest version (empty when that version holds no document).
+ */
+export async function readCardArtifact({ socketPath, token, artifactId }) {
+  const get = (path, label) =>
+    exchange({
+      options: {
+        socketPath,
+        path,
+        method: "GET",
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      },
+      deadlineMs: KV_READ_TIMEOUT_MS,
+      label,
+    });
+  const head = await get(artifactPath(artifactId), "happy card read");
+  if (head.status !== 200) throw new Error(`happy card read returned HTTP ${head.status}`);
+  let artifact;
+  try {
+    artifact = JSON.parse(head.text)?.artifact;
+  } catch {
+    throw new Error("happy card read returned invalid JSON");
+  }
+  if (
+    artifact?.status !== "active" ||
+    typeof artifact.version !== "string" ||
+    !ARTIFACT_VERSION_RE.test(artifact.version) ||
+    !Number.isInteger(artifact.latestVersion)
+  ) {
+    throw new Error("happy card artifact is not an active artifact");
+  }
+  // The numbered version, so the document read belongs to the concurrency version above.
+  const file = await get(
+    artifactPath(artifactId, `/versions/${artifact.latestVersion}/files/${CARD_FILE}`),
+    "happy card file read"
+  );
+  if (file.status === 404)
+    return { version: artifact.version, updatedAt: artifact.updatedAt, text: "" };
+  if (file.status !== 200) throw new Error(`happy card file read returned HTTP ${file.status}`);
+  return { version: artifact.version, updatedAt: artifact.updatedAt, text: file.text };
+}
+
+/** Where a refused document is wrong: node paths named in the error, never values. */
+export function errorPaths(body) {
+  const paths = [];
+  const visit = (value, depth) => {
+    if (paths.length >= 10 || depth > 6 || !value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (
+        ["path", "instancePath", "pointer"].includes(key) &&
+        typeof child === "string" &&
+        /^[A-Za-z0-9_./#[\]-]{1,120}$/.test(child) &&
+        !paths.includes(child)
+      ) {
+        paths.push(child);
+      } else {
+        visit(child, depth + 1);
+      }
+      if (paths.length >= 10) return;
+    }
+  };
+  visit(body, 0);
+  return paths;
+}
+
+/** Writes the card document as a new version of its artifact; resolves with what came back. */
+export async function writeCardArtifact({
+  socketPath,
+  token,
+  artifactId,
+  version,
+  text,
+  mutationId,
+}) {
+  if (!ARTIFACT_VERSION_RE.test(version)) throw new Error("happy card version is not a version");
+  const body = JSON.stringify({ mutationId, files: [{ path: CARD_FILE, text }] });
+  const { status, text: answer } = await exchange({
+    options: {
+      socketPath,
+      path: artifactPath(artifactId),
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+        // The version alone, without quotes.
+        "if-match": version,
+      },
+    },
+    body,
+    deadlineMs: PUBLISH_TIMEOUT_MS,
+    label: "happy card write",
+  });
+  let parsed = null;
+  try {
+    parsed = JSON.parse(answer);
+  } catch {
+    // Only the status is used then.
+  }
+  if (status >= 200 && status < 300) {
+    const next = parsed?.artifact?.version;
+    return {
+      status,
+      version: typeof next === "string" && ARTIFACT_VERSION_RE.test(next) ? next : null,
+    };
+  }
+  if (status === 400) {
+    const code =
+      typeof parsed?.code === "string" && /^[a-z_]{1,40}$/.test(parsed.code) ? parsed.code : null;
+    return { status, errorCode: code, paths: errorPaths(parsed) };
+  }
+  return { status };
 }
 
 /**
@@ -951,6 +1108,39 @@ async function main(configPath) {
     });
   }
 
+  // The phone card: a Gen UI document rendered from the report, written as a new version of its
+  // artifact only when it changes, at most once per interval. Its failures stay its own.
+  const card = cardSettings(config);
+  let cardTick = null;
+  if (card) {
+    const { socketPath, tokenFile } = config.happy;
+    const publishCard = createCardPublisher({
+      // The daemon token is read for each call, so a rotated token is picked up.
+      read: () =>
+        readCardArtifact({
+          socketPath,
+          token: readSecretFile(tokenFile),
+          artifactId: card.artifactId,
+        }),
+      write: (fields) =>
+        writeCardArtifact({
+          socketPath,
+          token: readSecretFile(tokenFile),
+          artifactId: card.artifactId,
+          ...fields,
+        }),
+      minIntervalMs: card.minIntervalMs,
+      log,
+    });
+    cardTick = coalesce(async () => {
+      try {
+        await publishCard(render(observer.payload(), Date.now(), card));
+      } catch {
+        log("card render failed");
+      }
+    });
+  }
+
   let readRequest = null;
   let ensureRestored = async () => true;
   if (refresh && flush) {
@@ -1041,6 +1231,8 @@ async function main(configPath) {
     if (pollError !== lastPollError)
       log(pollError ? `poll failed: ${pollError}` : "poll recovered");
     lastPollError = pollError;
+    // Not awaited: a slow artifact write never holds up the report.
+    cardTick?.();
     if (publishTick && (await ensureRestored())) await publishTick();
   };
   await tick();

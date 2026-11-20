@@ -1373,7 +1373,7 @@ test("refresh configuration is validated", (t) => {
   assert.deepEqual(refreshSettings(config({ ...base, refresh })), {
     baseUrl: "http://127.0.0.1:20128",
     tokenFile: refresh.tokenFile,
-    minIntervalMs: 120_000,
+    minIntervalMs: 300_000,
     requestPollMs: 2_000,
     timeoutMs: 60_000,
   });
@@ -1697,13 +1697,13 @@ test("the service reads refresh requests through the daemon and answers them", a
   assert.equal(get.url, "/v0/artifacts/art1/api/v1/kv/entry?key=omni-route%2Frefresh-request");
   assert.equal(get.authorization, "Bearer daemon-token");
   const { refresh } = answered().body.value;
-  assert.equal(refresh.minIntervalMs, 120_000);
+  assert.equal(refresh.minIntervalMs, 300_000);
   assert.equal(refresh.last.requestVersion, version(7));
   assert.equal(refresh.last.error, "not_configured");
   // The first report already carries the refresh state, before any request is answered.
   const firstPut = daemon.requests.find((r) => r.method === "PUT");
   assert.deepEqual(firstPut.body.value.refresh, {
-    minIntervalMs: 120_000,
+    minIntervalMs: 300_000,
     nextAllowedAt: null,
     last: null,
   });
@@ -2306,7 +2306,7 @@ test("the service publishes nothing and answers nothing until its last state is 
   const previous = {
     schema: "omni-route-usage/v1",
     refresh: {
-      minIntervalMs: 120_000,
+      minIntervalMs: 300_000,
       nextAllowedAt: new Date(answeredAt + 120_000).toISOString(),
       last: {
         requestVersion: version(7),

@@ -180,7 +180,7 @@ store is answered only if it is at most 90 s old; an older one is marked seen.
 "refresh": {
   "baseUrl": "http://127.0.0.1:20128",
   "tokenFile": "/Users/giovanni/.omniroute/observability/omniroute-access-token",
-  "minIntervalMs": 120000,
+  "minIntervalMs": 300000,
   "requestPollMs": 2000,
   "timeoutMs": 60000
 }
@@ -253,7 +253,7 @@ the authorized accounts, the kind of error the sync recorded are used; the rest 
 A timeout only ends the wait: the sync goes on in the gateway and stores its readings when it
 ends. The accounts not yet updated then read `tempo esgotado`, and with none updated the round
 fails with `gateway_timeout`. The minimum interval starts again at the timeout, and
-`nextAllowedAt` says so, so the next sync waits a whole `minIntervalMs` (120 s) after it.
+`nextAllowedAt` says so, so the next sync waits a whole `minIntervalMs` (300 s) after it.
 
 When the service starts, before it publishes anything, it reads its own last report from the
 artifact and takes back the refresh state: the request it last answered is not answered again,
@@ -278,11 +278,13 @@ call, to the daemon and to Omni Route, goes through an agent of its own, never t
 global agent, so a proxy set in the environment (`NODE_USE_ENV_PROXY` with `HTTP_PROXY`) never
 sees a request or its credential, and `localhost` in `baseUrl` is used as `127.0.0.1`.
 
-**Why at most one refresh every two minutes.** Each click runs one whole sync: every active
+**Why at most one refresh every five minutes.** Each click runs one whole sync: every active
 connection of a supported provider (seven on 2026-11-19) is read once, one at a time, 1.5 s
-apart by default within the round — what the automatic sync already does every 70 minutes. With
-the default interval of 120 s the button starts at most 30 syncs an hour in the worst case, on top
-of the automatic one, so at most 30 manual reads an hour per account. The spacing holds only
+apart by default within the round — what the automatic sync already does every 70 minutes. The
+interval was 120 s at first; in the tests of 2026-11-20 Anthropic refused the reading of one or
+two of the three Claude accounts at that rate (its usage endpoint is limited per account), so the
+default is now 300 s. The button then starts at most 12 syncs an hour in the worst case, on top
+of the automatic one, so at most 12 manual reads an hour per account. The spacing holds only
 within one round: this service never starts a second round of its own while one runs, but the
 manual route does not share the automatic scheduler's lock, so a click can overlap the automatic
 run, a refresh from the dashboard, or a round that goes on in the gateway after a timeout (the
@@ -300,7 +302,7 @@ The result goes out in the published report (and in `GET /internal/omni-route/us
 
 ```json
 "refresh": {
-  "minIntervalMs": 120000,
+  "minIntervalMs": 300000,
   "nextAllowedAt": "2026-11-19T19:43:00.000Z",
   "last": {
     "requestVersion": "019a…",
@@ -348,6 +350,42 @@ block the report carries `"refresh": null` and the request key is never read. Th
 only events: `refresh requested`, `refresh done 3/3`, `refresh partial 1/3`,
 `refresh throttled`, `refresh failed: <error>`.
 
+### Phone card
+
+With a `card` block, the service also keeps a Gen UI artifact up to date: a native card with the
+same facts as the panel, for the Happy phone apps. It has no button; reading the quota again on
+demand stays in the panel.
+
+```json
+"card": { "artifactId": "pww9b30xe5g9yc9cinj75vad", "minIntervalMs": 300000, "timeZone": "America/Sao_Paulo" }
+```
+
+`artifactId` names an existing `gen_ui` artifact; `minIntervalMs` is 60000–86400000 (default 300000) and `timeZone` an IANA zone (default `America/Sao_Paulo`). The block needs the `happy`
+block, whose socket and token it uses.
+
+On every poll the document is rendered from the report (`render` in `card.mjs`), with the panel's
+own rules of what may be shown (`quotaOf`, `accountBadge`, `reasonText` and `drawState` of the
+panel's page) evaluated at that moment, and every time written in `timeZone`, pt-BR, 24 h. It
+holds a badge (`Atualizado · HH:MM`, `Desatualizado · lido …` or `Indisponível`, from the active
+account's reading), the account in use with its model and last request, one table row per account
+of the pool (5 h and weekly use, when each window resets, state), the most recent switch and a
+footer. Without a report it holds one line saying the report is unavailable. The card shows
+nothing the panel does not already show.
+
+A new version of the artifact is written only when the document differs from the one in its
+latest version **and** at least `minIntervalMs` has passed since the artifact last changed. At
+start the service reads the artifact (`GET /v0/artifacts/:id`) and the `index.genui.json` of its
+numbered latest version, so a restart neither writes the same card again nor shortens the
+interval. The write is `PATCH /v0/artifacts/:id` through the daemon socket with the token of the
+`happy` block, `If-Match` carrying the artifact's version without quotes, and the body
+`{ mutationId, files: [{ path: "index.genui.json", text }] }`. A `409` or `412` makes the service
+read the artifact again before the next write; a `400` (a document the daemon refuses) is logged
+with its error code and the node paths it names, never values, and that same document is not sent
+again. Any other failure is logged once and tried again on the next poll. The card never holds up
+the report: a failed or slow write does not touch the panel's data store. The log records
+`card published`, `card conflict: HTTP <code>, reloading`, `card refused: HTTP 400 …`,
+`card publish failed: …` and `card state not read: …`.
+
 ## Installation on this Mac
 
 Deploy from a merged commit of `jc/macos-v3.8.50`, never from a working tree.
@@ -356,7 +394,7 @@ Deploy from a merged commit of `jc/macos-v3.8.50`, never from a working tree.
 SHA=$(git rev-parse --short=8 HEAD)
 DEST=~/.omniroute/observability/$SHA
 mkdir -p "$DEST"
-cp scripts/ops/omniroute-observability/{aggregate,server}.mjs "$DEST/"
+cp scripts/ops/omniroute-observability/{aggregate,card,server}.mjs "$DEST/"
 ln -sfn "$DEST" ~/.omniroute/observability/current
 ```
 
@@ -407,7 +445,8 @@ launchctl kickstart -k gui/$(id -u)/com.jcdecor.omniroute-observability
 
 Removing the `refresh` block from the configuration and restarting the service is enough to turn
 the button off (the panel then shows manual refresh as unavailable); revoke the access token in
-the Omni Route dashboard as well when it is no longer needed.
+the Omni Route dashboard as well when it is no longer needed. Removing the `card` block stops the
+phone card; the artifact keeps its last version.
 
 ## Uninstall
 
