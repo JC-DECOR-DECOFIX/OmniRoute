@@ -476,11 +476,15 @@ export function stripProxyToolPrefix(body: Record<string, unknown>): void {
     return n.startsWith(TOOL_PREFIX) ? n.slice(TOOL_PREFIX.length) : n;
   };
 
+  // original -> stripped, for tools[] definitions that actually lost the prefix.
+  const declaredRenames = new Map<string, string>();
   const tools = body.tools as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(tools)) {
     for (const t of tools) {
       const stripped = stripName(t.name);
-      if (stripped !== undefined) t.name = stripped;
+      if (stripped === undefined) continue;
+      if (stripped !== t.name) declaredRenames.set(t.name as string, stripped);
+      t.name = stripped;
     }
   }
 
@@ -497,8 +501,9 @@ export function stripProxyToolPrefix(body: Record<string, unknown>): void {
       if (!Array.isArray(content)) continue;
       const blocks = content as Array<Record<string, unknown>>;
       for (let i = 0; i < blocks.length; i++) {
-        // ToolSearch references must keep naming the tool they load.
-        blocks[i] = renameToolReferences(blocks[i], stripName);
+        // A ToolSearch reference follows only a tools[] definition that was renamed;
+        // names a server toolset exposes (mcp_toolset `proxy_lookup`) stay untouched.
+        blocks[i] = renameToolReferences(blocks[i], (name) => declaredRenames.get(name));
         const block = blocks[i];
         if (block?.type === "tool_use") {
           const stripped = stripName(block.name);

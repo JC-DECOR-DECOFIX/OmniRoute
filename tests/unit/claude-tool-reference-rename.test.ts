@@ -163,6 +163,30 @@ describe("tool_reference never owns the reverse map", () => {
     assert.deepEqual([...map.keys()], ["CreateAgent"]);
   });
 
+  it("a reference after a history tool_use that minted an alias still stays put", () => {
+    // The tool_use mints GoneTool for an undeclared tool; a later reference to the
+    // same name must not pick it up (guards the pre-history alias snapshot).
+    const body = clientToolSearchBody("create_agent");
+    (body.messages as AnyRecord[]).push(
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "toolu_8", name: "gone_tool", input: {} }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_8",
+            content: [{ type: "tool_reference", tool_name: "gone_tool" }],
+          },
+        ],
+      }
+    );
+    cloakThirdPartyToolNames(body);
+    assert.deepEqual(referencedNames(body), ["CreateAgent", "gone_tool"]);
+  });
+
   it("a reference takes the declared alias even when a history tool_use collides", () => {
     // search_files and grep_search both want Grep; tools[] gets Grep, the history-only
     // grep_search gets Grep2. The reference to search_files must stay on Grep.
@@ -231,6 +255,28 @@ describe("tool_reference follows the other native renames", () => {
     stripProxyToolPrefix(body);
     assert.deepEqual(declaredNames(body), ["ToolSearch", "lookup"]);
     assert.deepEqual(referencedNames(body), ["lookup"]);
+  });
+
+  it("proxy_ strip leaves a reference no tools[] definition was renamed for", () => {
+    // An mcp_toolset from a server named `proxy` exposes `proxy_lookup`; no tools[]
+    // entry carries that name, so the reference must reach Anthropic unchanged.
+    const body: AnyRecord = {
+      tools: [{ type: "mcp_toolset", mcp_server_name: "proxy" }],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: [{ type: "tool_reference", tool_name: "proxy_lookup" }],
+            },
+          ],
+        },
+      ],
+    };
+    stripProxyToolPrefix(body);
+    assert.deepEqual(referencedNames(body), ["proxy_lookup"]);
   });
 
   it("the full native chain leaves every reference resolvable", () => {
