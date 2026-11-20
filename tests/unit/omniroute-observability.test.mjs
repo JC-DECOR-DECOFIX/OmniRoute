@@ -58,7 +58,7 @@ function fixture() {
       id_token TEXT, api_key TEXT, provider_specific_data TEXT);
     CREATE TABLE call_logs (id TEXT PRIMARY KEY, timestamp TEXT, status INTEGER, model TEXT,
       requested_model TEXT, provider TEXT, account TEXT, connection_id TEXT, error_type TEXT,
-      error_summary TEXT, correlation_id TEXT);
+      error_summary TEXT, correlation_id TEXT, request_type TEXT, api_key_id TEXT);
     CREATE TABLE key_value (namespace TEXT, key TEXT, value TEXT, PRIMARY KEY (namespace, key));
     CREATE TABLE quota_snapshots (id INTEGER PRIMARY KEY, provider TEXT, connection_id TEXT,
       window_key TEXT, remaining_percentage REAL, is_exhausted INTEGER, next_reset_at TEXT,
@@ -125,7 +125,9 @@ function fixture() {
   );
 
   let n = 0;
-  const log = db.prepare(`INSERT INTO call_logs VALUES (?, ?, ?, ?, ?, 'claude', ?, ?, ?, ?, ?)`);
+  const log = db.prepare(
+    `INSERT INTO call_logs VALUES (?, ?, ?, ?, ?, 'claude', ?, ?, ?, ?, ?, NULL, NULL)`
+  );
   const add = (minutesAgo, status, connection, email, model, corr, type = null, summary = null) =>
     log.run(
       `r${++n}`,
@@ -244,6 +246,39 @@ test("the current account is the newest served request, not the configured prior
   assert.equal(r.current.effectiveModel, "claude-sonnet-5");
   assert.equal(account(r, B).servedLatest, true);
   assert.equal(account(r, A).servedLatest, false);
+});
+
+test("only a server-tagged terminal Codex attempt can become the current served model", () => {
+  const db = fixture();
+  const id = "eeeeeeee-0000-4000-8000-000000000005";
+  db.prepare(
+    `INSERT INTO provider_connections (id, provider, email) VALUES (?, 'codex', 'codex@example.com')`
+  ).run(id);
+  const row = db.prepare(`INSERT INTO call_logs (id, timestamp, status, model, requested_model,
+    provider, account, connection_id, correlation_id, request_type)
+    VALUES (?, ?, 200, 'gpt-6.2-sol', ?, 'codex', 'codex@example.com', ?, ?, ?)`);
+  row.run("unrelated", at(-1), "claude/claude-opus-5-5", id, "corr-9", null);
+  row.run("direct", at(-1), "codex/gpt-6.2-sol", id, "corr-10", null);
+  const before = buildUsageReport(db, { now: NOW });
+  assert.notEqual(before.current?.connectionId, id);
+  row.run(
+    "terminal",
+    at(-0.75),
+    "claude/claude-opus-5-5",
+    id,
+    "corr-11",
+    "claude_terminal_fallback"
+  );
+  const after = buildUsageReport(db, { now: NOW });
+  assert.equal(after.current?.effectiveModel, "gpt-6.2-sol");
+  assert.equal(after.current?.requestedModel, "claude-opus-5-5");
+  assert.equal(after.current?.email, "codex@example.com");
+  assert.deepEqual(
+    after.accounts,
+    before.accounts.map((entry) => ({ ...entry, servedLatest: false }))
+  );
+  assert.deepEqual(after.inUse, before.inUse);
+  db.close();
 });
 
 test("in-use accounts count only served requests in the window", () => {
@@ -502,7 +537,7 @@ test("free text from the database is redacted beyond known key formats", () => {
 test("text fields that do not have their expected shape are dropped", () => {
   const db = fixture();
   db.prepare(
-    `INSERT INTO call_logs VALUES ('bad', ?, 200, ?, ?, 'claude', 'one@example.com', ?, NULL, NULL, NULL)`
+    `INSERT INTO call_logs VALUES ('bad', ?, 200, ?, ?, 'claude', 'one@example.com', ?, NULL, NULL, NULL, NULL, NULL)`
   ).run(at(0.1), "claude-opus-5-5\nInjected: header", "claude/<script>", A);
   db.prepare("UPDATE key_value SET value = ? WHERE key = ?").run(
     JSON.stringify({
@@ -556,7 +591,7 @@ test("a missing percentage is not read as 0 % remaining", () => {
 test("switches skip attempts without an account and attempts outside the look-back", () => {
   const db = fixture();
   const row = db.prepare(
-    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?)`
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?, NULL, NULL)`
   );
   // A fails, a rejection with no account, then B serves the same request.
   row.run("n1", at(45), 503, A, "corr-4");
@@ -679,7 +714,7 @@ test("connection ids that do not have the id shape never reach the report", () =
      VALUES (?, 'claude', 'odd@example.com', 9, 1, 'active')`
   ).run(odd);
   const row = db.prepare(
-    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?)`
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?, NULL, NULL)`
   );
   row.run("i1", at(0.2), 200, odd, null);
   row.run("i2", at(10), 500, A, "corr-7");
@@ -730,7 +765,7 @@ test("a newer invalid snapshot does not hide the previous valid one", () => {
 test("the last error ignores successes that share its timestamp", () => {
   const db = fixture();
   const row = db.prepare(
-    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, ?, ?, NULL)`
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, ?, ?, NULL, NULL, NULL)`
   );
   row.run("e1", at(3), 429, C, "rate_limited", "limit");
   row.run("e2", at(3), 200, C, null, null);
@@ -767,7 +802,7 @@ test("the observer turns stale on the first failed poll", () => {
 test("ids with a NUL byte or stored as a blob never reach the report", () => {
   const db = fixture();
   const row = db.prepare(
-    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?)`
+    `INSERT INTO call_logs VALUES (?, ?, ?, 'claude-opus-5-5', 'claude/claude-opus-5-5', 'claude', NULL, ?, NULL, NULL, ?, NULL, NULL)`
   );
   row.run("z1", at(0.2), 200, `${B}\u0000<script>`, null);
   row.run("z2", at(0.15), 200, new Uint8Array([97, 98, 99]), null);

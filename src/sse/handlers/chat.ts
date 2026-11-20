@@ -75,7 +75,8 @@ import { createHookContext, runHooks, initPreRequestRegistry } from "@/lib/middl
 import { rejectPeerRequest } from "@/shared/resilience/peerRouting";
 import { deleteHandoff, getHandoff } from "@/lib/db/contextHandoffs";
 import { getComboByName, updateCombo } from "@/lib/db/combos";
-import { isModelAllowedForKey } from "@/lib/db/apiKeys";
+import { getApiKeyMetadata, isModelAllowedForKey } from "@/lib/db/apiKeys";
+import { getSyncedAvailableModelsByConnection } from "@/lib/db/models";
 import { promoteSuccessfulComboModel } from "@/lib/combos/autoPromote";
 import {
   deleteSessionAccountAffinity,
@@ -132,9 +133,19 @@ import { createVirtualAutoCombo, resolveAutoRoutingState } from "./autoRouting";
 import { getComboFailureLogError } from "./comboFailureLogging";
 import {
   adaptRequestForFallbackModel,
+  CLAUDE_TERMINAL_TARGET,
+  isClaudeTerminalSource,
+  markClaudeTerminalPool,
   withClaudeModelFallback,
   type ClaudeModelFallback,
 } from "./claudeModelFallback.ts";
+import {
+  canExhaustClaudeAccount,
+  describeClaudeTerminalPool,
+} from "../services/claudeTerminalPool";
+import { isClaudeUpstreamAccountFailure } from "@omniroute/open-sse/utils/claudeUpstreamAccountFailure.ts";
+import { getTrustedLocalRateLimitResponse } from "@omniroute/open-sse/services/rateLimitManager/errors.ts";
+import { estimateFinalInputTokens } from "@omniroute/open-sse/handlers/chatCore/contextEstimation.ts";
 
 // Pipeline integration — wired modules
 import { classify429FromError, type FailureKind } from "@/shared/utils/classify429";
@@ -1255,6 +1266,16 @@ async function handleChatImplementation(
       } catch {}
     }
   }
+  // Cross-provider disclosure requires operator opt-in and an exact restricted grant.
+  const terminalFallbackEnabled =
+    process.env.OMNIROUTE_CLAUDE_TERMINAL_FALLBACK?.trim() === CLAUDE_TERMINAL_TARGET &&
+    /(?:^|\/)messages\/?$/.test(clientRawRequest?.endpoint || "") &&
+    apiKeyInfo?.modelAccessMode === "restricted" &&
+    apiKeyInfo?.allowedModels?.includes(CLAUDE_TERMINAL_TARGET) &&
+    !combo &&
+    !requestedConnectionId &&
+    !managedLease &&
+    !isComboLiveTest;
   const singleModelOptions = {
     sessionId,
     sessionAffinityKey,
@@ -1267,6 +1288,7 @@ async function handleChatImplementation(
     reasoningIntent,
     reasoningRequestTags: requestRoutingTags.tags,
     managedLease,
+    terminalFallbackEnabled,
   };
   const singleModel = (
     requestBody: any,
@@ -1297,11 +1319,45 @@ async function handleChatImplementation(
       !Array.isArray(keyPool) ||
       keyPool.length === 0,
     isModelAllowed: (fallbackModel) => isModelAllowedForKey(policy.apiKey, fallbackModel),
-    dispatch: (fallbackModel, modelFallback) =>
-      singleModel(adaptRequestForFallbackModel(body, modelFallback.to), fallbackModel, {
+    terminal: terminalFallbackEnabled,
+    signal: request.signal,
+    dispatch: async (fallbackModel, modelFallback) => {
+      const adapted = adaptRequestForFallbackModel(body, modelFallback.to);
+      let allowedConnectionIds: string[] | null = null;
+      if (modelFallback.provider === "codex") {
+        const latestKey = await getApiKeyMetadata(policy.apiKey);
+        if (
+          latestKey?.modelAccessMode !== "restricted" ||
+          !latestKey.allowedModels?.includes(CLAUDE_TERMINAL_TARGET) ||
+          !latestKey.allowedConnections?.length ||
+          latestKey.isActive === false ||
+          latestKey.isBanned === true ||
+          latestKey.revokedAt ||
+          (latestKey.expiresAt && Date.parse(latestKey.expiresAt) <= Date.now()) ||
+          request.signal?.aborted
+        ) {
+          return errorResponse(
+            request.signal?.aborted ? 499 : 403,
+            "Terminal fallback is not authorized"
+          );
+        }
+        allowedConnectionIds = latestKey.allowedConnections;
+        delete adapted.metadata;
+        delete adapted.context_management;
+      }
+      return singleModel(adapted, fallbackModel, {
         ...singleModelOptions,
         modelFallback,
-      }),
+        ...(modelFallback.provider === "codex"
+          ? {
+              emergencyFallbackTried: true,
+              skipUpstreamRetry: true,
+              routingComboId: null,
+              allowedConnectionIds,
+            }
+          : {}),
+      });
+    },
   });
   recordTelemetry(telemetry);
   return withModalityBridgeHeader(
@@ -1356,6 +1412,7 @@ async function handleSingleModelChat(
     modelAbortSignal?: AbortSignal | null;
     /** Set when the continuity pool serves this request with a fallback model. */
     modelFallback?: ClaudeModelFallback | null;
+    terminalFallbackEnabled?: boolean;
   } = {},
   comboStrategy: string | null = null,
   isCombo: boolean = false
@@ -1373,6 +1430,8 @@ async function handleSingleModelChat(
   // to combo flow. This handles the case where the auto-fuzzy match in
   // resolveModelOrError found a combo but the main handler's combo lookup missed it.
   if ((resolved as any).combo) {
+    if (runtimeOptions.modelFallback)
+      return errorResponse(503, "Fallback target resolves to a combo");
     const redirectCombo = (resolved as any).combo;
     if (runtimeOptions.managedLease) return managedComboRejection();
     log.info(
@@ -1476,6 +1535,15 @@ async function handleSingleModelChat(
   })();
   const claudeAccountContinuityOnly =
     provider === "claude" && process.env.OMNIROUTE_CLAUDE_ACCOUNT_CONTINUITY_ONLY === "true";
+  const terminalPoolEnabled =
+    claudeAccountContinuityOnly &&
+    runtimeOptions.terminalFallbackEnabled &&
+    isClaudeTerminalSource(model) &&
+    (!runtimeOptions.modelFallback || runtimeOptions.modelFallback.to === model);
+  const terminalDispatch = runtimeOptions.modelFallback?.provider === "codex";
+  if (terminalDispatch && (provider !== "codex" || modelStr !== `${provider}/${model}`)) {
+    return errorResponse(503, "Terminal fallback target is not the configured Codex model");
+  }
   const forceLiveComboTest = runtimeOptions.forceLiveComboTest === true;
   const bypassProviderQuotaPolicy = hasProviderQuotaBypassScope(apiKeyInfo?.scopes);
   const hasForcedConnection =
@@ -1493,6 +1561,23 @@ async function handleSingleModelChat(
       effectiveAllowedConnections ?? [],
       quotaScope.connectionIds
     );
+  }
+
+  if (terminalDispatch) {
+    const catalogs = await getSyncedAvailableModelsByConnection("codex");
+    const estimatedTokens = estimateFinalInputTokens(body);
+    let overBudget = false;
+    effectiveAllowedConnections = (effectiveAllowedConnections ?? []).filter((id) =>
+      catalogs[id]?.some((entry) => {
+        if (entry.id !== model) return false;
+        if (estimatedTokens < Math.min(entry.inputTokenLimit ?? 500_000, 500_000)) return true;
+        overBudget = true;
+        return false;
+      })
+    );
+    if (overBudget && effectiveAllowedConnections.length === 0) {
+      return errorResponse(413, "Conversation exceeds the terminal Codex model's input budget");
+    }
   }
 
   const bypassReason = forceLiveComboTest
@@ -1597,6 +1682,7 @@ async function handleSingleModelChat(
   // loops so it can never reset and loop.
   let streamEarlyEofRetries = 0;
   const continuityAttemptedConnections = new Set<string>();
+  const terminalAttempts = new Map<string, number>();
   const sameAccountTransportRetries = new Map<string, number>();
   const occupancySessionKey =
     runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId ?? `request:${randomUUID()}`;
@@ -1832,7 +1918,7 @@ async function handleSingleModelChat(
             responseStatus,
             `Claude upstream accounts unavailable: ${reason}. ${recovery}`
           );
-          return new Response(
+          const poolResponse = new Response(
             JSON.stringify({
               ...errorBody,
               error: { ...errorBody.error, code: "upstream_accounts_unavailable" },
@@ -1843,6 +1929,25 @@ async function handleSingleModelChat(
               headers: responseHeaders,
             }
           );
+          if (
+            terminalPoolEnabled &&
+            !isCombo &&
+            !comboName &&
+            !hasForcedConnection &&
+            !requestSignal?.aborted &&
+            effectiveAllowedConnections?.length &&
+            canExhaustClaudeAccount(status)
+          ) {
+            const verdict = await describeClaudeTerminalPool(
+              model,
+              modelStr,
+              effectiveAllowedConnections,
+              terminalAttempts,
+              credentials?.poolRateLimit?.allRateLimited === true
+            );
+            if (verdict) markClaudeTerminalPool(poolResponse, model, verdict);
+          }
+          return poolResponse;
         }
         const noCredsRes = handleNoCredentials(
           credentials,
@@ -2015,8 +2120,9 @@ async function handleSingleModelChat(
             reasoningTransportFallback: runtimeOptions.reasoningTransportFallback ?? "drop",
             managedLease: runtimeOptions.managedLease ?? null,
             requestedModel: runtimeOptions.modelFallback
-              ? `${provider}/${runtimeOptions.modelFallback.from}`
+              ? `claude/${runtimeOptions.modelFallback.from}`
               : null,
+            terminalClaudeFallback: terminalDispatch,
           },
           runtimeOptions
         );
@@ -2031,6 +2137,21 @@ async function handleSingleModelChat(
       const { result, tlsFingerprintUsed } = execution;
       if (claudeAccountContinuityOnly) continuityAttemptedConnections.add(credentials.connectionId);
       if (!result.success) releaseOAuthSession();
+      if (!result.success && terminalPoolEnabled) {
+        const status = Number(result.status);
+        if (
+          requestSignal?.aborted ||
+          status === 499 ||
+          getTrustedLocalRateLimitResponse(result.response) ||
+          result.response.headers.get("x-omniroute-provider-breaker") === "open"
+        ) {
+          return withSelectedConnectionHeader(result.response, credentials.connectionId);
+        }
+        terminalAttempts.set(
+          credentials.connectionId,
+          effectiveModel === model && isClaudeUpstreamAccountFailure(result.response) ? status : 0
+        );
+      }
 
       const proxyLatency = Date.now() - proxyStartTime;
       const providerAlias = PROVIDER_ID_TO_ALIAS[provider] || provider;
@@ -2155,6 +2276,7 @@ async function handleSingleModelChat(
         // retrying would only double latency) and do NOT mark the account unavailable
         // for the early close.
         if (
+          !terminalDispatch &&
           shouldRetryStreamEarlyEof(result.errorCode, streamEarlyEofRetries) &&
           !hasForcedConnection
         ) {
@@ -2505,6 +2627,9 @@ async function handleSingleModelChat(
         ));
       const failedStatus = renewalPending ? HTTP_STATUS.SERVICE_UNAVAILABLE : result.status;
       const failedError = renewalPending ? CLAUDE_RENEWAL_PENDING_REASON : result.error;
+      if (renewalPending && terminalPoolEnabled) {
+        terminalAttempts.set(credentials.connectionId, 0);
+      }
 
       const { shouldFallback, cooldownMs } = skipConnectionDisable
         ? { shouldFallback: false, cooldownMs: 0 }
@@ -2532,7 +2657,7 @@ async function handleSingleModelChat(
       // to the next target — with ITS own pin. Same rule the antigravity
       // stream-readiness / pre-response-timeout and account-semaphore paths above
       // already apply.
-      if (shouldFallback && !hasForcedConnection) {
+      if (shouldFallback && !hasForcedConnection && !terminalDispatch) {
         if (Number.isFinite(cooldownMs) && cooldownMs > 0) {
           lastCooldownMs = cooldownMs;
           requestRetryLastCooldownMs = cooldownMs;

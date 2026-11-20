@@ -426,6 +426,7 @@ export async function executeChatWithBreaker({
   sessionAffinityKey = null,
   managedLease = null,
   requestedModel = null,
+  terminalClaudeFallback = false,
 }: ExecuteChatWithBreakerOptions): Promise<ExecuteChatWithBreakerResult> {
   let tlsFingerprintUsed = false;
   const normalizedTrafficType: TrafficType =
@@ -486,6 +487,7 @@ export async function executeChatWithBreaker({
             sessionAffinityKey,
             reasoningTransportFallback,
             managedLease,
+            terminalClaudeFallback,
             skipResourcePressureGuard: true,
             onCredentialsRefreshed: async (newCreds: any) => {
               await updateProviderCredentials(credentials.connectionId, {

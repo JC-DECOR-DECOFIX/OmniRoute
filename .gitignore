@@ -2,6 +2,7 @@
 
 # project-specific directories
 /output/
+/.context/
 .slim/deepwork/
 .omnivscodeagent/
 omnirouteCloud/

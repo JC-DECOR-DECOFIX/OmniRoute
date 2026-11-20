@@ -73,6 +73,7 @@ export type PersistAttemptLogsContext = {
   noLogEnabled: unknown;
   correlationId?: string | null;
   modelPinned?: boolean;
+  terminalClaudeFallback?: boolean;
   /** #8249: caller-supplied X-OmniRoute-Session-Id header, only set when the header was
    * explicitly present (never synthesized from skillRequestId) — persisted as call_logs.session_tag
    * for per-session cost attribution. */
@@ -191,6 +192,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
     noLogEnabled,
     correlationId,
     modelPinned,
+    terminalClaudeFallback,
     sessionTag,
   } = ctx;
   const initialConnectionId = toConnectionId(connectionId);
@@ -307,6 +309,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
     pipelinePayloads,
     correlationId,
     modelPinned: modelPinned || false,
+    requestType: terminalClaudeFallback ? "claude_terminal_fallback" : null,
     sessionTag: sessionTag || null,
     responseId: extractResponsesId(sourceFormat, clientResponse),
   }).catch(() => {});

@@ -246,12 +246,16 @@ function accountState(row, now) {
   return { state: "active", until: null };
 }
 
+const TERMINAL_CODEX = `(provider = 'codex' AND model = 'gpt-6.2-sol'
+  AND requested_model LIKE 'claude/%' AND request_type = 'claude_terminal_fallback'
+  AND correlation_id IS NOT NULL)`;
+
 function latestServed(db) {
   return db
     .prepare(
       `SELECT timestamp, requested_model, model, connection_id, account
          FROM call_logs
-        WHERE provider = ? AND status BETWEEN 200 AND 299 AND ${CONNECTION_OK}
+        WHERE (provider = ? OR ${TERMINAL_CODEX}) AND status BETWEEN 200 AND 299 AND ${CONNECTION_OK}
         ORDER BY timestamp DESC, rowid DESC LIMIT 1`
     )
     .get(PROVIDER);
@@ -387,6 +391,12 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
 
   const authorizedSet = new Set(authorized);
   const served = latestServed(db);
+  if (served?.connection_id && !emails.has(served.connection_id)) {
+    const servingAccount = db
+      .prepare("SELECT email FROM provider_connections WHERE provider = 'codex' AND id = ?")
+      .get(served.connection_id);
+    if (servingAccount) emails.set(served.connection_id, matching(servingAccount.email, EMAIL_RE));
+  }
   const active = inUse(db, now);
   const activeIds = new Set(active.map((entry) => entry.connectionId));
   const lastServed = lastServedByConnection(db);
