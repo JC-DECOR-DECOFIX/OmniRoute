@@ -1,3 +1,9 @@
+---
+title: "Earliest Quota Renewal First"
+version: 3.8.50
+lastUpdated: 2026-11-21
+---
+
 # EARLIEST_QUOTA_RENEWAL_FIRST — account selection by earliest quota renewal
 
 Provider-level account strategy `earliest-quota-renewal`. Among the healthy accounts that can
