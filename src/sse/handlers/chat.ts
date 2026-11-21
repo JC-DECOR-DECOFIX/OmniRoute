@@ -1,5 +1,13 @@
 import { randomUUID } from "crypto";
 import { resolveChatRequestBody } from "./requestBody";
+import { validateChatRequest } from "./chat/validateRequest";
+import {
+  getCombosCachedForChat,
+  intersectAllowedConnectionIds,
+  isManagedComboUnsupported,
+  managedComboRejection,
+  resolveComboContextOverflowDeferral,
+} from "./chat/comboPreflight";
 import * as chatAdmission from "./chatAdmission.ts";
 import { buildClientRawRequest, resolveDispatchClientRawRequest } from "./chat/clientRawRequest.ts";
 export { buildClientRawRequest, resolveDispatchClientRawRequest };
@@ -31,17 +39,11 @@ import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts"
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import { applyNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
 import { resolveCcDiscoveryAliasStrip } from "@/lib/ccDiscoveryAliasResolve";
-import {
-  handleComboChat,
-  resolveComboTargets,
-  shouldSkipConnDisable,
-} from "@omniroute/open-sse/services/combo.ts";
-import type { ComboLike, SingleModelTarget } from "@omniroute/open-sse/services/combo/types.ts";
+import { handleComboChat, shouldSkipConnDisable } from "@omniroute/open-sse/services/combo.ts";
+import type { SingleModelTarget } from "@omniroute/open-sse/services/combo/types.ts";
 import { mergeAbortSignals } from "@omniroute/open-sse/executors/base.ts";
 import { resolveRequestAutoControls } from "@omniroute/open-sse/services/autoCombo/requestControls.ts";
 import { isVerifiedNativeCodexRequest } from "@omniroute/open-sse/config/codexIdentity.ts";
-import { resolveCompressionSettings } from "@omniroute/open-sse/handlers/chatCore/compressionSettings.ts";
-import type { CompressionExclusions } from "@omniroute/open-sse/services/compression/exclusions.ts";
 import { resolveComboConfig } from "@omniroute/open-sse/services/comboConfig.ts";
 import { injectHandoffIntoBody } from "@omniroute/open-sse/services/contextHandoff.ts";
 import {
@@ -78,8 +80,7 @@ import {
   getSessionAccountAffinity,
 } from "@/lib/db/sessionAccountAffinity";
 import { dispatchChatWithAffinityEviction } from "./chatDispatch";
-import { getCachedSettings, getCombosCacheVersion } from "@/lib/db/readCache";
-import { getCombos } from "@/lib/db/combos";
+import { getCachedSettings } from "@/lib/db/readCache";
 import { resolveModelLockoutSettings } from "@/lib/resilience/modelLockoutSettings";
 import {
   ensureOpenAIStoreSessionFallback,
@@ -263,118 +264,6 @@ registerGrokWebQuotaFetcher();
 // what lets the per-window cutoff modal in Dashboard › Limits actually
 // enforce thresholds for Claude / GLM / Cursor / etc., not just Codex.
 registerGenericQuotaFetchers();
-let combosCachePromise: Promise<ComboLike[]> | null = null;
-let combosCacheTs = 0;
-let combosCacheVersionSnapshot = -1;
-const COMBOS_CACHE_TTL_MS = 10_000;
-
-/**
- * #10225 — resolve whether this request's combo preflight should DEFER its hard
- * context-overflow rejection so chatCore's compression runs first.
- *
- * Mirrors handleChatCore's own enablement determination (chatCore.ts): defer only
- * when the global compression switch is ON and the API key has not opted out
- * (`apiKeyInfo.compressionEnabled !== false`). Per-target applicability (server-side
- * exclusions) is checked inside getKnownContextOverflow via the returned exclusions.
- * Fail closed (defer=false) on any lookup error — the existing hard preflight stays.
- */
-async function resolveComboContextOverflowDeferral(
-  logger: { warn?: (...args: unknown[]) => void } | null | undefined,
-  apiKeyInfo: { compressionEnabled?: boolean } | null | undefined
-): Promise<{ defer: boolean; exclusions: CompressionExclusions | undefined }> {
-  try {
-    const compression = await resolveCompressionSettings(logger);
-    return {
-      defer: compression.enabled && apiKeyInfo?.compressionEnabled !== false,
-      exclusions: compression.settings?.exclusions,
-    };
-  } catch {
-    return { defer: false, exclusions: undefined };
-  }
-}
-
-async function getCombosCachedForChat(): Promise<ComboLike[]> {
-  const now = Date.now();
-  // Explicit non-null check: we intentionally cache and return the Promise
-  // itself (to dedupe concurrent callers), so this is not a forgotten await.
-  // The version check makes combo edits (create/update/delete/reorder) take
-  // effect immediately instead of after the 10s TTL — otherwise a removed
-  // target/model could keep being served as a "phantom" for up to 10s (#3147).
-  if (
-    combosCachePromise !== null &&
-    now - combosCacheTs < COMBOS_CACHE_TTL_MS &&
-    combosCacheVersionSnapshot === getCombosCacheVersion()
-  ) {
-    return combosCachePromise;
-  }
-
-  combosCacheTs = now;
-  combosCacheVersionSnapshot = getCombosCacheVersion();
-  combosCachePromise = getCombos().catch(() => []) as Promise<ComboLike[]>;
-  return combosCachePromise;
-}
-
-function normalizeAllowedConnectionIds(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const ids = value.filter(
-    (entry): entry is string => typeof entry === "string" && entry.trim().length > 0
-  );
-  return ids.length > 0 ? ids : null;
-}
-
-function intersectAllowedConnectionIds(primary: unknown, secondary: unknown): string[] | null {
-  const first = normalizeAllowedConnectionIds(primary);
-  const second = normalizeAllowedConnectionIds(secondary);
-
-  if (first && second) {
-    return first.filter((id) => second.includes(id));
-  }
-
-  return first || second || null;
-}
-
-function isManagedComboUnsupported(
-  combo: ComboLike,
-  settings: Record<string, unknown>,
-  allCombos: ComboLike[],
-  visited = new Set<string>()
-): boolean {
-  if (visited.has(combo.name)) return false;
-  visited.add(combo.name);
-  const strategy = combo.strategy ?? "priority";
-  const config = resolveComboConfig(combo, settings) as Record<string, unknown>;
-  const resolvedTargets = resolveComboTargets(combo, allCombos);
-  const pipeline =
-    strategy === "pipeline" ||
-    (strategy === "auto" && (config.pipeline_enabled === true || combo.name === "auto/smart"));
-  const nestedUnsafe = (combo.models as Array<{ kind?: string; comboName?: string }>).some(
-    (step) => {
-      if (step?.kind !== "combo-ref" || !step.comboName) return false;
-      const nested = allCombos.find((candidate) => candidate.name === step.comboName);
-      return Boolean(nested && isManagedComboUnsupported(nested, settings, allCombos, visited));
-    }
-  );
-  return (
-    strategy === "fusion" ||
-    strategy === "context-relay" ||
-    (config.chaos as { enabled?: boolean } | undefined)?.enabled === true ||
-    (config.shadowRouting as { enabled?: boolean } | undefined)?.enabled === true ||
-    (config.zeroLatencyOptimizationsEnabled === true && config.hedging === true) ||
-    (resolvedTargets.length > 1 &&
-      (pipeline || resolvedTargets.some((target) => Boolean(target.connectionId?.trim())))) ||
-    nestedUnsafe
-  );
-}
-
-const managedComboRejection = () =>
-  buildManagedLeaseErrorResponse(
-    new LeaseContextError(
-      409,
-      "LEASE_UNSUPPORTED_ROUTE",
-      "Managed leases do not support this route"
-    )
-  );
-
 const comboPromoteDeps = { updateCombo, info: log.info, warn: log.warn };
 
 export { shouldTripProviderBreakerForResult } from "./chatPredicates";
@@ -419,86 +308,8 @@ async function handleChatImplementation(
 
   const sourceFormat = detectFormatFromUrl(body, request.url);
 
-  // Early guard: an invalid `messages` field is rejected here with a clear
-  // OmniRoute-level 400 before any routing or upstream call (#5110, #6402).
-  // Without this guard, schema-invalid bodies fell through to model resolution
-  // and surfaced as a misleading 404 `model_not_found` from chatHelpers.ts (#6402).
-  // Cases covered:
-  //   - present-but-non-array (null, number, string, object) → 400 (#6402)
-  //   - empty array → 400 ("at least one message is required") (#5110)
-  //   - missing entirely, when the Responses-API `input` discriminator is also
-  //     absent → 400 (#6402). Responses-API requests use `input` (not `messages`),
-  //     and Antigravity requests use a cloudcode `request` envelope.
-  const msgBody = body as { messages?: unknown; input?: unknown };
-  if ("messages" in msgBody && !Array.isArray(msgBody.messages)) {
-    log.warn("CHAT", "Rejecting request with non-array messages");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "messages: Expected array");
-  }
-  if (Array.isArray(msgBody.messages) && msgBody.messages.length === 0) {
-    log.warn("CHAT", "Rejecting request with empty messages array");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "messages: at least one message is required");
-  }
-  if (!("messages" in msgBody) && !("input" in msgBody) && sourceFormat !== "antigravity") {
-    log.warn("CHAT", "Rejecting request with missing messages");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "messages: Expected array, received undefined");
-  }
-
-  // Reject non-string `model` before it reaches downstream code that calls
-  // `.toLowerCase()` / `.split()` / `.startsWith()` on it (crash-then-500 with an
-  // empty body, escaping the error sanitizer — #6407). An explicit `null`/`undefined`
-  // stays permitted here because the existing `Missing model` guard below returns a
-  // clean 400 for those; anything else that is not a string is a client type error.
-  const rawModel = (body as { model?: unknown }).model;
-  if (rawModel !== undefined && rawModel !== null && typeof rawModel !== "string") {
-    log.warn("CHAT", `Rejecting non-string model (typeof=${typeof rawModel})`);
-    return errorResponse(
-      HTTP_STATUS.BAD_REQUEST,
-      `model: Expected string, received ${Array.isArray(rawModel) ? "array" : typeof rawModel}`
-    );
-  }
-
-  // Early schema validation for scalar params BEFORE provider/model resolution (#6412).
-  // Previously, a bad `temperature: "not-a-number"` on an unknown provider returned
-  // 404 "model_not_found" — hiding the real schema error. Validate the param shape
-  // first so the client gets a 400 with the field name. Kept narrow to widely-supported
-  // OpenAI-spec params (temperature 0..2, top_p 0..1, max_tokens int >=1) so we don't
-  // reject legitimate provider-specific fields.
-  {
-    const b = body as {
-      temperature?: unknown;
-      top_p?: unknown;
-      max_tokens?: unknown;
-      n?: unknown;
-    };
-    const badParam = (name: string, msg: string) =>
-      errorResponse(HTTP_STATUS.BAD_REQUEST, `${name}: ${msg}`);
-    if (b.temperature !== undefined) {
-      if (typeof b.temperature !== "number" || Number.isNaN(b.temperature)) {
-        return badParam("temperature", "must be a number");
-      }
-      if (b.temperature < 0 || b.temperature > 2) {
-        return badParam("temperature", "must be between 0 and 2");
-      }
-    }
-    if (b.top_p !== undefined) {
-      if (typeof b.top_p !== "number" || Number.isNaN(b.top_p)) {
-        return badParam("top_p", "must be a number");
-      }
-      if (b.top_p < 0 || b.top_p > 1) {
-        return badParam("top_p", "must be between 0 and 1");
-      }
-    }
-    if (b.max_tokens !== undefined) {
-      if (typeof b.max_tokens !== "number" || !Number.isInteger(b.max_tokens) || b.max_tokens < 1) {
-        return badParam("max_tokens", "must be a positive integer");
-      }
-    }
-    if (b.n !== undefined) {
-      if (typeof b.n !== "number" || !Number.isInteger(b.n) || b.n < 1) {
-        return badParam("n", "must be a positive integer");
-      }
-    }
-  }
+  const invalidRequest = validateChatRequest(body, sourceFormat);
+  if (invalidRequest) return invalidRequest;
 
   const deferredClientRawBody = chatAdmission.captureDeferredClientRawBody(body);
 

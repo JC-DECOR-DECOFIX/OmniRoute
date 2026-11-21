@@ -7,6 +7,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ALIBABA_FREE_TIER_TEXT_CAPABLE_MODELS,
   ALIBABA_NO_FREE_TIER_TEXT_MODELS,
@@ -27,18 +31,41 @@ test("built-in allowlist includes operator free models and excludes paid blockli
   assert.equal(isAlibabaBuiltinFreeTierTextModel("qwen3.7-max"), false);
 });
 
-test("allowlist JSON pack overrides embedded lists when valid", () => {
+test("the shipped JSON pack overrides embedded lists only through its expiry", (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), "alibaba-allowlist-"));
+  const packPath = fileURLToPath(
+    new URL("../../config/alibaba-free-tier-allowlist.json", import.meta.url)
+  );
   const previousPath = process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH;
-  const packPath = `${process.cwd()}/config/alibaba-free-tier-allowlist.json`;
+  const previousDataDir = process.env.DATA_DIR;
+  t.after(() => {
+    if (previousPath === undefined) delete process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH;
+    else process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = previousPath;
+    if (previousDataDir === undefined) delete process.env.DATA_DIR;
+    else process.env.DATA_DIR = previousDataDir;
+    resetAlibabaFreeTierAllowlistCache();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
   process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = packPath;
+  process.env.DATA_DIR = dataDir;
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-07-28T00:00:00Z") });
   resetAlibabaFreeTierAllowlistCache();
 
   const pack = loadAlibabaFreeTierAllowlistPack();
   assert.ok(pack);
-  assert.ok(isAlibabaFreeTierAllowlistPackValid(pack!));
-  assert.ok(pack!.capable.includes("qwen3.6-plus"));
+  assert.ok(pack.validUntil, "the shipped pack must have an expiry");
+  assert.ok(pack.capable.includes("qwen3.6-plus"));
 
-  if (previousPath) process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = previousPath;
-  else delete process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH;
+  const expiry = Date.parse(pack.validUntil);
+  assert.ok(expiry > Date.now());
+  t.mock.timers.setTime(expiry);
   resetAlibabaFreeTierAllowlistCache();
+  assert.ok(isAlibabaFreeTierAllowlistPackValid(pack));
+  assert.deepEqual(loadAlibabaFreeTierAllowlistPack(), pack);
+
+  t.mock.timers.tick(1);
+  resetAlibabaFreeTierAllowlistCache();
+  assert.equal(isAlibabaFreeTierAllowlistPackValid(pack), false);
+  assert.equal(loadAlibabaFreeTierAllowlistPack(), null);
+  assert.equal(isAlibabaBuiltinFreeTierTextModel("qwen3.6-plus"), true);
 });

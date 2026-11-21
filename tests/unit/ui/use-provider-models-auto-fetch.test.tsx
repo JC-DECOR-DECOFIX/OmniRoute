@@ -1,10 +1,11 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
-}));
+vi.mock("next-intl", () => {
+  const translate = (key: string) => key;
+  return { useTranslations: () => translate };
+});
 
 const { useProviderModels } =
   await import("@/app/(dashboard)/dashboard/providers/hooks/useProviderModels");
@@ -26,10 +27,9 @@ async function renderProviderModels(providerId = "custom-provider") {
     return null;
   }
 
-  act(() => {
+  await act(async () => {
     root.render(<TestHook />);
   });
-  await Promise.resolve();
 
   return {
     unmount: () => {
@@ -40,12 +40,19 @@ async function renderProviderModels(providerId = "custom-provider") {
 }
 
 async function flushQueuedSync() {
-  await new Promise<void>((resolve) => setTimeout(resolve, 10));
-  await Promise.resolve();
+  await act(async () => {
+    await vi.runOnlyPendingTimersAsync();
+  });
 }
 
 describe("useProviderModels upstream auto-fetch", () => {
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -64,19 +71,13 @@ describe("useProviderModels upstream auto-fetch", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const mounted = await renderProviderModels();
-    await flushQueuedSync();
+    try {
+      await flushQueuedSync();
+    } finally {
+      mounted.unmount();
+    }
 
-    // Desmontar ANTES de asserir. O hook agenda a auto-sync num setTimeout e o
-    // callback so checa o flag `cancelled` na entrada; enquanto o componente
-    // estiver montado esse flag e false. Se o timer escapar da janela do teste,
-    // ele dispara depois do afterEach ja ter feito unstubAllGlobals() e cai no
-    // fetch REAL com uma URL relativa — `new URL` estoura e derruba o arquivo.
-    // Isso nao acontece com a maquina ociosa, so sob os 20 workers da suite
-    // cheia, e foi assim que este teste virou vermelho intermitente no CI.
-    // Desmontar primeiro faz `cancelled` virar true e o callback sair cedo; as
-    // chamadas ja registradas no fetchMock continuam disponiveis para o assert.
-    mounted.unmount();
-
+    expect(fetchMock).toHaveBeenCalledWith("/api/providers");
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/providers/connection-1/sync-models?mode=sync",
       expect.anything()
@@ -108,10 +109,11 @@ describe("useProviderModels upstream auto-fetch", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const mounted = await renderProviderModels();
-    await flushQueuedSync();
-
-    // Mesmo motivo do teste acima: desmontar fecha a janela do timer vazado.
-    mounted.unmount();
+    try {
+      await flushQueuedSync();
+    } finally {
+      mounted.unmount();
+    }
 
     expect(fetchMock).toHaveBeenCalledWith("/api/providers/connection-1/sync-models?mode=sync", {
       method: "POST",

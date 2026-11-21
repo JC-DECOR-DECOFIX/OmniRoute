@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { BrowserContextOptions } from "playwright-core";
+import type { BrowserContextOptions } from "playwright";
 import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
 import {
@@ -65,7 +65,7 @@ async function inspectStoredState(
   config: AppConfig,
   storageState: NonNullable<BrowserContextOptions["storageState"]>
 ): Promise<{ proAvailable: boolean; url: string }> {
-  const { chromium } = await import("playwright-core");
+  const { chromium } = await import("playwright");
   if (!config.cdpEndpoint && !config.chromeExecutablePath) {
     throw new Error("ChatGPT browser runtime is not configured");
   }
@@ -132,7 +132,7 @@ export async function loginToChatGpt(
   config: AppConfig,
   options: { timeoutMs?: number } = {}
 ): Promise<BrowserLoginResult> {
-  const { chromium } = await import("playwright-core");
+  const { chromium } = await import("playwright");
   if (!config.chromeExecutablePath || !existsSync(config.chromeExecutablePath)) {
     throw new Error(
       `Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`
@@ -226,7 +226,7 @@ export function browserLoginStateExists(config: AppConfig): boolean {
 }
 
 export async function checkBrowserEngine(config: AppConfig): Promise<void> {
-  const { chromium } = await import("playwright-core");
+  const { chromium } = await import("playwright");
   if (config.cdpEndpoint) {
     const browser = await chromium.connectOverCDP(config.cdpEndpoint);
     await browser.close();

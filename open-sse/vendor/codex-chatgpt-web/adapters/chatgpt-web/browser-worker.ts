@@ -1,7 +1,7 @@
 /* Adapted from miuuyy/codex-chatgpt-web commit 55592fca0ba19a27f1b769cec8fff61ff340a785 (MIT). */
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
+import type { Browser, BrowserContext, Locator, Page } from "playwright";
 import { atomicWriteFile, expandUserPath, getConfigDir } from "../../config";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
@@ -453,7 +453,7 @@ export class ChatGptBrowserWorker {
         `Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`
       );
     }
-    const { chromium } = await import("playwright-core");
+    const { chromium } = await import("playwright");
     if (this.config.cdpEndpoint) {
       this.browser = await chromium.connectOverCDP(this.config.cdpEndpoint);
       this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });

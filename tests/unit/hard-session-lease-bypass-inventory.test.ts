@@ -50,6 +50,9 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/lib/search/executeWebSearch.ts": 2,
     "src/lib/skills/webFetchExecution.ts": 1,
     "src/sse/handlers/chat.ts": 2,
+    // Ordinary Opus recovery: selection rejects managed/forced requests and
+    // the send fence rechecks the key's exclusive scope and connection policy.
+    "src/sse/handlers/claudeRecoveryProbe.ts": 1,
     "src/sse/services/auth.ts": 4,
     "src/sse/services/imageCredentialRetry.ts": 1,
   },
@@ -76,7 +79,9 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     // class as providerWildcard/autoComboCandidates, so it is classified B below.
     "open-sse/services/combo.ts": 1,
     "open-sse/services/combo/providerWildcard.ts": 1,
-    "open-sse/services/tokenRefresh.ts": 1,
+    // The second read resolves a refresh conflict for the same selected ID.
+    // Neither read chooses another connection or independently dispatches.
+    "open-sse/services/tokenRefresh.ts": 2,
     "src/app/(dashboard)/dashboard/tools/agent-bridge/page.tsx": 1,
     "src/app/api/cloud/auth/route.ts": 1,
     "src/app/api/cloud/credentials/update/route.ts": 1,
@@ -157,6 +162,10 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/shared/services/modelSyncScheduler.ts": 1,
     "src/sse/handlers/chatHelpers.ts": 1,
     "src/sse/services/auth.ts": 4,
+    // Pre-send read applies the exclusive connection policy to the selected ID.
+    "src/sse/services/claudeOpusRecovery.ts": 1,
+    // Read-only comparison after a failed renewal; no selection or dispatch.
+    "src/sse/services/claudeRenewalState.ts": 1,
   },
 };
 
@@ -203,6 +212,7 @@ const CLASSIFICATION: Record<InventoryKind, Record<string, BypassClass>> = {
         "src/lib/warmupScheduler.ts",
         "src/shared/services/modelSyncScheduler.ts",
         "src/sse/services/auth.ts",
+        "src/sse/services/claudeOpusRecovery.ts",
       ].includes(file)
         ? "B"
         : "C",
