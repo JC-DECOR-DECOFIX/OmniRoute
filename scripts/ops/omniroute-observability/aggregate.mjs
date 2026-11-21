@@ -10,6 +10,8 @@ const QUOTA_FRESH_MS = 10 * 60_000;
 const IN_USE_WINDOW_MS = 5 * 60_000;
 const SWITCH_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 const MAX_SWITCHES = 20;
+const EPISODE_GAP_MS = 30 * 60_000;
+const MAX_EPISODES = 6;
 const MAX_REASON_LENGTH = 160;
 
 const WINDOW_KEYS = { fiveHour: "session (5h)", weekly: "weekly (7d)" };
@@ -261,14 +263,16 @@ function accountState(row, now) {
   return { state: "active", until: null };
 }
 
-const TERMINAL_CODEX = `(provider = 'codex' AND model = 'gpt-6.2-sol'
+const TERMINAL_MODEL = "gpt-6.2-sol";
+const TERMINAL_TARGET = `codex/${TERMINAL_MODEL}`;
+const TERMINAL_CODEX = `(provider = 'codex' AND model = '${TERMINAL_MODEL}'
   AND requested_model LIKE 'claude/%' AND request_type = 'claude_terminal_fallback'
   AND correlation_id IS NOT NULL)`;
 
 function latestServed(db) {
   return db
     .prepare(
-      `SELECT timestamp, requested_model, model, connection_id, account
+      `SELECT timestamp, requested_model, model, provider, connection_id, account
          FROM call_logs
         WHERE (provider = ? OR ${TERMINAL_CODEX}) AND status BETWEEN 200 AND 299 AND ${CONNECTION_OK}
         ORDER BY timestamp DESC, rowid DESC LIMIT 1`
@@ -389,6 +393,166 @@ function switches(db, now, emailOf) {
   return events.slice(0, MAX_SWITCHES);
 }
 
+/**
+ * Whether an API key grants the terminal fallback, read from its policy columns only: the
+ * checks Omni Route repeats before dispatching to Codex (src/sse/handlers/chat.ts). The grant
+ * names its Codex accounts in `allowed_connections`.
+ */
+function terminalGrants(db, now) {
+  const rows = db
+    .prepare(
+      `SELECT model_access_mode, allowed_models, allowed_connections, is_active, is_banned,
+              revoked_at, expires_at
+         FROM api_keys`
+    )
+    .all();
+  const parseList = (value) => {
+    try {
+      const list = typeof value === "string" ? JSON.parse(value) : null;
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  };
+  const grants = [];
+  for (const row of rows) {
+    // As the gateway reads it, an expiry that is not a date does not end the key.
+    const expiresAtMs = row.expires_at ? Date.parse(row.expires_at) : NaN;
+    if (
+      row.is_active !== 1 ||
+      row.is_banned !== 0 ||
+      row.revoked_at !== null ||
+      expiresAtMs <= now ||
+      row.model_access_mode !== "restricted" ||
+      !parseList(row.allowed_models).includes(TERMINAL_TARGET)
+    ) {
+      continue;
+    }
+    grants.push(new Set(parseList(row.allowed_connections).filter((id) => typeof id === "string")));
+  }
+  return grants;
+}
+
+/** Terminal attempts of the look-back grouped into episodes split by a quiet gap. */
+function terminalEpisodes(db, now) {
+  const rows = db
+    .prepare(
+      `SELECT timestamp, status, requested_model FROM call_logs
+        WHERE ${TERMINAL_CODEX} AND typeof(status) = 'integer' AND timestamp >= ?
+        ORDER BY timestamp, rowid`
+    )
+    .all(iso(now - SWITCH_LOOKBACK_MS));
+  const episodes = [];
+  let open = null;
+  for (const row of rows) {
+    const atMs = parseTime(row.timestamp);
+    if (atMs === null) continue;
+    if (open === null || atMs - open.endMs > EPISODE_GAP_MS) {
+      open = { startMs: atMs, endMs: atMs, served: 0, failed: 0, models: new Map() };
+      episodes.push(open);
+    }
+    open.endMs = atMs;
+    if (row.status >= 200 && row.status < 300) open.served++;
+    else if (row.status !== 499) open.failed++;
+    const name = model(row.requested_model);
+    if (name !== null) open.models.set(name, (open.models.get(name) ?? 0) + 1);
+  }
+  return episodes
+    .sort((a, b) => b.endMs - a.endMs)
+    .slice(0, MAX_EPISODES)
+    .map((episode) => {
+      // The most frequent requested model; a tie goes to the first name in order.
+      let requestedModel = null;
+      let count = 0;
+      for (const [name, n] of episode.models) {
+        if (n > count || (n === count && name < requestedModel)) {
+          requestedModel = name;
+          count = n;
+        }
+      }
+      return {
+        start: iso(episode.startMs),
+        end: iso(episode.endMs),
+        served: episode.served,
+        failed: episode.failed,
+        requestedModel,
+      };
+    });
+}
+
+/**
+ * The last rung of the fallback chain: Codex's GPT-6.2 Sol, which serves a Claude request only
+ * through a restricted key that grants it. The account shown is the one that served the latest
+ * terminal attempt or, before any, the single active Codex account a grant names.
+ */
+function terminalStatus(db, now, served) {
+  const status = {
+    model: TERMINAL_MODEL,
+    connectionId: null,
+    shortId: null,
+    email: null,
+    enabled: null,
+    state: "unavailable",
+    lastServedAt: null,
+    episodes: null,
+  };
+  try {
+    const codex = db
+      .prepare(
+        `SELECT id, email, is_active, test_status, rate_limited_until
+           FROM provider_connections WHERE provider = 'codex' ORDER BY id`
+      )
+      .all()
+      .filter((row) => matching(row.id, ID_RE) !== null);
+    let grants = null;
+    try {
+      grants = terminalGrants(db, now);
+    } catch {
+      // A build without these columns: the grant cannot be read.
+    }
+    const last = db
+      .prepare(
+        `SELECT timestamp, connection_id FROM call_logs
+          WHERE ${TERMINAL_CODEX} AND status BETWEEN 200 AND 299 AND ${CONNECTION_OK}
+          ORDER BY timestamp DESC, rowid DESC LIMIT 1`
+      )
+      .get();
+    status.lastServedAt = isoOf(last?.timestamp);
+    let account = codex.find((row) => row.id === last?.connection_id) ?? null;
+    if (account === null && grants !== null) {
+      const covered = codex.filter(
+        (row) => row.is_active && grants.some((grant) => grant.has(row.id))
+      );
+      if (covered.length === 1) account = covered[0];
+    }
+    if (account !== null) {
+      status.connectionId = account.id;
+      status.shortId = shortId(account.id);
+      status.email = matching(account.email, EMAIL_RE);
+    }
+    // Before any account can be named, any grant of a Codex account enables the rung.
+    const candidates = account !== null ? [account] : codex;
+    if (grants !== null) {
+      status.enabled = grants.some((grant) => candidates.some((row) => grant.has(row.id)));
+    }
+    status.episodes = terminalEpisodes(db, now);
+    if (served?.provider === "codex" && served.model === TERMINAL_MODEL) {
+      status.state = "serving";
+    } else if (
+      status.enabled === true &&
+      account &&
+      accountState(account, now).state === "active"
+    ) {
+      status.state = "ready";
+    } else if (status.enabled === false) {
+      status.state = "off";
+    }
+  } catch {
+    // Never a reason to lose the rest of the report.
+  }
+  return status;
+}
+
 /** `authorized` lists the connection ids the operator approved for the Claude pool. */
 export function buildUsageReport(db, { now = Date.now(), authorized = [], gateway = {} } = {}) {
   const connections = db
@@ -468,6 +632,7 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
     accounts,
     lastSwitch: history[0] ?? null,
     switches: history,
+    terminal: terminalStatus(db, now, served),
     thresholds: { quotaFreshMs: QUOTA_FRESH_MS, inUseWindowMs: IN_USE_WINDOW_MS },
   };
 }
