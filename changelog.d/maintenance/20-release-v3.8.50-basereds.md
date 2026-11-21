@@ -1,0 +1,1 @@
+- **fix(maintenance):** Update dependencies with published fixes and restore deterministic checks for Alibaba allowlist expiry, chat dispatch, stream-EOF affinity, and exclusive-lease routing in the macOS v3.8.50 fork.
