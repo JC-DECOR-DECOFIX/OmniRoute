@@ -148,7 +148,10 @@ export async function buildAccountSelectionReport(provider = "claude", now = Dat
         lastUsedAt: pin.lastUsedAt,
         expiresAt: pin.expiresAt,
       })),
-      recent: listRecentSessions(provider, now - RECENT_SESSION_WINDOW_MS),
+      recent: listRecentSessions(provider, now - RECENT_SESSION_WINDOW_MS).map((session) => {
+        const pin = pins.find((entry) => entry.keyHash === session.sessionHash);
+        return { ...session, pinned: !!pin, pinExpiresAt: pin?.expiresAt ?? null };
+      }),
     },
     failovers: listAccountFailoverEvents({ provider, limit: 20 }),
   };

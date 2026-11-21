@@ -90,6 +90,30 @@ function fixture({ strategy = "earliest-quota-renewal", gateway = null } = {}) {
       sessionHash: "0123456789abcdef",
     })
   );
+  kv.run(
+    "account_session_activity",
+    "claude:abc0000000000000",
+    JSON.stringify({
+      provider: "claude",
+      sessionHash: "abc0000000000000",
+      connectionId: P2,
+      model: "claude-opus-5-5",
+      client: "happy-claude-code",
+      firstServedAt: iso(-30 * 60_000),
+      lastServedAt: iso(-60_000),
+      lastChange: { at: iso(-20 * 60_000), fromConnectionId: P1, reason: "failover: upstream 429" },
+    })
+  );
+  kv.run(
+    "session_account_affinity",
+    "claude:abc0000000000000ffff",
+    JSON.stringify({
+      connectionId: P2,
+      createdAt: iso(-H),
+      lastUsedAt: iso(-60_000),
+      expiresAt: iso(H),
+    })
+  );
   if (gateway) kv.run("account_selection_ranking", "claude", JSON.stringify(gateway));
   return db;
 }
@@ -116,7 +140,14 @@ test("mirror ranking: earliest weekly renewal chosen, exhausted out, policy and 
   );
   assert.equal(a[P4].selection.tier, "out");
   assert.equal(a[P4].selection.reason, "weekly_exhausted");
-  assert.equal(a[P2].sessionPins, 1);
+  assert.equal(a[P2].sessionPins, 2);
+  assert.equal(report.sessions.length, 1);
+  assert.deepEqual(
+    [report.sessions[0].shortId, report.sessions[0].model, report.sessions[0].client],
+    ["598035c1", "claude-opus-5-5", "happy-claude-code"]
+  );
+  assert.equal(report.sessions[0].pinned, true);
+  assert.equal(report.sessions[0].lastChange.reason, "failover: upstream 429");
   assert.equal(a[P1].sessionPins, 0, "expired pins are not counted");
   assert.equal(report.failoverEvents.length, 1);
   assert.equal(report.failoverEvents[0].reason, "upstream 429");

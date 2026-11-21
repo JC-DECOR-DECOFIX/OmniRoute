@@ -9,6 +9,7 @@ import {
   readGatewayRanking,
   readRoutingPolicy,
   readSessionPins,
+  readSessions,
 } from "./selection.mjs";
 
 export const SCHEMA = "omni-route-usage/v1";
@@ -627,10 +628,11 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
 
   const history = switches(db, now, emailOf);
   const policy = readRoutingPolicy(db, PROVIDER);
+  const pins = readSessionPins(db, PROVIDER, now);
   const selection = rankAccounts(accounts, {
     now,
     authorized: authorizedSet,
-    pins: readSessionPins(db, PROVIDER, now),
+    pins,
     gateway: readGatewayRanking(db, PROVIDER, now),
   });
   return {
@@ -653,6 +655,7 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
     lastSwitch: history[0] ?? null,
     switches: history,
     failoverEvents: readFailoverEvents(db, PROVIDER),
+    sessions: readSessions(db, PROVIDER, now, pins, emailOf),
     terminal: terminalStatus(db, now, served),
     thresholds: { quotaFreshMs: QUOTA_FRESH_MS, inUseWindowMs: IN_USE_WINDOW_MS },
   };

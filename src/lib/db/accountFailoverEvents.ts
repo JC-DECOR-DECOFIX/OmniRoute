@@ -38,9 +38,17 @@ function safeText(value: unknown): string | null {
   return typeof value === "string" && TEXT_RE.test(value) ? value : null;
 }
 
-export function hashSessionKey(sessionKey: string | null | undefined): string | null {
-  if (!sessionKey) return null;
-  return createHash("sha256").update(sessionKey).digest("hex").slice(0, 16);
+/**
+ * Short session hash, identical to the first 16 hex chars of the session pin key
+ * (`sessionAccountAffinity.ts::affinityKey` = sha256("<provider>:<sessionKey>")), so pins,
+ * session activity and failover events can be joined without the raw identifier.
+ */
+export function hashSessionKey(
+  provider: string,
+  sessionKey: string | null | undefined
+): string | null {
+  if (!sessionKey || !provider) return null;
+  return createHash("sha256").update(`${provider}:${sessionKey}`).digest("hex").slice(0, 16);
 }
 
 export function recordAccountFailoverEvent(input: {
@@ -66,7 +74,7 @@ export function recordAccountFailoverEvent(input: {
     toConnectionId,
     reason: safeText(input.reason),
     model: safeText(input.model),
-    sessionHash: hashSessionKey(input.sessionKey),
+    sessionHash: hashSessionKey(provider, input.sessionKey),
     attempts: Number.isInteger(input.attempts) ? Number(input.attempts) : null,
   };
   const db = getDbInstance();

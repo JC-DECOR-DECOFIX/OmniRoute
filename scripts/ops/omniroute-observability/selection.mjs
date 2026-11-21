@@ -47,7 +47,7 @@ export function readRoutingPolicy(db, provider) {
   };
 }
 
-/** Non-expired session pins per connection. Keys are already sha256 hashes. */
+/** Non-expired session pins: count per connection and expiry per 16-hex key hash. */
 export function readSessionPins(db, provider, now) {
   const rows = db
     .prepare(
@@ -55,14 +55,73 @@ export function readSessionPins(db, provider, now) {
     )
     .all(`${provider}:%`);
   const byConnection = new Map();
+  const byHash = new Map();
   for (const row of rows) {
     const record = parseJson(row.value);
     const connectionId = match(record?.connectionId, ID_RE);
     const expiresAt = ms(record?.expiresAt);
     if (!connectionId || expiresAt === null || expiresAt <= now) continue;
     byConnection.set(connectionId, (byConnection.get(connectionId) ?? 0) + 1);
+    const hash =
+      typeof row.key === "string" ? row.key.slice(provider.length + 1, provider.length + 17) : "";
+    if (HASH_RE.test(hash))
+      byHash.set(hash, { connectionId, expiresAt: new Date(expiresAt).toISOString() });
   }
-  return byConnection;
+  return { byConnection, byHash };
+}
+
+const CLIENTS = new Set([
+  "claude-code-cli",
+  "claude-code-vscode",
+  "happy-claude-code",
+  "agent-sdk",
+  "claude-code-other",
+  "other",
+  "unknown",
+]);
+const SESSION_WINDOW_MS = 60 * 60_000;
+const MAX_SESSIONS = 20;
+
+/** Sessions served in the last hour: account, effective model, client family, last change. */
+export function readSessions(db, provider, now, pins, emailOf) {
+  const rows = db
+    .prepare(
+      `SELECT value FROM key_value WHERE namespace = 'account_session_activity' AND key LIKE ?
+         AND json_valid(value) = 1 AND json_extract(value, '$.lastServedAt') >= ?
+       ORDER BY json_extract(value, '$.lastServedAt') DESC LIMIT ?`
+    )
+    .all(`${provider}:%`, new Date(now - SESSION_WINDOW_MS).toISOString(), MAX_SESSIONS);
+  const sessions = [];
+  for (const row of rows) {
+    const s = parseJson(row.value);
+    const sessionHash = match(s?.sessionHash, HASH_RE);
+    const connectionId = match(s?.connectionId, ID_RE);
+    const lastServedAt = ms(s?.lastServedAt);
+    if (!sessionHash || !connectionId || lastServedAt === null) continue;
+    const pin = pins.byHash.get(sessionHash) ?? null;
+    const change = s.lastChange && typeof s.lastChange === "object" ? s.lastChange : null;
+    sessions.push({
+      sessionHash,
+      connectionId,
+      shortId: connectionId.slice(0, 8),
+      email: emailOf(connectionId),
+      model: match(s.model, TEXT_RE),
+      client: CLIENTS.has(s.client) ? s.client : "unknown",
+      lastServedAt: new Date(lastServedAt).toISOString(),
+      pinned: !!pin && pin.connectionId === connectionId,
+      pinExpiresAt: pin && pin.connectionId === connectionId ? pin.expiresAt : null,
+      lastChange:
+        change && ms(change.at) !== null
+          ? {
+              at: new Date(ms(change.at)).toISOString(),
+              fromConnectionId: match(change.fromConnectionId, ID_RE),
+              reason: match(change.reason, TEXT_RE),
+            }
+          : null,
+      source: "omniroute:account_session_activity",
+    });
+  }
+  return sessions;
 }
 
 /** The gateway's own last ranking (src/sse/services/quotaRenewalRanking.ts), when recent. */
@@ -218,7 +277,7 @@ export function rankAccounts(accounts, { now, authorized, pins, gateway = null }
       resetAt: d?.resetAt ?? null,
       source: d?.outsideGateway ? "observability:mirror" : source,
     };
-    account.sessionPins = pins.get(account.connectionId) ?? 0;
+    account.sessionPins = pins.byConnection.get(account.connectionId) ?? 0;
   }
   const pick = (d) =>
     d

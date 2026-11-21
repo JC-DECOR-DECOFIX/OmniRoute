@@ -1956,6 +1956,7 @@ async function handleSingleModelChat(
           ...audit,
           attemptedConnectionIds: [...excludedConnectionIds, credentials.connectionId],
           forcedConnection: hasForcedConnection,
+          userAgent: request?.headers?.get?.("user-agent") ?? null,
         });
         if (claudeAccountContinuityOnly && apiKeyInfo?.noLog !== true) {
           const attempts = Array.from(continuityAttemptedConnections);

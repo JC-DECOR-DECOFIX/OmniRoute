@@ -126,3 +126,49 @@ test("chat.ts: one audit call in the success branch; account switch only before 
   assert.match(source, /This verdict exists only before the first useful output/);
   assert.match(source, /Claude stream interrupted before useful output/);
 });
+
+test("session activity: account, effective model, client family and last change are persisted", async () => {
+  const tracker = await import("../../src/sse/services/accountSessionTracker.ts");
+  const activity = await import("../../src/lib/db/accountSessionActivity.ts");
+  assert.equal(
+    tracker.classifyClaudeClient("claude-cli/2.1.328 (external, cli)"),
+    "claude-code-cli"
+  );
+  assert.equal(
+    tracker.classifyClaudeClient("claude-cli/2.1.328 (external, claude-vscode)"),
+    "claude-code-vscode"
+  );
+  assert.equal(
+    tracker.classifyClaudeClient("claude-cli/2.1.321 (external, sdk-cli)"),
+    "happy-claude-code"
+  );
+  assert.equal(
+    tracker.classifyClaudeClient("claude-cli/2.1.321 (external, sdk-ts, agent-sdk/0.3.321)"),
+    "agent-sdk"
+  );
+  assert.equal(tracker.classifyClaudeClient("curl/8"), "other");
+
+  const base = { provider: "claude", model: "claude-opus-5-5", sessionKey: "claude:activity" };
+  finalizeAccountSelection(new Response("ok"), {
+    ...base,
+    credentials: { connectionId: A },
+    attemptedConnectionIds: [A],
+    userAgent: "claude-cli/2.1.321 (external, sdk-cli)",
+  });
+  finalizeAccountSelection(new Response("ok"), {
+    ...base,
+    credentials: { connectionId: B },
+    attemptedConnectionIds: [A, B],
+    lastStatus: 429,
+    userAgent: "claude-cli/2.1.321 (external, sdk-cli)",
+  });
+  const [row] = activity
+    .listSessionActivity("claude", Date.now() - 60_000)
+    .filter((s) => s.connectionId === B && s.client === "happy-claude-code");
+  assert.ok(row, "activity row persisted");
+  assert.equal(row.model, "claude-opus-5-5");
+  assert.equal(row.lastChange?.fromConnectionId, A);
+  assert.equal(row.lastChange?.reason, "failover: upstream 429");
+  assert.match(row.sessionHash, /^[0-9a-f]{16}$/);
+  assert.ok(!JSON.stringify(row).includes("claude:activity"));
+});

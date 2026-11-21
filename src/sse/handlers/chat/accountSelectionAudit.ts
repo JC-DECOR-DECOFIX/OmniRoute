@@ -24,6 +24,8 @@ export interface AccountSelectionOutcome {
   sessionKey?: string | null;
   lastStatus?: number | string | null;
   forcedConnection?: boolean;
+  /** Client User-Agent, reduced to a client family before it is stored. */
+  userAgent?: string | null;
 }
 
 function setHeader(response: Response, value: string): Response {
@@ -55,13 +57,17 @@ export function finalizeAccountSelection(
     }
     if (!finalId) return out;
     const firstId = outcome.attemptedConnectionIds[0] ?? null;
-    if (firstId && firstId !== finalId) {
+    const failedOver = !!firstId && firstId !== finalId;
+    const failoverReason = outcome.lastStatus
+      ? `upstream ${outcome.lastStatus}`
+      : "account unavailable";
+    if (failedOver) {
       recordAccountFailoverEvent({
         provider: outcome.provider,
         kind: "failover",
         fromConnectionId: firstId,
         toConnectionId: finalId,
-        reason: outcome.lastStatus ? `upstream ${outcome.lastStatus}` : "account unavailable",
+        reason: failoverReason,
         model: outcome.model,
         sessionKey: outcome.sessionKey,
         attempts: outcome.attemptedConnectionIds.length,
@@ -72,6 +78,9 @@ export function finalizeAccountSelection(
       sessionKey: outcome.sessionKey,
       connectionId: finalId,
       model: outcome.model,
+      userAgent: outcome.userAgent,
+      changeReason: failedOver ? "failover" : outcome.forcedConnection ? "manual_pin" : null,
+      changeDetail: failedOver ? failoverReason : null,
     });
     if (outcome.forcedConnection && previousConnectionId && previousConnectionId !== finalId) {
       recordAccountFailoverEvent({
