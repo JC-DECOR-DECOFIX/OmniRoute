@@ -58,6 +58,8 @@ export const ACCOUNT_FALLBACK_STRATEGY_VALUES = [
   "least-used",
   "cost-optimized",
   "strict-random",
+  // EARLIEST_QUOTA_RENEWAL_FIRST (src/sse/services/quotaRenewalRanking.ts).
+  "earliest-quota-renewal",
 ] as const;
 
 export type AccountFallbackStrategyValue = (typeof ACCOUNT_FALLBACK_STRATEGY_VALUES)[number];

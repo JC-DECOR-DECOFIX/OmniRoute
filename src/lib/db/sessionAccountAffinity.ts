@@ -108,6 +108,36 @@ export function upsertSessionAccountAffinity(
     .run(NAMESPACE, key, JSON.stringify(record));
 }
 
+/**
+ * Atomic first-writer-wins pin creation. Inside one SQLite write transaction: when a
+ * non-expired pin already exists it is kept (and returned); otherwise `connectionId` is
+ * written. Concurrent first requests of the same session therefore all converge on the
+ * pin of whichever request committed first. Returns the pinned connection id, or null
+ * when the TTL is disabled.
+ */
+export function claimSessionAccountAffinity(
+  sessionKey: string,
+  provider: string,
+  connectionId: string,
+  now: number = Date.now(),
+  ttlMs = 0
+): string | null {
+  const normalizedTtlMs = normalizePositiveTtl(ttlMs);
+  if (!sessionKey || !provider || !connectionId || normalizedTtlMs <= 0) return null;
+
+  const db = getDbInstance();
+  const claim = db.transaction(() => {
+    const existing = getSessionAccountAffinity(sessionKey, provider, normalizedTtlMs, now);
+    if (existing) return existing.connectionId;
+    upsertSessionAccountAffinity(sessionKey, provider, connectionId, now, normalizedTtlMs);
+    return connectionId;
+  });
+  // BEGIN IMMEDIATE (better-sqlite3) takes the write lock before the read, so another
+  // process cannot interleave; the synchronous driver already serializes this process.
+  const immediate = (claim as unknown as { immediate?: () => string }).immediate;
+  return typeof immediate === "function" ? immediate.call(claim) : claim();
+}
+
 export function touchSessionAccountAffinity(
   sessionKey: string,
   provider: string,

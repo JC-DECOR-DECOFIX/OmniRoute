@@ -127,6 +127,8 @@ import {
   planSessionAffinityConnection,
   syncSessionAffinityRuntimeFields,
 } from "./sessionAffinityPin";
+import { applyEarliestQuotaRenewal, isEarliestQuotaRenewalStrategy } from "./quotaRenewalRanking";
+import { extractClaudeCodeSessionId } from "./claudeCodeSessionKey";
 import {
   isAnonymousFallbackDisabledBySettings,
   isNoAuthProviderBlockedBySettings,
@@ -295,6 +297,8 @@ export function extractSessionAffinityKey(
     "header"
   );
   if (headerKey) return headerKey;
+  const claudeCodeKey = normalizeSessionKey(extractClaudeCodeSessionId(body, headers), "claude");
+  if (claudeCodeKey) return claudeCodeKey;
 
   const record = asRecord(body);
   const metadata = asRecord(record.metadata);
@@ -1011,7 +1015,10 @@ function planLastUsedCommit(
 function materializeConnection(
   connection: ProviderConnectionView,
   options: CredentialSelectionOptions,
-  extra: DeferredLeaseSelection & { exclusiveLease?: ExclusiveConnectionLease } = {}
+  extra: DeferredLeaseSelection & {
+    exclusiveLease?: ExclusiveConnectionLease;
+    accountSelection?: string;
+  } = {}
 ) {
   const apiKeyHealth = connection.providerSpecificData?.apiKeyHealth as
     Record<string, KeyHealth> | undefined;
@@ -1808,6 +1815,12 @@ export async function getProviderCredentials(
     >;
     const providerOverride = providerStrategyOverrides[resolvedId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    // EARLIEST_QUOTA_RENEWAL_FIRST: rank the filtered pool; affinity and new pins use it too.
+    const renewal = isEarliestQuotaRenewalStrategy(strategy)
+      ? applyEarliestQuotaRenewal(resolvedId, orderedConnections, requestedModel)
+      : null;
+    const affinityPool = renewal?.pool ?? orderedConnections;
+    const pickNew = renewal ? (pool: typeof affinityPool) => pool[0] ?? null : undefined;
 
     let commitSelectionSideEffects: (() => Promise<void> | void) | undefined;
     let connection = leasePolicy.activeLease
@@ -1820,8 +1833,9 @@ export async function getProviderCredentials(
         ? planSessionAffinityConnection(
             provider,
             options.sessionKey,
-            orderedConnections,
-            sessionAffinityTtlMs
+            affinityPool,
+            sessionAffinityTtlMs,
+            pickNew
           )
         : null;
     const affinityConnection = connection
@@ -1831,8 +1845,9 @@ export async function getProviderCredentials(
         : await selectSessionAffinityConnection(
             provider,
             options.sessionKey,
-            orderedConnections,
-            sessionAffinityTtlMs
+            affinityPool,
+            sessionAffinityTtlMs,
+            pickNew
           );
     if (affinityConnection) {
       connection = affinityConnection;
@@ -1847,6 +1862,8 @@ export async function getProviderCredentials(
 
     if (connection) {
       // Session affinity selected a connection before global sticky routing.
+    } else if (renewal) {
+      connection = renewal.pool[0];
     } else if (strategy === "round-robin") {
       const stickyLimit = toNumber(
         providerOverride.stickyRoundRobinLimit ??
@@ -1999,7 +2016,8 @@ export async function getProviderCredentials(
       connection = orderedConnections[0];
     }
 
-    if (options.reserveOAuthSession === true && connection?.authType === "oauth") {
+    // The renewal ranking already decided; a peer swap would undo it.
+    if (!renewal && options.reserveOAuthSession === true && connection?.authType === "oauth") {
       const selectedPriority = connection.priority || 999;
       const selectedAvailability = getOAuthSessionAvailability(connection.id, options.sessionKey);
       const moreAvailablePeer = [...orderedConnections]
@@ -2033,6 +2051,7 @@ export async function getProviderCredentials(
         return materializeConnection(connection, options, {
           commitSelectionSideEffects,
           selectNextLeaseCandidate,
+          accountSelection: renewal?.describe(connection.id),
         });
       }
       let claim = mutateExclusiveConnectionLease(
@@ -2063,7 +2082,8 @@ export async function getProviderCredentials(
       );
     }
 
-    return materializeConnection(connection, options, { exclusiveLease });
+    const accountSelection = renewal?.describe(connection.id);
+    return materializeConnection(connection, options, { exclusiveLease, accountSelection });
   } finally {
     selectionLock?.release();
   }

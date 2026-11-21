@@ -29,6 +29,7 @@
 import {
   getSessionAccountAffinity,
   upsertSessionAccountAffinity,
+  claimSessionAccountAffinity,
   touchSessionAccountAffinity,
   deleteSessionAccountAffinity,
   evictSessionAccountAffinityForConnection,
@@ -42,6 +43,7 @@ import {
 } from "@omniroute/open-sse/services/accountFallback.ts";
 import { isComboPerModelTimeoutAbort } from "@omniroute/open-sse/services/combo/comboAbortReasons.ts";
 import * as log from "../utils/logger";
+import { EARLIEST_QUOTA_RENEWAL_STRATEGY } from "./quotaRenewalRanking";
 
 /** Minimal structural view of a provider connection this module reads. */
 export interface AffinityPinConnection {
@@ -73,6 +75,13 @@ export function formatSessionKeyForLog(sessionKey: string): string {
   return `${sessionKey.slice(0, 18)}...`;
 }
 
+/** Default chooser for a new pin: least recently used, then priority. */
+export function pickLeastRecentlyUsed<T extends SessionAffinityConnection>(
+  connections: T[]
+): T | null {
+  return [...connections].sort(compareLruConnections)[0] ?? null;
+}
+
 function compareLruConnections(a: SessionAffinityConnection, b: SessionAffinityConnection): number {
   if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
   if (!a.lastUsedAt) return -1;
@@ -95,7 +104,8 @@ export async function selectSessionAffinityConnection<T extends SessionAffinityC
   provider: string,
   sessionKey: string | null | undefined,
   connections: T[],
-  ttlMs = 0
+  ttlMs = 0,
+  pickNew: (connections: T[]) => T | null = pickLeastRecentlyUsed
 ): Promise<T | null> {
   if (!sessionKey || connections.length === 0 || ttlMs <= 0) return null;
 
@@ -125,10 +135,11 @@ export async function selectSessionAffinityConnection<T extends SessionAffinityC
     );
   }
 
-  const connection = [...connections].sort(compareLruConnections)[0] ?? null;
-  if (!connection) return null;
-
-  upsertSessionAccountAffinity(sessionKey, provider, connection.id, Date.now(), ttlMs);
+  const picked = pickNew(connections);
+  if (!picked) return null;
+  // First writer wins: a concurrent request of the same session may have pinned already.
+  const claimedId = claimSessionAccountAffinity(sessionKey, provider, picked.id, Date.now(), ttlMs);
+  const connection = connections.find((candidate) => candidate.id === claimedId) ?? picked;
   await touchConnectionLastUsed(connection.id, 1);
   connection.lastUsedAt = new Date().toISOString();
   connection.consecutiveUseCount = 1;
@@ -149,13 +160,14 @@ export function planSessionAffinityConnection<T extends SessionAffinityConnectio
   provider: string,
   sessionKey: string | null | undefined,
   connections: T[],
-  ttlMs = 0
+  ttlMs = 0,
+  pickNew: (connections: T[]) => T | null = pickLeastRecentlyUsed
 ) {
   if (!sessionKey || connections.length === 0 || ttlMs <= 0) return null;
   const existing = getSessionAccountAffinity(sessionKey, provider, ttlMs);
   const existingConnection =
     existing && connections.find((candidate) => candidate.id === existing.connectionId);
-  const connection = existingConnection ?? [...connections].sort(compareLruConnections)[0] ?? null;
+  const connection = existingConnection ?? pickNew(connections) ?? null;
   if (!connection) return null;
 
   return {
@@ -252,6 +264,11 @@ export interface AffinityPinOptions {
 export interface AffinityPinSettings {
   sessionAffinityTtlMs?: number | null;
   codexSessionAffinityTtlMs?: number | null;
+  /** Per-provider override: `providerStrategies.<provider>.sessionAffinityTtlMs`. */
+  providerStrategies?: Record<
+    string,
+    { fallbackStrategy?: string; sessionAffinityTtlMs?: number | null } | undefined
+  > | null;
 }
 
 /**
@@ -263,12 +280,24 @@ export interface AffinityPinSettings {
  * site with one call.
  */
 export function resolveSessionAffinityTtlMs(
-  _provider: string,
+  provider: string,
   options: AffinityPinOptions,
   settings: AffinityPinSettings
 ): number {
   const override = Number(options.sessionAffinityTtlMs);
   if (Number.isFinite(override) && override > 0) return override;
+  // Scoped TTL: enables affinity for one provider without pinning every other pool. It is
+  // honored only together with EARLIEST_QUOTA_RENEWAL_FIRST, so switching the provider back
+  // to its previous strategy (e.g. "priority") is a complete, single-key rollback.
+  const scopedOverride = settings.providerStrategies?.[provider];
+  const scoped = Number(scopedOverride?.sessionAffinityTtlMs);
+  if (
+    scopedOverride?.fallbackStrategy === EARLIEST_QUOTA_RENEWAL_STRATEGY &&
+    Number.isFinite(scoped) &&
+    scoped > 0
+  ) {
+    return scoped;
+  }
   const configured = Number(settings.sessionAffinityTtlMs ?? settings.codexSessionAffinityTtlMs);
   if (Number.isFinite(configured) && configured > 0) return configured;
   return 0;
