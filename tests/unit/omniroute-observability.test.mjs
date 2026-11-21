@@ -2476,3 +2476,266 @@ test("a restart after a late timeout whose result was not written keeps a whole 
   assert.equal(h.calls.length, 0);
   assert.equal(h.refresher.state().last.status, "throttled");
 });
+
+const SOL = "ffffffff-0000-4000-8000-000000000006";
+const TERMINAL_TARGET = "codex/gpt-6.2-sol";
+
+/** The base fixture plus a Codex account, the key table and, unless `grant` is false, a grant. */
+function terminalFixture({ codexActive = 1, grant = {} } = {}) {
+  const db = fixture();
+  db.exec(`CREATE TABLE api_keys (id TEXT PRIMARY KEY, name TEXT, key TEXT, key_hash TEXT,
+    allowed_models TEXT, allowed_connections TEXT, model_access_mode TEXT, is_active INTEGER,
+    is_banned INTEGER, revoked_at TEXT, expires_at TEXT)`);
+  db.prepare(
+    `INSERT INTO provider_connections (id, provider, email, is_active, test_status, access_token)
+     VALUES (?, 'codex', 'sol@example.com', ?, 'active', ?)`
+  ).run(SOL, codexActive, SECRET);
+  if (grant !== false) addKey(db, grant);
+  return db;
+}
+
+let keys = 0;
+function addKey(db, overrides = {}) {
+  const row = {
+    allowed_models: JSON.stringify(["claude/*", TERMINAL_TARGET]),
+    allowed_connections: JSON.stringify([A, B, C, SOL]),
+    model_access_mode: "restricted",
+    is_active: 1,
+    is_banned: 0,
+    revoked_at: null,
+    expires_at: null,
+    ...overrides,
+  };
+  db.prepare(
+    `INSERT INTO api_keys (id, name, key, key_hash, allowed_models, allowed_connections,
+       model_access_mode, is_active, is_banned, revoked_at, expires_at)
+     VALUES (?, 'k', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    `key-${++keys}`,
+    SECRET,
+    SECRET,
+    row.allowed_models,
+    row.allowed_connections,
+    row.model_access_mode,
+    row.is_active,
+    row.is_banned,
+    row.revoked_at,
+    row.expires_at
+  );
+}
+
+let terminalRows = 0;
+function addTerminal(db, timestamp, status, requested = "claude/claude-opus-5-5") {
+  db.prepare(
+    `INSERT INTO call_logs (id, timestamp, status, model, requested_model, provider, account,
+       connection_id, correlation_id, request_type)
+     VALUES (?, ?, ?, 'gpt-6.2-sol', ?, 'codex', 'sol@example.com', ?, ?, 'claude_terminal_fallback')`
+  ).run(`t${++terminalRows}`, timestamp, status, requested, SOL, `tcorr-${terminalRows}`);
+}
+
+const terminalOf = (db, now = NOW) => buildUsageReport(db, { now }).terminal;
+
+test("terminal: without a key table or a Codex account nothing is claimed", () => {
+  assert.deepEqual(report().terminal, {
+    model: "gpt-6.2-sol",
+    connectionId: null,
+    shortId: null,
+    email: null,
+    enabled: null,
+    state: "unavailable",
+    lastServedAt: null,
+    episodes: [],
+  });
+});
+
+test("terminal: with a grant and no terminal attempt yet the granted account is ready", () => {
+  const t = terminalOf(terminalFixture());
+  assert.equal(t.connectionId, SOL);
+  assert.equal(t.shortId, "ffffffff");
+  assert.equal(t.email, "sol@example.com");
+  assert.equal(t.enabled, true);
+  assert.equal(t.state, "ready");
+  assert.equal(t.lastServedAt, null);
+  assert.deepEqual(t.episodes, []);
+});
+
+test("terminal: without a grant the rung is off", () => {
+  const db = terminalFixture({ grant: { allowed_models: JSON.stringify(["claude/*"]) } });
+  const t = terminalOf(db);
+  assert.equal(t.enabled, false);
+  assert.equal(t.state, "off");
+  assert.equal(t.connectionId, null);
+});
+
+test("terminal: a grant with Claude still serving is ready and keeps its history", () => {
+  const db = terminalFixture();
+  addTerminal(db, at(600), 200);
+  addTerminal(db, at(590), 200);
+  const r = buildUsageReport(db, { now: NOW });
+  assert.equal(r.current.connectionId, B);
+  assert.equal(r.terminal.state, "ready");
+  assert.equal(r.terminal.lastServedAt, at(590));
+  assert.deepEqual(r.terminal.episodes, [
+    { start: at(600), end: at(590), served: 2, failed: 0, requestedModel: "claude-opus-5-5" },
+  ]);
+});
+
+test("terminal: the night of 20 November, served by Sol, is two serving episodes", () => {
+  const db = terminalFixture();
+  // `count` served attempts spread evenly from `first` to `last`.
+  const burst = (first, last, count) => {
+    const [from, to] = [Date.parse(first), Date.parse(last)];
+    for (let i = 0; i < count; i++) {
+      addTerminal(
+        db,
+        new Date(from + Math.round(((to - from) * i) / (count - 1))).toISOString(),
+        200
+      );
+    }
+  };
+  // As recorded: 462 served in two bursts 42 minutes apart, with 24 client cancellations
+  // that count neither as served nor as failed.
+  burst("2026-11-20T22:38:37.722Z", "2026-11-20T22:47:53.009Z", 79);
+  burst("2026-11-20T23:30:05.995Z", "2026-11-21T01:05:37.068Z", 383);
+  for (let i = 0; i < 24; i++) {
+    addTerminal(
+      db,
+      new Date(Date.parse("2026-11-20T23:31:00.000Z") + i * 180_000).toISOString(),
+      499
+    );
+  }
+  const now = Date.parse("2026-11-21T01:10:00.000Z");
+  const r = buildUsageReport(db, { now });
+  assert.equal(r.current.effectiveModel, "gpt-6.2-sol");
+  assert.deepEqual(r.terminal, {
+    model: "gpt-6.2-sol",
+    connectionId: SOL,
+    shortId: "ffffffff",
+    email: "sol@example.com",
+    enabled: true,
+    state: "serving",
+    lastServedAt: "2026-11-21T01:05:37.068Z",
+    episodes: [
+      {
+        start: "2026-11-20T23:30:05.995Z",
+        end: "2026-11-21T01:05:37.068Z",
+        served: 383,
+        failed: 0,
+        requestedModel: "claude-opus-5-5",
+      },
+      {
+        start: "2026-11-20T22:38:37.722Z",
+        end: "2026-11-20T22:47:53.009Z",
+        served: 79,
+        failed: 0,
+        requestedModel: "claude-opus-5-5",
+      },
+    ],
+  });
+});
+
+test("terminal: an inactive Codex account makes the rung unavailable", () => {
+  const db = terminalFixture({ codexActive: 0 });
+  // Never served: no active account a grant names, so none is shown.
+  let t = terminalOf(db);
+  assert.equal(t.connectionId, null);
+  assert.equal(t.state, "unavailable");
+  // Served once before: that account is shown, still unavailable.
+  addTerminal(db, at(600), 200);
+  t = terminalOf(db);
+  assert.equal(t.connectionId, SOL);
+  assert.equal(t.enabled, true);
+  assert.equal(t.state, "unavailable");
+});
+
+test("terminal: a Codex account in cooldown is not ready", () => {
+  const db = terminalFixture();
+  db.prepare("UPDATE provider_connections SET rate_limited_until = ? WHERE id = ?").run(
+    at(-10),
+    SOL
+  );
+  assert.equal(terminalOf(db).state, "unavailable");
+});
+
+test("terminal: episodes split on a quiet gap over 30 minutes", () => {
+  const db = terminalFixture();
+  addTerminal(db, at(500), 200);
+  addTerminal(db, at(470), 200); // exactly 30 minutes later: same episode
+  addTerminal(db, at(439), 502); // 31 minutes later: a new one
+  addTerminal(db, at(430), 200, "claude/claude-fable-5-2");
+  addTerminal(db, at(429), 200, "claude/claude-fable-5-2");
+  const { episodes } = terminalOf(db);
+  assert.deepEqual(episodes, [
+    { start: at(439), end: at(429), served: 2, failed: 1, requestedModel: "claude-fable-5-2" },
+    { start: at(500), end: at(470), served: 2, failed: 0, requestedModel: "claude-opus-5-5" },
+  ]);
+});
+
+test("terminal: client cancellations count neither as served nor failed", () => {
+  const db = terminalFixture();
+  addTerminal(db, at(300), 499);
+  addTerminal(db, at(299), 200);
+  addTerminal(db, at(298), 499);
+  addTerminal(db, at(297), 503);
+  const [episode] = terminalOf(db).episodes;
+  assert.deepEqual([episode.served, episode.failed], [1, 1]);
+  assert.equal(episode.start, at(300));
+});
+
+test("terminal: a revoked, expired, banned or inactive key grants nothing", () => {
+  for (const grant of [
+    { revoked_at: at(60) },
+    { expires_at: at(1) },
+    { is_banned: 1 },
+    { is_active: 0 },
+  ]) {
+    const t = terminalOf(terminalFixture({ grant }));
+    assert.equal(t.enabled, false, JSON.stringify(grant));
+    assert.equal(t.state, "off", JSON.stringify(grant));
+  }
+  // An expiry still ahead keeps the grant.
+  assert.equal(terminalOf(terminalFixture({ grant: { expires_at: at(-60) } })).enabled, true);
+});
+
+test("terminal: only a restricted key naming the exact target and account grants it", () => {
+  for (const grant of [
+    { model_access_mode: "all" },
+    { allowed_models: JSON.stringify(["codex/*"]) },
+    { allowed_models: "not json" },
+    { allowed_connections: JSON.stringify([A, B, C]) },
+  ]) {
+    const t = terminalOf(terminalFixture({ grant }));
+    assert.equal(t.enabled, false, JSON.stringify(grant));
+    assert.equal(t.state, "off", JSON.stringify(grant));
+  }
+});
+
+test("terminal: at most six episodes, newest first, from the look-back only", () => {
+  const db = terminalFixture();
+  addTerminal(db, at(8 * 24 * 60), 200); // older than seven days
+  for (let i = 0; i < 8; i++) addTerminal(db, at(1000 + i * 60), 200);
+  const { episodes, lastServedAt } = terminalOf(db);
+  assert.equal(episodes.length, 6);
+  assert.deepEqual(
+    episodes.map((episode) => episode.end),
+    [0, 1, 2, 3, 4, 5].map((i) => at(1000 + i * 60))
+  );
+  assert.equal(lastServedAt, at(1000));
+});
+
+test("terminal: an unreadable key table leaves enabled unknown and the report whole", () => {
+  const db = fixture();
+  db.exec("CREATE TABLE api_keys (id TEXT PRIMARY KEY, name TEXT)");
+  const r = buildUsageReport(db, { now: NOW });
+  assert.equal(r.terminal.enabled, null);
+  assert.equal(r.terminal.state, "unavailable");
+  assert.equal(r.current.connectionId, B);
+});
+
+test("terminal: the report never carries a key or a credential", () => {
+  const db = terminalFixture();
+  addTerminal(db, at(600), 200);
+  const json = JSON.stringify(buildUsageReport(db, { now: NOW }));
+  assert.equal(json.includes("SECRETSECRET"), false);
+  assert.equal(json.includes("key-"), false);
+});
