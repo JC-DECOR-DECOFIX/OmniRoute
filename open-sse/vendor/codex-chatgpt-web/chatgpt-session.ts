@@ -1,5 +1,5 @@
 /* Adapted from miuuyy/codex-chatgpt-web commit 55592fca0ba19a27f1b769cec8fff61ff340a785 (MIT). */
-import type { Locator, Page } from "playwright-core";
+import type { Locator, Page } from "playwright";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 

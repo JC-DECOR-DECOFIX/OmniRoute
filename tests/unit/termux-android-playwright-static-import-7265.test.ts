@@ -13,6 +13,18 @@ import { dirname, join } from "node:path";
 // unsupported platform crashed the whole server at startup regardless of configured provider.
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SOLVER = join(HERE, "../../open-sse/services/claudeTurnstileSolver.ts");
+const CODEX_WEB = join(HERE, "../../open-sse/vendor/codex-chatgpt-web");
+
+test("the Codex browser adapter uses the declared Playwright package lazily", () => {
+  for (const file of ["adapters/chatgpt-web/browser-worker.ts", "browser-login.ts"]) {
+    const source = readFileSync(join(CODEX_WEB, file), "utf8");
+    assert.doesNotMatch(source, /["']playwright-core["']/, file);
+    assert.doesNotMatch(source, /^import (?!type\b)[^\n]* from "playwright"/m, file);
+    assert.match(source, /const \{ chromium \} = await import\("playwright"\)/, file);
+  }
+  const session = readFileSync(join(CODEX_WEB, "chatgpt-session.ts"), "utf8");
+  assert.match(session, /^import type \{ Locator, Page \} from "playwright";/m);
+});
 
 test("claudeTurnstileSolver.ts does not statically import the playwright runtime", () => {
   const src = readFileSync(SOLVER, "utf8");
