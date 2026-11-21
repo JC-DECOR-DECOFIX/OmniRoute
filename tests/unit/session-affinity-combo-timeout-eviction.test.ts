@@ -184,7 +184,7 @@ test("chat.ts routes its upstream dispatch through the eviction-aware seam", () 
   const src = fs.readFileSync(new URL("../../src/sse/handlers/chat.ts", import.meta.url), "utf8");
   assert.match(
     src,
-    /dispatchChatWithAffinityEviction\(/,
+    /await\s+withRenewalOutcome\(\s*renewalOutcome,\s*dispatchChatWithAffinityEviction\s*\)\s*\(/,
     "chat.ts must dispatch through the seam that owns the eviction"
   );
   assert.doesNotMatch(

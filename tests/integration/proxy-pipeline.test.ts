@@ -73,7 +73,10 @@ describe("Chat Pipeline — handleSingleModelChat decomposition", () => {
   // pelo circuit breaker — mas agora precisa ser verificado nos DOIS saltos, senao a
   // extracao poderia remover o breaker do caminho sem nenhum teste reclamar.
   it("handleSingleModelChat should dispatch through the breaker seam", () => {
-    assert.match(src, /dispatchChatWithAffinityEviction\(/);
+    assert.match(
+      src,
+      /await\s+withRenewalOutcome\(\s*renewalOutcome,\s*dispatchChatWithAffinityEviction\s*\)\s*\(/
+    );
     assert.ok(dispatchSrc, "src/sse/handlers/chatDispatch.ts should exist");
     assert.match(dispatchSrc, /executeChatWithBreaker\(/);
   });
