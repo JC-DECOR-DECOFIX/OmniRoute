@@ -240,3 +240,25 @@ export function stopSessionAccountAffinityCleanupForTests(): void {
   clearInterval(cleanupTimer);
   cleanupTimer = null;
 }
+
+/**
+ * Active (non-expired) pins of one provider, for observability. Keys are already hashed
+ * (`<provider>:<sha256>`), so no session identifier is exposed.
+ */
+export function listSessionAccountAffinities(
+  provider: string,
+  now: number = Date.now()
+): Array<SessionAccountAffinityRecord & { keyHash: string }> {
+  if (!provider) return [];
+  const rows = getDbInstance()
+    .prepare("SELECT key, value FROM key_value WHERE namespace = ? AND key LIKE ?")
+    .all(NAMESPACE, `${provider}:%`) as Array<{ key?: unknown; value?: unknown }>;
+  const out: Array<SessionAccountAffinityRecord & { keyHash: string }> = [];
+  for (const row of rows) {
+    if (typeof row.key !== "string") continue;
+    const record = parseRecord(row.value);
+    if (!record || Date.parse(record.expiresAt) <= now) continue;
+    out.push({ ...record, keyHash: row.key.slice(provider.length + 1, provider.length + 17) });
+  }
+  return out.sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt));
+}

@@ -9,21 +9,12 @@
  * - Manual pin event: an operator pin (`x-omniroute-connection`) moved a session to an
  *   account different from the one it last used in this process.
  */
-import { hashSessionKey, recordAccountFailoverEvent } from "@/lib/db/accountFailoverEvents";
+import { recordAccountFailoverEvent } from "@/lib/db/accountFailoverEvents";
+import { trackSessionServed } from "../../services/accountSessionTracker";
 import * as log from "../../utils/logger";
 
 export const ACCOUNT_SELECTION_HEADER = "X-OmniRoute-Account-Selection";
 const HEADER_VALUE_RE = /^[\x20-\x7e]{1,300}$/;
-const MAX_TRACKED_SESSIONS = 5_000;
-
-declare global {
-  var __omnirouteManualPinSessions: Map<string, string> | undefined;
-}
-
-function manualPinSessions(): Map<string, string> {
-  if (!globalThis.__omnirouteManualPinSessions) globalThis.__omnirouteManualPinSessions = new Map();
-  return globalThis.__omnirouteManualPinSessions;
-}
 
 export interface AccountSelectionOutcome {
   provider: string;
@@ -76,23 +67,22 @@ export function finalizeAccountSelection(
         attempts: outcome.attemptedConnectionIds.length,
       });
     }
-    const sessionHash = hashSessionKey(outcome.sessionKey);
-    if (sessionHash) {
-      const sessions = manualPinSessions();
-      const previous = sessions.get(sessionHash);
-      if (outcome.forcedConnection && previous && previous !== finalId) {
-        recordAccountFailoverEvent({
-          provider: outcome.provider,
-          kind: "manual_pin",
-          fromConnectionId: previous,
-          toConnectionId: finalId,
-          reason: "x-omniroute-connection",
-          model: outcome.model,
-          sessionKey: outcome.sessionKey,
-        });
-      }
-      if (!sessions.has(sessionHash) && sessions.size >= MAX_TRACKED_SESSIONS) sessions.clear();
-      sessions.set(sessionHash, finalId);
+    const { previousConnectionId } = trackSessionServed({
+      provider: outcome.provider,
+      sessionKey: outcome.sessionKey,
+      connectionId: finalId,
+      model: outcome.model,
+    });
+    if (outcome.forcedConnection && previousConnectionId && previousConnectionId !== finalId) {
+      recordAccountFailoverEvent({
+        provider: outcome.provider,
+        kind: "manual_pin",
+        fromConnectionId: previousConnectionId,
+        toConnectionId: finalId,
+        reason: "x-omniroute-connection",
+        model: outcome.model,
+        sessionKey: outcome.sessionKey,
+      });
     }
   } catch (error) {
     log.warn("ACCOUNT_SELECTION", "audit skipped", {

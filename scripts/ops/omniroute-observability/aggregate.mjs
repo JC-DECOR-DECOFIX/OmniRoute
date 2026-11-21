@@ -3,6 +3,14 @@
 // Every text value taken from the database is validated against the shape it is expected to
 // have, or redacted and bounded when it is free text, before it reaches the report.
 
+import {
+  rankAccounts,
+  readFailoverEvents,
+  readGatewayRanking,
+  readRoutingPolicy,
+  readSessionPins,
+} from "./selection.mjs";
+
 export const SCHEMA = "omni-route-usage/v1";
 export const PROVIDER = "claude";
 
@@ -618,20 +626,33 @@ export function buildUsageReport(db, { now = Date.now(), authorized = [], gatewa
     : null;
 
   const history = switches(db, now, emailOf);
+  const policy = readRoutingPolicy(db, PROVIDER);
+  const selection = rankAccounts(accounts, {
+    now,
+    authorized: authorizedSet,
+    pins: readSessionPins(db, PROVIDER, now),
+    gateway: readGatewayRanking(db, PROVIDER, now),
+  });
   return {
     schema: SCHEMA,
     generatedAt: iso(now),
     gateway: { name: "Omni Route", ...gateway },
     pool: {
-      strategy: "priority",
+      strategy: policy.strategy,
       sameModelFirst: true,
       authorized: [...authorizedSet].map(shortId),
+      policy: { ...policy, quotaFreshMs: QUOTA_FRESH_MS },
+      chosen: selection.chosen,
+      reserve: selection.reserve,
+      selectionSource: selection.source,
+      gatewayEvaluatedAt: selection.gatewayEvaluatedAt,
     },
     current,
     inUse: active,
     accounts,
     lastSwitch: history[0] ?? null,
     switches: history,
+    failoverEvents: readFailoverEvents(db, PROVIDER),
     terminal: terminalStatus(db, now, served),
     thresholds: { quotaFreshMs: QUOTA_FRESH_MS, inUseWindowMs: IN_USE_WINDOW_MS },
   };

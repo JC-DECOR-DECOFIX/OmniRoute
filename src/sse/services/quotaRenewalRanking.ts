@@ -26,6 +26,7 @@
  */
 
 import { getQuotaCache } from "@/domain/quotaCache";
+import { saveAccountSelectionRanking } from "@/lib/db/accountSelectionDecisions";
 
 export const EARLIEST_QUOTA_RENEWAL_STRATEGY = "earliest-quota-renewal";
 export const EARLIEST_QUOTA_RENEWAL_POLICY = "EARLIEST_QUOTA_RENEWAL_FIRST";
@@ -375,10 +376,14 @@ export function describeSelection(ranking: QuotaRenewalRanking, connectionId: st
   return parts.join("; ");
 }
 
-// ─── Last ranking per provider (observability, process-local) ─────────────────
+// ─── Last ranking per provider (observability) ────────────────────────────────
+
+/** Persist on a change of order/tiers, or at most once per interval while unchanged. */
+const PERSIST_INTERVAL_MS = 60_000;
 
 interface RankingState {
   last: Map<string, QuotaRenewalRanking>;
+  persisted: Map<string, { signature: string; at: number }>;
 }
 
 declare global {
@@ -387,13 +392,32 @@ declare global {
 
 function rankingState(): RankingState {
   if (!globalThis.__omnirouteQuotaRenewalRankingState) {
-    globalThis.__omnirouteQuotaRenewalRankingState = { last: new Map() };
+    globalThis.__omnirouteQuotaRenewalRankingState = { last: new Map(), persisted: new Map() };
   }
   return globalThis.__omnirouteQuotaRenewalRankingState;
 }
 
+function signatureOf(ranking: QuotaRenewalRanking): string {
+  return [...ranking.ordered, ...ranking.excluded]
+    .map((d) => `${d.connectionId}:${d.tier}:${d.position ?? "-"}:${d.reason}:${d.resetAt ?? ""}`)
+    .join("|");
+}
+
 export function recordAccountSelectionRanking(provider: string, ranking: QuotaRenewalRanking) {
-  rankingState().last.set(provider, ranking);
+  const state = rankingState();
+  state.last.set(provider, ranking);
+  const signature = signatureOf(ranking);
+  const previous = state.persisted.get(provider);
+  const now = Date.parse(ranking.evaluatedAt);
+  if (previous && previous.signature === signature && now - previous.at < PERSIST_INTERVAL_MS) {
+    return;
+  }
+  state.persisted.set(provider, { signature, at: now });
+  try {
+    saveAccountSelectionRanking(provider, ranking);
+  } catch {
+    // Observability only: a failed write must never affect account selection.
+  }
 }
 
 export function getLastAccountSelectionRanking(provider: string): QuotaRenewalRanking | null {
@@ -402,4 +426,5 @@ export function getLastAccountSelectionRanking(provider: string): QuotaRenewalRa
 
 export function __resetQuotaRenewalRankingForTests() {
   rankingState().last.clear();
+  rankingState().persisted.clear();
 }
