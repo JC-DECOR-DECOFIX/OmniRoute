@@ -1,0 +1,720 @@
+{
+  "schema": "omni-route-usage/v1",
+  "generatedAt": "2026-11-19T19:42:43.501Z",
+  "gateway": {
+    "name": "Omni Route",
+    "build": "09966db7"
+  },
+  "pool": {
+    "strategy": "priority",
+    "sameModelFirst": true,
+    "authorized": [
+      "6726837b",
+      "598035c1",
+      "bd7bc37c"
+    ]
+  },
+  "current": {
+    "connectionId": "6726837b-0000-4000-8000-000000000001",
+    "shortId": "6726837b",
+    "email": "one@example.com",
+    "emailConfirmed": true,
+    "requestedModel": "claude-opus-5-5",
+    "effectiveModel": "claude-opus-5-5",
+    "at": "2026-11-19T19:42:41.267Z",
+    "source": "omniroute:call_logs"
+  },
+  "inUse": [
+    {
+      "connectionId": "6726837b-0000-4000-8000-000000000001",
+      "shortId": "6726837b",
+      "requests": 157,
+      "lastAt": "2026-11-19T19:42:41.267Z"
+    },
+    {
+      "connectionId": "598035c1-0000-4000-8000-000000000002",
+      "shortId": "598035c1",
+      "requests": 35,
+      "lastAt": "2026-11-19T19:39:27.240Z"
+    },
+    {
+      "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+      "shortId": "bd7bc37c",
+      "requests": 1,
+      "lastAt": "2026-11-19T19:38:36.260Z"
+    }
+  ],
+  "accounts": [
+    {
+      "connectionId": "6726837b-0000-4000-8000-000000000001",
+      "shortId": "6726837b",
+      "email": "one@example.com",
+      "emailSource": "omniroute:provider_connections (OAuth)",
+      "priority": 1,
+      "authorized": true,
+      "state": "active",
+      "stateUntil": null,
+      "testStatus": "active",
+      "inUse": true,
+      "servedLatest": true,
+      "lastServedAt": "2026-11-19T19:42:41.267Z",
+      "lastError": {
+        "at": "2026-11-19T19:41:55.317Z",
+        "status": 400,
+        "type": null,
+        "reason": "[400]: Tool reference 'list_projects' not found in available tools",
+        "model": "claude-opus-5-5"
+      },
+      "quota": {
+        "status": "fresh",
+        "fetchedAt": "2026-11-19T19:38:36.577Z",
+        "plan": "default_claude_max_20x",
+        "windows": {
+          "fiveHour": null,
+          "weekly": {
+            "usedPercent": 75,
+            "state": "reported",
+            "resetsAt": "2026-11-21T05:59:59.636Z",
+            "capturedAt": "2026-11-19T19:38:36.577Z",
+            "source": "anthropic:/api/oauth/usage via omniroute:quota_snapshots"
+          }
+        },
+        "source": "anthropic:/api/oauth/usage (subscription quota) read by Omni Route"
+      }
+    },
+    {
+      "connectionId": "598035c1-0000-4000-8000-000000000002",
+      "shortId": "598035c1",
+      "email": "two@example.com",
+      "emailSource": "omniroute:provider_connections (OAuth)",
+      "priority": 2,
+      "authorized": true,
+      "state": "active",
+      "stateUntil": null,
+      "testStatus": "active",
+      "inUse": true,
+      "servedLatest": false,
+      "lastServedAt": "2026-11-19T19:39:27.240Z",
+      "lastError": {
+        "at": "2026-11-19T19:39:34.968Z",
+        "status": 429,
+        "type": "rate_limited",
+        "reason": "[429]: This request would exceed your account's rate limit. Please try again later.",
+        "model": "claude-fable-5-2"
+      },
+      "quota": {
+        "status": "fresh",
+        "fetchedAt": "2026-11-19T19:39:34.689Z",
+        "plan": "default_raven",
+        "windows": {
+          "fiveHour": {
+            "usedPercent": 100,
+            "state": "reported",
+            "resetsAt": "2026-11-19T23:29:59.658Z",
+            "capturedAt": "2026-11-19T19:39:34.688Z",
+            "source": "anthropic:/api/oauth/usage via omniroute:quota_snapshots"
+          },
+          "weekly": {
+            "usedPercent": 76,
+            "state": "reported",
+            "resetsAt": "2026-11-22T14:59:59.658Z",
+            "capturedAt": "2026-11-19T19:39:34.689Z",
+            "source": "anthropic:/api/oauth/usage via omniroute:quota_snapshots"
+          }
+        },
+        "source": "anthropic:/api/oauth/usage (subscription quota) read by Omni Route"
+      }
+    },
+    {
+      "connectionId": "78dc4b41-0000-4000-8000-000000000004",
+      "shortId": "78dc4b41",
+      "email": "old@example.com",
+      "emailSource": "omniroute:provider_connections (OAuth)",
+      "priority": 3,
+      "authorized": false,
+      "state": "inactive",
+      "stateUntil": null,
+      "testStatus": "expired",
+      "inUse": false,
+      "servedLatest": false,
+      "lastServedAt": null,
+      "lastError": null,
+      "quota": {
+        "status": "stale",
+        "fetchedAt": "2026-10-16T03:33:14.795Z",
+        "plan": "default_raven",
+        "windows": {
+          "fiveHour": {
+            "usedPercent": 0,
+            "state": "reported",
+            "resetsAt": null,
+            "capturedAt": "2026-10-16T03:33:14.795Z",
+            "source": "anthropic:/api/oauth/usage via omniroute:providerLimitsCache"
+          },
+          "weekly": {
+            "usedPercent": null,
+            "state": "reset_pending_reading",
+            "resetsAt": "2026-10-16T08:59:59.913Z",
+            "capturedAt": "2026-10-16T03:33:14.795Z",
+            "source": "anthropic:/api/oauth/usage via omniroute:providerLimitsCache"
+          }
+        },
+        "source": "anthropic:/api/oauth/usage (subscription quota) read by Omni Route"
+      }
+    },
+    {
+      "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+      "shortId": "bd7bc37c",
+      "email": "three@example.com",
+      "emailSource": "omniroute:provider_connections (OAuth)",
+      "priority": 4,
+      "authorized": true,
+      "state": "active",
+      "stateUntil": null,
+      "testStatus": "active",
+      "inUse": true,
+      "servedLatest": false,
+      "lastServedAt": "2026-11-19T19:38:36.260Z",
+      "lastError": {
+        "at": "2026-11-19T16:58:59.941Z",
+        "status": 429,
+        "type": "rate_limited",
+        "reason": "[429]: This request would exceed your account's rate limit. Please try again later.",
+        "model": "claude-fable-5-2"
+      },
+      "quota": {
+        "status": "stale",
+        "fetchedAt": "2026-11-19T18:56:26.903Z",
+        "plan": "default_claude_max_20x",
+        "windows": {
+          "fiveHour": null,
+          "weekly": {
+            "usedPercent": 100,
+            "state": "reported",
+            "resetsAt": "2026-11-23T05:59:59.791Z",
+            "capturedAt": "2026-11-19T18:56:26.903Z",
+            "source": "anthropic:/api/oauth/usage via omniroute:providerLimitsCache"
+          }
+        },
+        "source": "anthropic:/api/oauth/usage (subscription quota) read by Omni Route"
+      }
+    }
+  ],
+  "lastSwitch": {
+    "at": "2026-11-19T19:39:43.112Z",
+    "correlationId": "7eb22861-0000-4000-8000-000000000005",
+    "from": {
+      "connectionId": "598035c1-0000-4000-8000-000000000002",
+      "shortId": "598035c1",
+      "email": "two@example.com"
+    },
+    "to": {
+      "connectionId": "6726837b-0000-4000-8000-000000000001",
+      "shortId": "6726837b",
+      "email": "one@example.com"
+    },
+    "reason": {
+      "status": 429,
+      "type": "rate_limited",
+      "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+    },
+    "requestedModel": "claude-opus-5-5",
+    "effectiveModel": "claude-opus-5-5",
+    "outcome": "served",
+    "outcomeStatus": 200,
+    "source": "omniroute:call_logs"
+  },
+  "switches": [
+    {
+      "at": "2026-11-19T19:39:43.112Z",
+      "correlationId": "7eb22861-0000-4000-8000-000000000005",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T19:39:39.453Z",
+      "correlationId": "e121fa46-0000-4000-8000-000000000006",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T19:39:32.699Z",
+      "correlationId": "7cc4bfda-0000-4000-8000-000000000007",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-sonnet-5",
+      "effectiveModel": "claude-sonnet-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T19:39:09.373Z",
+      "correlationId": "bb057b2e-0000-4000-8000-000000000008",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T18:00:15.367Z",
+      "correlationId": "70a0484d-0000-4000-8000-000000000009",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T18:00:13.007Z",
+      "correlationId": "26bdd832-0000-4000-8000-000000000010",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T17:59:19.610Z",
+      "correlationId": "5cb25d96-0000-4000-8000-000000000011",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-sonnet-5",
+      "effectiveModel": "claude-sonnet-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T17:19:36.020Z",
+      "correlationId": "3c6b0b84-0000-4000-8000-000000000012",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+        "shortId": "bd7bc37c",
+        "email": "three@example.com"
+      },
+      "reason": {
+        "status": 504,
+        "type": "server_error",
+        "summary": "Stream produced no non-ping SSE event within 160000ms"
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T16:59:22.060Z",
+      "correlationId": "5d8f0292-0000-4000-8000-000000000013",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T16:58:59.941Z",
+      "correlationId": "e1f6935c-0000-4000-8000-000000000014",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+        "shortId": "bd7bc37c",
+        "email": "three@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "failed",
+      "outcomeStatus": 429,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T16:58:43.374Z",
+      "correlationId": "899250f0-0000-4000-8000-000000000015",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-sonnet-5",
+      "effectiveModel": "claude-sonnet-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T16:51:29.039Z",
+      "correlationId": "2370d342-0000-4000-8000-000000000016",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T16:34:37.800Z",
+      "correlationId": "4723b291-0000-4000-8000-000000000017",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "reason": {
+        "status": 504,
+        "type": "server_error",
+        "summary": "Stream produced no non-ping SSE event within 115000ms"
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T14:23:24.480Z",
+      "correlationId": "08147b5c-0000-4000-8000-000000000018",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T13:42:59.820Z",
+      "correlationId": "2695de02-0000-4000-8000-000000000019",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+        "shortId": "bd7bc37c",
+        "email": "three@example.com"
+      },
+      "reason": {
+        "status": 504,
+        "type": "server_error",
+        "summary": "Stream produced no non-ping SSE event within 115000ms"
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "failed",
+      "outcomeStatus": 502,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T13:38:54.326Z",
+      "correlationId": "2695de02-0000-4000-8000-000000000019",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "reason": {
+        "status": 504,
+        "type": "server_error",
+        "summary": "Stream produced no non-ping SSE event within 115000ms"
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "failed",
+      "outcomeStatus": 502,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T13:04:25.373Z",
+      "correlationId": "4ba85205-0000-4000-8000-000000000020",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T00:34:04.269Z",
+      "correlationId": "be5d56ba-0000-4000-8000-000000000021",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+        "shortId": "bd7bc37c",
+        "email": "three@example.com"
+      },
+      "reason": {
+        "status": 504,
+        "type": "server_error",
+        "summary": "Stream produced no non-ping SSE event within 115000ms"
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "failed",
+      "outcomeStatus": 429,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-19T00:28:06.736Z",
+      "correlationId": "4c0943e4-0000-4000-8000-000000000022",
+      "from": {
+        "connectionId": "6726837b-0000-4000-8000-000000000001",
+        "shortId": "6726837b",
+        "email": "one@example.com"
+      },
+      "to": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "reason": {
+        "status": 429,
+        "type": "rate_limited",
+        "summary": "[429]: This request would exceed your account's rate limit. Please try again later."
+      },
+      "requestedModel": "claude-fable-5-2",
+      "effectiveModel": "claude-fable-5-2",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    },
+    {
+      "at": "2026-11-18T16:03:37.247Z",
+      "correlationId": "fdda1595-0000-4000-8000-000000000023",
+      "from": {
+        "connectionId": "598035c1-0000-4000-8000-000000000002",
+        "shortId": "598035c1",
+        "email": "two@example.com"
+      },
+      "to": {
+        "connectionId": "bd7bc37c-0000-4000-8000-000000000003",
+        "shortId": "bd7bc37c",
+        "email": "three@example.com"
+      },
+      "reason": {
+        "status": 502,
+        "type": "server_error",
+        "summary": "Stream ended before producing a non-ping SSE event"
+      },
+      "requestedModel": "claude-opus-5-5",
+      "effectiveModel": "claude-opus-5-5",
+      "outcome": "served",
+      "outcomeStatus": 200,
+      "source": "omniroute:call_logs"
+    }
+  ],
+  "thresholds": {
+    "quotaFreshMs": 600000,
+    "inUseWindowMs": 300000
+  },
+  "observer": {
+    "status": "fresh",
+    "lastSuccessAt": "2026-11-19T19:42:43.685Z",
+    "lastError": null,
+    "pollIntervalMs": 15000,
+    "servedAt": "2026-11-19T19:42:43.685Z"
+  }
+}

@@ -11,6 +11,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   buildUsageReport,
+  redactCredentials,
   sanitizeReason,
 } from "../../scripts/ops/omniroute-observability/aggregate.mjs";
 import {
@@ -553,6 +554,34 @@ test("text fields that do not have their expected shape are dropped", () => {
   assert.equal(r.current.requestedModel, null);
   assert.equal(account(r, A).quota.plan, null);
   assert.equal(account(r, B).quota.plan, "team");
+});
+
+test("a model name that holds a credential is dropped", () => {
+  for (const [requested, effective] of [
+    ["oma_abcdefghij0123456789", "claude/sk-ant-oat01-abcdefghij"],
+    ["claude/token=abc123", "claude-0123456789abcdef0123456789abcdef"],
+  ]) {
+    const db = fixture();
+    db.prepare(
+      `INSERT INTO call_logs VALUES ('cred', ?, 200, ?, ?, 'claude', 'one@example.com', ?, NULL, NULL, NULL, NULL, NULL)`
+    ).run(at(0.1), requested, effective, A);
+    const r = buildUsageReport(db, { now: NOW, authorized: [A] });
+    assert.equal(r.current.connectionId, A);
+    assert.equal(r.current.requestedModel, null);
+    assert.equal(r.current.effectiveModel, null);
+    assert.doesNotMatch(JSON.stringify(r), /oma_|sk-ant|token=|0123456789abcdef0123/);
+  }
+});
+
+test("redactCredentials replaces credentials and keeps model names", () => {
+  assert.equal(redactCredentials("x oma_abc-123 y"), "x [redacted] y");
+  assert.equal(redactCredentials("Bearer abc.def"), "[redacted]");
+  assert.equal(redactCredentials("sk-ant-oat01-abc"), "[redacted]");
+  assert.equal(
+    redactCredentials("claude-opus-4-1-20250805-thinking-extended-1m"),
+    "claude-opus-4-1-20250805-thinking-extended-1m"
+  );
+  assert.equal(redactCredentials("one@example.com"), "one@example.com");
 });
 
 test("a cache entry without quotas does not hide a valid snapshot", () => {
@@ -1373,7 +1402,7 @@ test("refresh configuration is validated", (t) => {
   assert.deepEqual(refreshSettings(config({ ...base, refresh })), {
     baseUrl: "http://127.0.0.1:20128",
     tokenFile: refresh.tokenFile,
-    minIntervalMs: 120_000,
+    minIntervalMs: 300_000,
     requestPollMs: 2_000,
     timeoutMs: 60_000,
   });
@@ -1697,13 +1726,13 @@ test("the service reads refresh requests through the daemon and answers them", a
   assert.equal(get.url, "/v0/artifacts/art1/api/v1/kv/entry?key=omni-route%2Frefresh-request");
   assert.equal(get.authorization, "Bearer daemon-token");
   const { refresh } = answered().body.value;
-  assert.equal(refresh.minIntervalMs, 120_000);
+  assert.equal(refresh.minIntervalMs, 300_000);
   assert.equal(refresh.last.requestVersion, version(7));
   assert.equal(refresh.last.error, "not_configured");
   // The first report already carries the refresh state, before any request is answered.
   const firstPut = daemon.requests.find((r) => r.method === "PUT");
   assert.deepEqual(firstPut.body.value.refresh, {
-    minIntervalMs: 120_000,
+    minIntervalMs: 300_000,
     nextAllowedAt: null,
     last: null,
   });
@@ -2198,7 +2227,7 @@ test("NODE_DEBUG disables the gateway credential", () => {
   assert.equal(debugLogsRequests({ NODE_DEBUG: "net,tls" }), true);
 });
 
-test("the service with NODE_DEBUG set never sends the gateway token", async (t) => {
+test("the service with NODE_DEBUG set sends no credential", async (t) => {
   const { dir, write } = privateDir(t);
   const gateway = await fakeGateway(t, (_req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
@@ -2229,17 +2258,47 @@ test("the service with NODE_DEBUG set never sends the gateway token", async (t) 
         tokenFile: write("omniroute-access-token", GATEWAY_TOKEN),
         requestPollMs: 500,
       },
+      card: { artifactId: "card1" },
     })
   );
+  // Node prints each connection's options, headers included, when NODE_DEBUG names `net`.
   const service = startService(t, configPath, { ...process.env, NODE_DEBUG: "http,https,net" });
-  const answered = () =>
-    daemon.requests.find((r) => r.method === "PUT" && r.body.value.refresh?.last);
-  await waitFor(answered);
-  assert.equal(answered().body.value.refresh.last.error, "not_configured");
-  assert.equal(gateway.seen.length, 0);
+  await waitFor(() => /refresh state not restored/.test(service.stdout()));
+  await waitFor(() => /card state not read/.test(service.stdout()));
+  assert.match(service.stdout(), /daemon and gateway calls disabled while NODE_DEBUG is set/);
   assert.match(service.stdout(), /refresh disabled while NODE_DEBUG is set/);
-  assert.equal(service.stderr().includes(GATEWAY_TOKEN), false);
-  assert.equal(service.stdout().includes(GATEWAY_TOKEN), false);
+  assert.match(service.stdout(), /happy kv read not sent while NODE_DEBUG is set/);
+  assert.equal(daemon.requests.length, 0);
+  assert.equal(gateway.seen.length, 0);
+  for (const secret of [GATEWAY_TOKEN, "daemon-token"]) {
+    assert.equal(service.stderr().includes(secret), false);
+    assert.equal(service.stdout().includes(secret), false);
+  }
+});
+
+test("with NODE_DEBUG set an exchange sends a request only without a credential", async (t) => {
+  const { dir } = privateDir(t);
+  const daemon = await fakeDaemon(t, dir);
+  const previous = process.env.NODE_DEBUG;
+  process.env.NODE_DEBUG = "net";
+  t.after(() => {
+    if (previous === undefined) delete process.env.NODE_DEBUG;
+    else process.env.NODE_DEBUG = previous;
+  });
+  const call = (headers) =>
+    exchange({
+      options: { socketPath: daemon.socketPath, path: "/x", method: "GET", headers },
+      deadlineMs: 5_000,
+      label: "happy kv read",
+    });
+  await assert.rejects(
+    call({ Authorization: "Bearer daemon-token" }),
+    (error) =>
+      error.kind === "network" && error.message === "happy kv read not sent while NODE_DEBUG is set"
+  );
+  assert.equal(daemon.requests.length, 0);
+  await call({ accept: "application/json" });
+  assert.equal(daemon.requests.length, 1);
 });
 
 test("an exchange whose request cannot be created fails like a network error", async () => {
@@ -2306,7 +2365,7 @@ test("the service publishes nothing and answers nothing until its last state is 
   const previous = {
     schema: "omni-route-usage/v1",
     refresh: {
-      minIntervalMs: 120_000,
+      minIntervalMs: 300_000,
       nextAllowedAt: new Date(answeredAt + 120_000).toISOString(),
       last: {
         requestVersion: version(7),

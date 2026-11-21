@@ -1,0 +1,45 @@
+{
+  "genui": 1,
+  "fallback": "Claude · Omni Route, lido 16:38 de 19/11: em uso a conta 1 (one@example.com), semana em 75%, renova sáb 21/11 02:59. Conta 2 com 5 h em 100% até 20:29; conta 3 com semana em 100% até seg 23/11 02:59.",
+  "root": {
+    "type": "card",
+    "title": "Claude · Omni Route",
+    "badge": { "text": "Desatualizado · lido 19/11 16:38", "tone": "warning" },
+    "children": [
+      {
+        "type": "keyvalue",
+        "items": [
+          { "label": "Em uso agora", "value": "Conta 1 · one@example.com", "icon": "user" },
+          { "label": "Modelo", "value": "claude-opus-5-5" },
+          { "label": "Última requisição", "value": "19/11 16:42:41", "icon": "clock" }
+        ]
+      },
+      {
+        "type": "table",
+        "columns": [
+          { "key": "conta", "label": "Conta" },
+          { "key": "h5", "label": "5 h", "kind": "number" },
+          { "key": "h5z", "label": "5 h zera" },
+          { "key": "sem", "label": "Semana", "kind": "number" },
+          { "key": "semr", "label": "Semana renova" },
+          { "key": "estado", "label": "Estado", "kind": "badge" }
+        ],
+        "rows": [
+          { "conta": "1 · one@example.com", "h5": "—", "h5z": "—", "sem": "75%", "semr": "sáb 21/11 02:59", "estado": { "text": "Ativa", "tone": "accent" } },
+          { "conta": "2 · two@example.com", "h5": { "text": "100%", "tone": "danger" }, "h5z": "qui 19/11 20:29", "sem": "76%", "semr": "dom 22/11 11:59", "estado": { "text": "Em uso" } },
+          { "conta": "3 · three@example.com", "h5": "—", "h5z": "—", "sem": { "text": "100%", "tone": "danger" }, "semr": "seg 23/11 02:59", "estado": { "text": "Desatualizado", "tone": "warning" } }
+        ],
+        "caption": "“—”: a Anthropic não informou a janela de 5 h dessa conta. Fora do pool: old@example.com, expirada."
+      },
+      {
+        "type": "keyvalue",
+        "items": [
+          { "label": "Última troca", "value": "19/11 16:39 · conta 2 → conta 1", "icon": "arrow-right" },
+          { "label": "Motivo", "value": "429 · limite de taxa da conta" },
+          { "label": "Resultado", "value": "mesmo modelo (claude-opus-5-5), atendida" }
+        ]
+      },
+      { "type": "text", "variant": "caption", "text": "Fonte: Omni Route · cota de assinatura lida em api.anthropic.com/api/oauth/usage · cartão republicado quando algo muda, no máximo a cada 5 min" }
+    ]
+  }
+}
