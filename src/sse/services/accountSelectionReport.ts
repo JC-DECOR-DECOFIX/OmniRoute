@@ -4,7 +4,7 @@
  * explicitly from the connection row; tokens, cookies, keys, request bodies and raw session
  * identifiers are never read into the report. Times are UTC ISO strings; the UI formats BRT.
  */
-import { getProviderConnections } from "@/lib/db/providers";
+import { getRawProviderConnections } from "@/lib/db/providers";
 import { getSettings } from "@/lib/db/settings";
 import { getProviderLimitsCache } from "@/lib/db/providerLimits";
 import { listSessionAccountAffinities } from "@/lib/db/sessionAccountAffinity";
@@ -58,9 +58,17 @@ export async function buildAccountSelectionReport(provider = "claude", now = Dat
     str(overrides[provider]?.fallbackStrategy) || str(settings.fallbackStrategy) || "fill-first";
   const sessionAffinityTtlMs = resolveSessionAffinityTtlMs(provider, {}, settings as never);
 
-  const rows = ((await getProviderConnections({ provider })) as unknown as Row[]).filter(
-    (row) => typeof row.id === "string"
-  );
+  // Metadata columns only: no credential column is selected or decrypted.
+  const rows = (
+    (await getRawProviderConnections({ provider }, undefined, undefined, [
+      "id",
+      "email",
+      "priority",
+      "is_active",
+      "test_status",
+      "rate_limited_until",
+    ])) as unknown as Row[]
+  ).filter((row) => typeof row.id === "string");
   const blocked = new Map(rows.map((row) => [row.id as string, blockedReasons(row, now)]));
   const candidates = rows
     .filter((row) => blocked.get(row.id as string)!.length === 0)
