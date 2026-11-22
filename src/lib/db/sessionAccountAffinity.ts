@@ -108,6 +108,36 @@ export function upsertSessionAccountAffinity(
     .run(NAMESPACE, key, JSON.stringify(record));
 }
 
+/**
+ * Atomic first-writer-wins pin creation. Inside one SQLite write transaction: when a
+ * non-expired pin already exists it is kept (and returned); otherwise `connectionId` is
+ * written. Concurrent first requests of the same session therefore all converge on the
+ * pin of whichever request committed first. Returns the pinned connection id, or null
+ * when the TTL is disabled.
+ */
+export function claimSessionAccountAffinity(
+  sessionKey: string,
+  provider: string,
+  connectionId: string,
+  now: number = Date.now(),
+  ttlMs = 0
+): string | null {
+  const normalizedTtlMs = normalizePositiveTtl(ttlMs);
+  if (!sessionKey || !provider || !connectionId || normalizedTtlMs <= 0) return null;
+
+  const db = getDbInstance();
+  const claim = db.transaction(() => {
+    const existing = getSessionAccountAffinity(sessionKey, provider, normalizedTtlMs, now);
+    if (existing) return existing.connectionId;
+    upsertSessionAccountAffinity(sessionKey, provider, connectionId, now, normalizedTtlMs);
+    return connectionId;
+  });
+  // BEGIN IMMEDIATE (better-sqlite3) takes the write lock before the read, so another
+  // process cannot interleave; the synchronous driver already serializes this process.
+  const immediate = (claim as unknown as { immediate?: () => string }).immediate;
+  return typeof immediate === "function" ? immediate.call(claim) : claim();
+}
+
 export function touchSessionAccountAffinity(
   sessionKey: string,
   provider: string,
@@ -209,4 +239,26 @@ export function stopSessionAccountAffinityCleanupForTests(): void {
   if (!cleanupTimer) return;
   clearInterval(cleanupTimer);
   cleanupTimer = null;
+}
+
+/**
+ * Active (non-expired) pins of one provider, for observability. Keys are already hashed
+ * (`<provider>:<sha256>`), so no session identifier is exposed.
+ */
+export function listSessionAccountAffinities(
+  provider: string,
+  now: number = Date.now()
+): Array<SessionAccountAffinityRecord & { keyHash: string }> {
+  if (!provider) return [];
+  const rows = getDbInstance()
+    .prepare("SELECT key, value FROM key_value WHERE namespace = ? AND key LIKE ?")
+    .all(NAMESPACE, `${provider}:%`) as Array<{ key?: unknown; value?: unknown }>;
+  const out: Array<SessionAccountAffinityRecord & { keyHash: string }> = [];
+  for (const row of rows) {
+    if (typeof row.key !== "string") continue;
+    const record = parseRecord(row.value);
+    if (!record || Date.parse(record.expiresAt) <= now) continue;
+    out.push({ ...record, keyHash: row.key.slice(provider.length + 1, provider.length + 17) });
+  }
+  return out.sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt));
 }

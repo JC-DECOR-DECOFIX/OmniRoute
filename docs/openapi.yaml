@@ -3057,6 +3057,31 @@ paths:
         "200":
           description: Connection usage data
 
+  /api/usage/account-selection:
+    get:
+      tags: [Usage]
+      summary: EARLIEST_QUOTA_RENEWAL_FIRST account ranking, session pins and failovers
+      description: >
+        Credential-free report of the account selection for one provider: per-account 5h and
+        weekly windows (UTC), tier (A, B, out, blocked), position, reason, data freshness and last
+        sync, the chosen and reserve accounts, persisted session pins (hashed keys), recent
+        sessions with their effective model and the failover log. Requires management auth.
+      parameters:
+        - name: provider
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: "^[a-z0-9-]{1,40}$"
+            default: claude
+      responses:
+        "200":
+          description: Account selection report (schema omni-route-account-selection/v1)
+        "400":
+          description: Invalid provider
+        "401":
+          description: Management authentication required
+
   /api/usage/history:
     get:
       tags: [Usage]

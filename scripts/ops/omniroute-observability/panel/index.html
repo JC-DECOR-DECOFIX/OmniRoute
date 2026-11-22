@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude · Omni Route</title>
+<link rel="stylesheet" href="/api/v1/style.css">
+<script src="/api/v1/client.js"></script>
+<style>
+  .panel { max-width: 336px; min-width: 0; box-sizing: border-box; display: flex; flex-direction: column; border: 1px solid var(--happy-border); border-radius: 10px; font-family: var(--happy-font); color: var(--happy-text); }
+  .p-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; }
+  .p-title { font-size: 13px; font-weight: 600; }
+  .p-head .badge { margin-left: auto; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px; font-size: 11px; line-height: 16px; font-weight: 500; border-radius: 999px; background: var(--color-background-secondary, color-mix(in srgb, var(--happy-text) 6%, transparent)); color: var(--happy-muted); white-space: nowrap; flex: none; }
+  .b-ok { background: var(--color-background-success, color-mix(in srgb, #32d74b 14%, transparent)); color: var(--color-text-success, #32d74b); }
+  .b-warn { background: var(--color-background-warning, color-mix(in srgb, #ffab00 15%, transparent)); color: var(--color-text-warning, #ffab00); }
+  .b-info { background: var(--color-background-info, color-mix(in srgb, #0a84ff 12%, transparent)); color: var(--color-text-info, #0a84ff); }
+  .b-sol { background: color-mix(in srgb, #bf5af2 14%, transparent); color: #bf5af2; }
+  .sec { padding: 8px 12px; border-top: 1px solid var(--happy-border); display: flex; flex-direction: column; gap: 6px; }
+  .sec-h { font-size: 11px; font-weight: 600; color: var(--happy-faint); text-transform: uppercase; letter-spacing: .04em; display: flex; gap: 6px; align-items: center; }
+  .sec-h .r { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; font-variant-numeric: tabular-nums; }
+  .mono { font-family: var(--happy-mono); font-size: 11px; }
+  .faint { color: var(--happy-faint); }
+  .kv { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 2px 8px; font-size: 12px; line-height: 18px; margin: 0; }
+  .kv dt { color: var(--happy-muted); }
+  .kv dd { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kv dd.wrap { white-space: normal; overflow-wrap: anywhere; }
+  .bar { display: grid; grid-template-columns: 52px minmax(0, 1fr) 36px; align-items: center; gap: 8px; font-size: 12px; min-height: 18px; }
+  .bar .lbl { color: var(--happy-muted); }
+  .bar .pct { text-align: right; font-variant-numeric: tabular-nums; }
+  .track { display: block; height: 6px; border-radius: 999px; background: var(--color-background-tertiary, color-mix(in srgb, var(--happy-text) 12%, transparent)); overflow: hidden; }
+  .fill { display: block; height: 100%; border-radius: 999px; background: var(--happy-text); }
+  .fill.hi { background: var(--color-text-warning, #ffab00); }
+  .fill.full { background: var(--color-text-danger, #f48fb1); }
+  .bar-sub { font-size: 11px; color: var(--happy-faint); padding-left: 60px; margin-top: -3px; }
+  .bar-sub:empty, .out:empty { display: none; }
+  .na { font-size: 12px; color: var(--happy-faint); }
+  .more { font-size: 11px; color: var(--happy-faint); }
+  .accts { display: flex; flex-direction: column; }
+  .a { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 8px; margin: 0 -8px; border-radius: 8px; font-size: 12px; }
+  .a.on { background: var(--happy-selected-background, color-mix(in srgb, var(--happy-text) 8%, transparent)); }
+  .a .pr { color: var(--happy-faint); font-variant-numeric: tabular-nums; }
+  .a .em { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .a .mini { grid-column: 2 / 4; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+  .mini .m { display: grid; grid-template-columns: 28px minmax(0, 1fr) 30px; align-items: center; gap: 6px; font-size: 11px; color: var(--happy-muted); font-variant-numeric: tabular-nums; }
+  .mini .m span:last-child { text-align: right; }
+  .mini .track { height: 4px; }
+  .a .rn { grid-column: 2 / 4; font-size: 11px; line-height: 15px; color: var(--happy-faint); font-variant-numeric: tabular-nums; }
+  .a .ord { grid-column: 2 / 4; font-size: 11px; line-height: 15px; color: var(--color-text-success, #0a7f6f); font-variant-numeric: tabular-nums; }
+  .a .ord.out { color: var(--color-text-warning, #ffab00); }
+  .panel [hidden] { display: none !important; }
+  .out { font-size: 11px; color: var(--happy-faint); padding-top: 2px; }
+  .sep { border-top: 1px dashed var(--happy-border); margin: 4px 0 0; }
+  .sw { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .sw li { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 0 8px; font-size: 12px; line-height: 16px; }
+  .sw .t { color: var(--happy-faint); font-variant-numeric: tabular-nums; }
+  .sw .why { color: var(--happy-muted); font-size: 11px; grid-column: 2; }
+  .foot { padding: 8px 12px 10px; border-top: 1px solid var(--happy-border); font-size: 11px; line-height: 16px; color: var(--happy-faint); }
+  .p-act { display: flex; align-items: center; gap: 8px; padding: 0 12px 10px; min-height: 24px; }
+  .btn { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 9px; flex: none; font: inherit; font-size: 12px; font-weight: 500; line-height: 16px; color: var(--happy-text); background: transparent; border: 1px solid var(--happy-border); border-radius: 6px; cursor: pointer; }
+  .btn:hover:not(:disabled) { background: color-mix(in srgb, var(--happy-text) 6%, transparent); }
+  .btn:focus-visible { outline: 2px solid var(--happy-accent); outline-offset: 1px; }
+  .btn:disabled { cursor: default; color: var(--happy-muted); }
+  .btn svg { width: 12px; height: 12px; flex: none; }
+  .btn.busy svg { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .btn.busy svg { animation: none; } }
+  .rf-msg { min-width: 0; font-size: 11px; line-height: 15px; color: var(--happy-faint); }
+  .rf-msg.ok { color: var(--color-text-success, #32d74b); }
+  .rf-msg.warn { color: var(--color-text-warning, #ffab00); }
+</style>
+</head>
+<body>
+<div class="panel" aria-label="Painel Claude · Omni Route">
+  <div class="p-head">
+    <span class="p-title">Claude · Omni Route</span>
+    <span class="badge" id="state">Consultando…</span>
+  </div>
+  <div class="p-act">
+    <button type="button" class="btn" id="rf-btn" disabled>
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>
+      <span id="rf-label">Atualizar</span>
+    </button>
+    <span class="rf-msg" id="rf-msg" role="status" aria-live="polite"></span>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h">Conta da última requisição <span class="r mono" id="cur-at"></span></div>
+    <dl class="kv">
+      <dt>E-mail</dt><dd class="wrap" id="cur-email">Indisponível</dd>
+      <dt>Conta</dt><dd class="mono" id="cur-id">—</dd>
+      <dt>Solicitado</dt><dd id="cur-req">—</dd>
+      <dt>Efetivo</dt><dd id="cur-eff">—</dd>
+    </dl>
+    <div class="bar" id="cur-5h"></div>
+    <div class="bar-sub" id="cur-5h-sub"></div>
+    <div class="bar" id="cur-wk"></div>
+    <div class="bar-sub" id="cur-wk-sub"></div>
+  </div>
+
+  <div class="sec" id="sel" hidden>
+    <div class="sec-h">Escolha de conta <span class="r">renovação mais cedo primeiro</span></div>
+    <dl class="kv">
+      <dt>Sessão nova</dt><dd id="sel-next">—</dd>
+      <dt></dt><dd class="faint wrap" id="sel-next-why"></dd>
+      <dt>Reserva</dt><dd id="sel-res">—</dd>
+      <dt></dt><dd class="faint wrap" id="sel-res-why"></dd>
+      <dt>Sessões</dt><dd id="sel-pins">0 fixadas em contas</dd>
+      <dt></dt><dd class="faint wrap">cada sessão fica na mesma conta até <span id="sel-ttl">60 min</span> sem uso ou até a cota dela acabar</dd>
+    </dl>
+    <div class="sec-h" id="sel-ses-h" style="margin-top:4px" hidden>Sessões fixadas</div>
+    <ul class="sw" id="sel-ses" hidden></ul>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h">Contas <span class="r" id="in-use"></span></div>
+    <div class="accts" id="accts"></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h">Alternâncias <span class="r">últimos 7 dias</span></div>
+    <ul class="sw" id="sw"></ul>
+    <div class="more" id="more"></div>
+  </div>
+
+  <div class="foot">
+    Fonte: Omni Route (registros por requisição) · cota de assinatura lida pelo Omni Route em api.anthropic.com/api/oauth/usage, não consumo de API · <span id="foot-sel" hidden>ordem de escolha decidida pelo Omni Route a cada sessão nova · </span>o painel redesenha a cada 15 s · Atualizar relê a cota na hora (no máximo 1 vez a cada <span id="rf-min">2 min</span>)
+  </div>
+</div>
+
+<script>
+(() => {
+  const KEY = "omni-route/usage";
+  // The publisher writes at least once a minute; older than this, the service has stopped.
+  const LIVE_MS = 150000;
+  const MAX_SWITCHES = 6;
+
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  };
+  const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+  const str = (v) => (typeof v === "string" && v ? v : null);
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const pct = (v) => { const n = num(v); return n !== null && n >= 0 && n <= 100 ? n : null; };
+  // Only the canonical ISO 8601 UTC form the service emits; Date.parse alone accepts "x 5".
+  const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+  const time = (v) => {
+    const s = str(v);
+    if (!s || !ISO.test(s)) return null;
+    const ms = Date.parse(s);
+    if (!Number.isFinite(ms)) return null;
+    // Date.parse rolls impossible dates over (02-30 becomes 03-02); only a round trip is real.
+    const fraction = (s.match(/\.(\d{1,3})Z$/) || [, ""])[1].padEnd(3, "0");
+    const canonical = `${s.slice(0, 19)}.${fraction}Z`;
+    const d = new Date(ms);
+    return d.toISOString() === canonical ? d : null;
+  };
+  // Tolerated clock difference between this device and the Mac before a reading counts as wrong.
+  const CLOCK_SKEW_MS = 60000;
+
+  const hm = (d) => d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  const hms = (d) => d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const dm = (d) => d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  const when = (d) => (sameDay(d, new Date()) ? hm(d) : `${dm(d)} ${hm(d)}`);
+  const resetText = (d) => {
+    const wd = d.toLocaleDateString("pt-BR", { weekday: "short" }).replace(".", "");
+    return sameDay(d, new Date()) ? `hoje ${hm(d)}` : `${wd} ${dm(d)} ${hm(d)}`;
+  };
+
+  function badge(node, text, kind) {
+    node.className = "badge" + (kind ? ` b-${kind}` : "");
+    node.textContent = text;
+  }
+
+  function fillClass(p) { return p >= 95 ? "fill full" : p >= 80 ? "fill hi" : "fill"; }
+  function track(p) {
+    const t = el("span", "track");
+    const f = el("span", fillClass(p));
+    f.style.width = `${p}%`;
+    t.append(f);
+    return t;
+  }
+
+  /**
+   * A quota as the panel may show it. `known` is false when Omni Route holds no confirmed reading
+   * of the account: then no number is shown at all.
+   */
+  function quotaOf(account) {
+    const q = account && isObj(account.quota) ? account.quota : null;
+    const readAt = q ? time(q.fetchedAt) : null;
+    if (!q || str(q.status) === "unavailable" || !readAt || !isObj(q.windows)) {
+      return { known: false, readAt: null, stale: true, windows: { fiveHour: null, weekly: null } };
+    }
+    const windowOf = (name) => {
+      // The report always names both windows; a missing key is a malformed reading.
+      if (!(name in q.windows)) return { kind: "invalid" };
+      const w = q.windows[name];
+      // Null: the vendor did not report this window in the reading.
+      if (w === null) return { kind: "absent" };
+      if (!isObj(w)) return { kind: "invalid" };
+      const resetsAt = time(w.resetsAt);
+      if (str(w.state) === "reset_pending_reading") return { kind: "reset", resetsAt };
+      const used = pct(w.usedPercent);
+      if (used === null) return { kind: "invalid" };
+      // A window whose reset passed since it was read no longer describes the account.
+      if (resetsAt && resetsAt.getTime() <= Date.now()) return { kind: "reset", resetsAt };
+      return { kind: "value", used, resetsAt, capturedAt: time(w.capturedAt) };
+    };
+    const windows = { fiveHour: windowOf("fiveHour"), weekly: windowOf("weekly") };
+    const kinds = [windows.fiveHour.kind, windows.weekly.kind];
+    // A malformed window, or a reading that reports neither window, cannot be trusted.
+    if (kinds.includes("invalid") || kinds.every((k) => k === "absent")) {
+      return { known: false, readAt: null, stale: true, windows: { fiveHour: null, weekly: null } };
+    }
+    // Each shown number carries its own read time; the oldest one decides how current the panel is.
+    const captures = [windows.fiveHour, windows.weekly].filter((w) => w.kind === "value").map((w) => w.capturedAt);
+    const oldestAt = captures.length && captures.every(Boolean) ? new Date(Math.min(...captures.map((d) => d.getTime()))) : null;
+    const stale = str(q.status) !== "fresh" || kinds.includes("reset") || (captures.length > 0 && oldestAt === null);
+    return { known: true, readAt, oldestAt, stale, windows };
+  }
+
+  function drawMainWindow(barId, subId, label, quota, name) {
+    const bar = $(barId), sub = $(subId);
+    bar.replaceChildren(el("span", "lbl", label));
+    sub.textContent = "";
+    const w = quota.known ? quota.windows[name] : null;
+    if (!w || w.kind === "invalid") { bar.append(el("span", "na", "Indisponível"), el("span")); return; }
+    if (w.kind === "absent") { bar.append(el("span", "na", "Não reportada pela Anthropic"), el("span")); return; }
+    if (w.kind === "reset") {
+      bar.append(el("span", "na", "Indisponível"), el("span"));
+      sub.textContent = w.resetsAt ? `Renovou ${when(w.resetsAt)} · aguardando nova leitura` : "Renovou · aguardando nova leitura";
+      return;
+    }
+    bar.append(track(w.used), el("span", "pct", `${Math.round(w.used)}%`));
+    const parts = [w.resetsAt ? `Renova ${resetText(w.resetsAt)}` : "Renovação não informada"];
+    const read = w.capturedAt || quota.readAt;
+    if (read) parts.push(`lido ${when(read)}`);
+    sub.textContent = parts.join(" · ");
+  }
+
+  function miniWindow(label, w) {
+    const m = el("div", "m");
+    m.append(el("span", null, label));
+    if (w && w.kind === "reset") { m.append(el("span", "faint", "Indisponível"), el("span")); return m; }
+    if (!w || w.kind !== "value") { m.append(el("span", "faint", "—"), el("span")); return m; }
+    m.append(track(w.used), el("span", null, `${Math.round(w.used)}%`));
+    return m;
+  }
+
+  /** When the account's weekly window renews; empty when the reading has no weekly window. */
+  function renewText(w) {
+    if (!w) return "";
+    if (w.kind === "reset") return w.resetsAt ? `Semanal renovou ${when(w.resetsAt)} · aguardando nova leitura` : "Semanal renovou · aguardando nova leitura";
+    if (w.kind !== "value") return "";
+    return w.resetsAt ? `Semanal renova ${resetText(w.resetsAt)}` : "Renovação semanal não informada";
+  }
+
+  function accountBadge(a, quota, isCurrent) {
+    if (isCurrent) return ["Ativa", "info"];
+    if (a.state === "cooldown") { const u = time(a.stateUntil); return [u ? `Em espera até ${hm(u)}` : "Em espera", "warn"]; }
+    if (a.state !== "active") return ["Indisponível", null];
+    if (!quota.known) return ["Indisponível", null];
+    if (quota.stale) return ["Desatualizado", "warn"];
+    if (a.inUse === true) return ["Em uso", null];
+    return ["Ociosa", null];
+  }
+
+  const REASONS = [
+    [/would exceed your account's rate limit/i, "limite de taxa da conta"],
+    [/usage limit|limit reached/i, "limite de uso da conta"],
+    [/Stream ended before producing/i, "stream terminou sem resposta"],
+    [/no non-ping SSE event within|did not start within|timed? ?out|TIMEOUT/i, "sem resposta dentro do prazo"],
+    [/fetch failed/i, "falha de conexão com a Anthropic"],
+    [/overloaded/i, "Anthropic sobrecarregada"],
+    [/unauthori[sz]ed|invalid_grant|authentication/i, "autenticação recusada"],
+  ];
+  function reasonText(reason) {
+    const summary = str(reason && reason.summary) || "";
+    for (const [pattern, text] of REASONS) if (pattern.test(summary)) return text;
+    return summary.replace(/^\[\d+\]:\s*/, "") || "motivo não registrado";
+  }
+
+  /** Only a complete report is shown; anything else is treated as no report at all. */
+  function valid(v) {
+    if (!isObj(v) || v.schema !== "omni-route-usage/v1" || !time(v.generatedAt)) return false;
+    if (!isObj(v.observer) || !str(v.observer.status)) return false;
+    if (!isObj(v.pool) || !Array.isArray(v.pool.authorized)) return false;
+    if (!Array.isArray(v.accounts) || !Array.isArray(v.inUse) || !Array.isArray(v.switches)) return false;
+    if (!v.accounts.every((a) => isObj(a) && str(a.connectionId))) return false;
+    // Every field the service always sends must be present; a partial item rejects the report.
+    const side = (x) => isObj(x) && !!str(x.connectionId) && !!str(x.shortId);
+    if (!v.inUse.every((u) => isObj(u) && str(u.connectionId) && num(u.requests) !== null && time(u.lastAt))) return false;
+    if (!v.switches.every((s) =>
+      isObj(s) && time(s.at) && side(s.from) && side(s.to) &&
+      isObj(s.reason) && num(s.reason.status) !== null &&
+      (s.outcome === "served" || s.outcome === "failed"))) return false;
+    if (v.current !== null && !(isObj(v.current) && str(v.current.connectionId))) return false;
+    return true;
+  }
+
+  // Last step of the fallback: the report names its state; the page never infers it.
+  const TERMINAL_BADGES = {
+    serving: ["Em uso", "sol"],
+    ready: ["Pronto", "sol"],
+    off: ["Desligado", null],
+    unavailable: ["Indisponível", null],
+  };
+  const TERMINAL_NAMES = { "gpt-6.2-sol": "GPT-6.2 Sol" };
+  /** The terminal step as the panel may show it, or null when the report has none or it is malformed. */
+  function terminalOf(r) {
+    const t = r && isObj(r.terminal) ? r.terminal : null;
+    if (!t || !str(t.model) || !Object.hasOwn(TERMINAL_BADGES, str(t.state) || "")) return null;
+    if (t.lastServedAt != null && !time(t.lastServedAt)) return null;
+    const episodes = Array.isArray(t.episodes) ? t.episodes : [];
+    if (!episodes.every((e) => isObj(e) && time(e.start) && time(e.end) && num(e.served) !== null && num(e.failed) !== null)) return null;
+    return {
+      model: t.model,
+      name: TERMINAL_NAMES[t.model] || t.model,
+      email: str(t.email),
+      state: t.state,
+      lastServedAt: time(t.lastServedAt),
+      episodes,
+    };
+  }
+
+  // ---- EARLIEST_QUOTA_RENEWAL_FIRST: the order in which Omni Route picks an account for a new
+  // session. The report carries the gateway's own decision (or the same rule recomputed when that
+  // decision is older than 15 min); the panel only formats it. Absent or off: nothing is shown.
+  const SEL_TIERS = ["A", "B", "out"];
+  const CLIENTS = {
+    "claude-code-cli": "Claude Code",
+    "claude-code-vscode": "VS Code",
+    "happy-claude-code": "Happy",
+    "agent-sdk": "Agent SDK",
+  };
+  const HASH16 = /^[0-9a-f]{16}$/;
+  /** The selection block, or null when the report has none, the policy is off, or it is malformed. */
+  function selectionOf(r) {
+    const p = r && isObj(r.pool) && isObj(r.pool.policy) ? r.pool.policy : null;
+    if (!p || p.enabled !== true) return null;
+    const side = (x) => (x === null || x === undefined ? null : isObj(x) && str(x.connectionId) && SEL_TIERS.includes(x.tier) ? x : undefined);
+    const chosen = side(r.pool.chosen), reserve = side(r.pool.reserve);
+    if (chosen === undefined || reserve === undefined) return null;
+    const ttl = num(p.sessionAffinityTtlMs);
+    const sessions = (Array.isArray(r.sessions) ? r.sessions : []).filter((x) =>
+      isObj(x) && HASH16.test(str(x.sessionHash) || "") && str(x.connectionId) && time(x.lastServedAt));
+    const events = (Array.isArray(r.failoverEvents) ? r.failoverEvents : []).filter((e) =>
+      isObj(e) && e.kind === "manual_pin" && time(e.at) && str(e.toConnectionId));
+    return { chosen, reserve, ttlMs: ttl !== null && ttl > 0 ? ttl : null, sessions, events };
+  }
+  /** One account's place in the order, or null. */
+  function orderOf(a) {
+    const o = a && isObj(a.selection) ? a.selection : null;
+    if (!o || !SEL_TIERS.includes(o.tier)) return null;
+    if (o.tier === "out") {
+      const until = time(o.resetAt);
+      const win = o.limitingWindow === "5h" ? "5 h" : "semanal";
+      return { out: true, text: `Fora da ordem · ${win} esgotada${until ? ` até ${resetText(until)}` : ""}` };
+    }
+    const pos = num(o.position);
+    if (pos === null || pos < 1) return null;
+    const why = o.tier === "B" ? "sem leitura recente · por prioridade"
+      : pos === 1 ? "renova primeiro com saldo" : pos === 2 ? "reserva" : "";
+    return { out: false, text: `${pos}ª na ordem${why ? ` · ${why}` : ""}` };
+  }
+  const ago = (d) => {
+    const min = Math.floor((Date.now() - d.getTime()) / 60000);
+    return min < 1 ? "agora" : `há ${min} min`;
+  };
+
+  let report = null;
+  let updatedAt = null;
+
+  function current() {
+    if (!report || !report.current) return { cur: null, account: null };
+    const account = report.accounts.find((a) => a.connectionId === report.current.connectionId) || null;
+    return { cur: report.current, account };
+  }
+
+  /**
+   * Atualizado: the active account's quota was read within the freshness window, and the service
+   * is publishing without errors. Desatualizado: an older reading, or any part of the chain
+   * stopped; the badge keeps the reading's own time. Indisponível: no confirmed reading.
+   */
+  function drawState() {
+    const node = $("state");
+    if (!report) { badge(node, happy.status === "connecting" ? "Consultando…" : "Indisponível", null); return; }
+    const obs = report.observer;
+    const quota = quotaOf(current().account);
+    const shownAt = quota.known ? quota.oldestAt || quota.readAt : null;
+    if (str(obs.status) === "unavailable" || !quota.known) { badge(node, "Indisponível", null); return; }
+    // Green needs a valid threshold and an explicit absence of error; anything else is not proof.
+    const freshMs = num(report.thresholds && report.thresholds.quotaFreshMs);
+    const stale =
+      freshMs === null ||
+      freshMs <= 0 ||
+      quota.readAt.getTime() - Date.now() > CLOCK_SKEW_MS ||
+      Date.now() - shownAt.getTime() > freshMs ||
+      str(obs.status) !== "fresh" ||
+      obs.lastError !== null ||
+      updatedAt === null ||
+      Date.now() - updatedAt > LIVE_MS ||
+      quota.stale ||
+      !(happy.status === "online" || happy.status === "syncing");
+    if (stale) badge(node, `Desatualizado · lido ${when(shownAt)}`, "warn");
+    else badge(node, `Atualizado · ${hm(shownAt)}`, "ok");
+  }
+
+  function drawUnavailable() {
+    $("sel").hidden = true;
+    $("foot-sel").hidden = true;
+    $("cur-at").textContent = "";
+    $("cur-email").textContent = "Indisponível";
+    $("cur-id").textContent = "—";
+    $("cur-req").textContent = "Indisponível";
+    $("cur-eff").textContent = "Indisponível";
+    const none = { known: false };
+    drawMainWindow("cur-5h", "cur-5h-sub", "5 h", none, "fiveHour");
+    drawMainWindow("cur-wk", "cur-wk-sub", "Semanal", none, "weekly");
+    $("in-use").textContent = "";
+    $("accts").replaceChildren(el("span", "na", "Indisponível"));
+    $("sw").replaceChildren(el("li", "na", "Indisponível"));
+    $("more").textContent = "";
+  }
+
+  function drawSelection(r, sel, poolNumber) {
+    $("sel").hidden = !sel;
+    $("foot-sel").hidden = !sel;
+    if (!sel) return;
+    const byId = (id) => r.accounts.find((a) => a.connectionId === id) || null;
+    const label = (id) => {
+      const a = byId(id);
+      const n = a ? poolNumber(a.shortId) : null;
+      const email = a && str(a.email);
+      return `${n ? `conta ${n}` : "fora do pool"}${email ? ` · ${email}` : ""}`;
+    };
+    const why = (side, first) => {
+      if (!side) return "";
+      if (side.tier === "B") return "sem leitura recente · por prioridade";
+      const a = byId(side.connectionId);
+      const reset = a && isObj(a.selection) ? time(a.selection.resetAt) : null;
+      if (!reset) return "";
+      return first ? `semanal com saldo que renova primeiro: ${resetText(reset)}` : `semanal renova ${resetText(reset)}`;
+    };
+    $("sel-next").textContent = sel.chosen ? label(sel.chosen.connectionId) : "nenhuma conta apta agora";
+    $("sel-next-why").textContent = why(sel.chosen, true);
+    $("sel-res").textContent = sel.reserve ? label(sel.reserve.connectionId) : "—";
+    $("sel-res-why").textContent = why(sel.reserve, false);
+    const pins = r.accounts.reduce((n, a) => n + (num(a.sessionPins) ?? 0), 0);
+    $("sel-pins").textContent = pins === 1 ? "1 fixada em conta" : `${pins} fixadas em contas`;
+    $("sel-ttl").textContent = sel.ttlMs ? `${Math.round(sel.ttlMs / 60000)} min` : "60 min";
+    const pinned = sel.sessions.filter((x) => x.pinned === true).slice(0, MAX_SWITCHES);
+    const list = $("sel-ses");
+    list.replaceChildren();
+    $("sel-ses-h").hidden = list.hidden = pinned.length === 0;
+    const accountN = (id) => { const a = byId(id); const n = a ? poolNumber(a.shortId) : null; return n ? `conta ${n}` : "fora do pool"; };
+    for (const x of pinned) {
+      const change = isObj(x.lastChange) && time(x.lastChange.at) ? x.lastChange : null;
+      const client = CLIENTS[x.client] || "outro cliente";
+      let tail;
+      if (change) {
+        const reason = str(change.reason) || "";
+        const status = reason.match(/^failover: upstream (\d{3})$/);
+        const cause = status ? `${status[1]} da ${accountN(change.fromConnectionId)}`
+          : reason.startsWith("manual_pin") ? "troca manual" : "reavaliação";
+        tail = `trocada às ${hm(time(change.at))} por ${cause}${status ? " · mesmo modelo" : ""}`;
+      } else {
+        const first = time(x.firstServedAt) || time(x.lastServedAt);
+        tail = `fixada às ${hm(first)} · renovação mais cedo`;
+      }
+      const li = el("li");
+      li.append(
+        el("span", "t", ago(time(x.lastServedAt))),
+        el("span", null, `sessão ${x.sessionHash.slice(0, 4)}… · ${accountN(x.connectionId)}${str(x.model) ? ` · ${x.model}` : ""}`),
+        el("span", "why", `${client} · ${tail}`)
+      );
+      list.append(li);
+    }
+  }
+
+  function draw() {
+    drawState();
+    drawRefresh();
+    if (!report || str(report.observer.status) === "unavailable") { drawUnavailable(); return; }
+    const r = report;
+    const poolIds = r.pool.authorized.filter(str);
+    const poolNumber = (shortId) => { const i = poolIds.indexOf(shortId); return i < 0 ? null : i + 1; };
+    const { cur, account: curAccount } = current();
+
+    const curAt = cur ? time(cur.at) : null;
+    $("cur-at").textContent = curAt ? hms(curAt) : "";
+    const email = cur && str(cur.email);
+    const emailNode = $("cur-email");
+    if (email) emailNode.replaceChildren(email, el("span", "faint", cur.emailConfirmed === true ? " · confirmado" : " · não confirmado"));
+    else emailNode.textContent = "Indisponível";
+    const prio = curAccount ? num(curAccount.priority) : null;
+    $("cur-id").textContent = cur && str(cur.shortId) ? `${cur.shortId}${prio !== null ? ` · prioridade ${prio}` : ""}` : "—";
+    $("cur-req").textContent = (cur && str(cur.requestedModel)) || "Indisponível";
+    $("cur-eff").textContent = (cur && str(cur.effectiveModel)) || "Indisponível";
+    const curQuota = quotaOf(curAccount);
+    drawMainWindow("cur-5h", "cur-5h-sub", "5 h", curQuota, "fiveHour");
+    drawMainWindow("cur-wk", "cur-wk-sub", "Semanal", curQuota, "weekly");
+    const sel = selectionOf(r);
+    drawSelection(r, sel, poolNumber);
+
+    const pool = r.accounts.filter((a) => a.authorized === true)
+      .sort((x, y) => (poolNumber(x.shortId) ?? 99) - (poolNumber(y.shortId) ?? 99));
+    const list = $("accts");
+    list.replaceChildren();
+    if (!pool.length) list.append(el("span", "na", "Nenhuma conta autorizada no relatório"));
+    for (const a of pool) {
+      const isCurrent = !!cur && a.connectionId === cur.connectionId;
+      const quota = quotaOf(a);
+      const row = el("div", isCurrent ? "a on" : "a");
+      const [text, kind] = accountBadge(a, quota, isCurrent);
+      const b = el("span"); badge(b, text, kind);
+      const mini = el("div", "mini");
+      if (quota.known) mini.append(miniWindow("5 h", quota.windows.fiveHour), miniWindow("Sem", quota.windows.weekly));
+      else mini.append(el("span", "na", "Cota indisponível"));
+      row.append(el("span", "pr", poolNumber(a.shortId) ?? "—"), el("span", "em", str(a.email) || str(a.shortId) || "—"), b, mini);
+      const renew = quota.known ? renewText(quota.windows.weekly) : "";
+      if (renew) row.append(el("span", "rn", renew));
+      const order = sel ? orderOf(a) : null;
+      if (order) row.append(el("span", order.out ? "ord out" : "ord", order.text));
+      list.append(row);
+    }
+    const term = terminalOf(r);
+    if (term) {
+      list.append(el("div", "sep"));
+      const row = el("div", term.state === "serving" ? "a on" : "a");
+      const [text, kind] = TERMINAL_BADGES[term.state];
+      const b = el("span"); badge(b, text, kind);
+      const last = term.lastServedAt ? ` · última vez ${when(term.lastServedAt)}` : "";
+      row.append(
+        el("span", "pr", "↳"),
+        el("span", "em", `${term.name}${term.email ? ` · ${term.email}` : ""}`),
+        b,
+        el("span", "rn", `Último degrau: entra só quando as ${pool.length} contas Claude falham${last}`)
+      );
+      list.append(row);
+    }
+    const outside = r.accounts.filter((a) => a.authorized !== true)
+      .map((a) => `${str(a.email) || str(a.shortId) || "conta"} — ${a.testStatus === "expired" ? "expirada" : a.state === "active" ? "fora da lista autorizada" : "inativa"}`);
+    // Inside the account list, as in the mock.
+    if (outside.length) list.append(el("div", "out", `Fora do pool: ${outside.join(", ")}`));
+    const inUse = r.inUse.filter(isObj).length;
+    $("in-use").textContent = inUse === 1 ? "1 em uso nos últimos 5 min" : `${inUse} em uso nos últimos 5 min`;
+
+    const sw = $("sw");
+    sw.replaceChildren();
+    const switches = r.switches.filter((s) => isObj(s) && time(s.at));
+    // Terminal episodes share the list with the account switches, newest first.
+    const items = [
+      ...switches.map((s) => ({ at: time(s.at), s })),
+      ...(term ? term.episodes : []).map((e) => ({ at: time(e.end), e })),
+      ...(sel ? sel.events : []).map((m) => ({ at: time(m.at), m })),
+    ].sort((x, y) => y.at - x.at);
+    if (!items.length) sw.append(el("li", "na", "Nenhuma alternância nos últimos 7 dias"));
+    for (const item of items.slice(0, MAX_SWITCHES)) {
+      if (item.m) {
+        const m = item.m;
+        const n = (id) => { const a = r.accounts.find((x) => x.connectionId === id); const k = a ? poolNumber(a.shortId) : null; return k ? `conta ${k}` : "fora do pool"; };
+        const li = el("li");
+        li.append(
+          el("span", "t", sameDay(item.at, new Date()) ? hm(item.at) : dm(item.at)),
+          el("span", null, `troca manual · ${n(m.fromConnectionId)} → ${n(m.toConnectionId)}`),
+          el("span", "why", "fixada pelo pedido (x-omniroute-connection)")
+        );
+        sw.append(li);
+        continue;
+      }
+      if (item.e) {
+        const e = item.e, start = time(e.start), end = time(e.end);
+        const req = str(e.requestedModel);
+        const tail = [`${e.served} ${e.served === 1 ? "atendida" : "atendidas"}`];
+        if (e.failed > 0) tail.push(`${e.failed} com falha`);
+        const li = el("li");
+        li.append(
+          el("span", "t", sameDay(start, new Date()) ? hm(start) : dm(start)),
+          el("span", null, `contas Claude → ${term.name}${req ? ` · ${req}` : ""}`),
+          el("span", "why", `${hm(start)}–${hm(end)} · ${pool.length} contas sem cota; modelo efetivo ${term.model}, ${tail.join(", ")}`)
+        );
+        sw.append(li);
+        continue;
+      }
+      const s = item.s;
+      const at = time(s.at);
+      const from = poolNumber(s.from && s.from.shortId), to = poolNumber(s.to && s.to.shortId);
+      const label = (n, side) => (n ? `conta ${n}` : str(side && side.email) || "fora do pool");
+      const today = sameDay(at, new Date());
+      const req = str(s.requestedModel), eff = str(s.effectiveModel);
+      const status = num(s.reason && s.reason.status);
+      const tail = [];
+      // Compared only when both models were recorded; the requested one is never inferred.
+      if (req && eff) tail.push(req === eff ? "mesmo modelo" : `modelo efetivo ${eff}`);
+      else if (eff) tail.push(`modelo efetivo ${eff}`);
+      if (s.outcome === "served") tail.push("atendida");
+      const why = `${today ? "" : `${hm(at)} · `}${status !== null ? `${status} · ` : ""}${reasonText(s.reason)}${tail.length ? `; ${tail.join(", ")}` : ""}`;
+      const li = el("li");
+      li.title = `${str(s.from && s.from.email) || ""} → ${str(s.to && s.to.email) || ""}`;
+      li.append(el("span", "t", today ? hm(at) : dm(at)), el("span", null, `${label(from, s.from)} → ${label(to, s.to)}${req ? ` · ${req}` : ""}`), el("span", "why", why));
+      sw.append(li);
+    }
+    const hidden = items.length - MAX_SWITCHES;
+    // The service sends at most the 20 most recent switches, plus the terminal episodes.
+    $("more").textContent =
+      hidden <= 0 ? "" : switches.length >= 20 ? `e mais ${hidden} entre as ${items.length} mais recentes` : `e mais ${hidden} nos últimos 7 dias`;
+  }
+
+  // ---- Manual refresh: the page asks, the publisher on the Mac rereads the quota and answers in
+  // the report's `refresh` field. The request is one shared key; its store version identifies it.
+  const REQ_KEY = "omni-route/refresh-request";
+  const REQ_SCHEMA = "omni-route-refresh-request/v1";
+  // The publisher looks for requests every few seconds; without an answer by then it is not running.
+  const ACK_MS = 20000;
+  // The publisher rereads every provider in turn; longer than this, the reread is treated as lost.
+  const RUN_MS = 90000;
+  // A write the network has not confirmed by then is shown as queued, not as in progress.
+  const SEND_MS = 15000;
+  // A request older than this when first seen is history, not something to wait for.
+  const OLD_REQUEST_MS = 120000;
+  const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const STATUSES = ["running", "done", "partial", "failed", "throttled"];
+  const ERRORS = {
+    not_configured: "atualização manual não configurada no Mac",
+    gateway_unreachable: "Omni Route fora do ar",
+    gateway_auth_failed: "credencial do painel recusada pelo Omni Route",
+    gateway_timeout: "Omni Route não respondeu a tempo",
+  };
+  const errorText = (code) => {
+    const c = str(code);
+    if (!c) return "motivo não informado";
+    const http = c.match(/^gateway_http_(\d{3})$/);
+    return ERRORS[c] || (http ? `Omni Route respondeu ${http[1]}` : "motivo não informado");
+  };
+
+  // Every time in the refresh answer comes from the Mac. The panel compares them with the Mac's
+  // own time: when the latest report was published, carried forward by this page's monotonic
+  // clock, so a device whose clock is off never changes what is shown. It never moves backward:
+  // a report republished with an older time does not reopen a wait that already ran out.
+  const mono = () => performance.now();
+  let macRef = null;
+  // Extra time for a report this page found already sitting in the store when it opened.
+  let staleExtra = 0;
+  const macNow = () => (macRef ? macRef.at + (mono() - macRef.mono) + staleExtra : null);
+  function noteReport(r, writtenAt, live) {
+    const at = r ? time(r.observer && r.observer.servedAt) || time(r.generatedAt) : null;
+    if (!at) return;
+    // A report that arrives while the page is open was just published. Only the one found when
+    // the page opens may be old: a live publisher rewrites it at least once a minute, so if this
+    // device's clock says it is older than LIVE_MS, the excess is added while that report is
+    // shown. It never touches the reference itself, so a device clock that is off affects at most
+    // the first report, and can only shorten a wait, never extend it.
+    const age = typeof writtenAt === "number" ? Date.now() - writtenAt : 0;
+    staleExtra = live ? 0 : Math.max(0, age - LIVE_MS);
+    const current = macRef ? macRef.at + (mono() - macRef.mono) : null;
+    if (current === null || at.getTime() > current) macRef = { at: at.getTime(), mono: mono() };
+  }
+  /** Identity of one answer: the same request moves from running to its result. */
+  const answerKey = (last) => (last ? `${last.requestVersion} ${last.status} ${last.finishedAt}` : null);
+
+  /** The publisher's answer, or null when it has none or any part of it is malformed. */
+  function refreshOf(r) {
+    const f = r && isObj(r.refresh) ? r.refresh : null;
+    if (!f) return null;
+    const minMs = num(f.minIntervalMs);
+    if (minMs === null || minMs <= 0 || !Number.isInteger(minMs)) return null;
+    if (f.nextAllowedAt !== null && !time(f.nextAllowedAt)) return null;
+    let last = null;
+    if (f.last !== null) {
+      const l = f.last;
+      if (!isObj(l) || !str(l.requestVersion) || !UUID7.test(l.requestVersion) || !STATUSES.includes(l.status)) return null;
+      if (!time(l.requestedAt)) return null;
+      // A running reread has started and not finished; every other answer has finished.
+      if (l.status === "running" ? !time(l.startedAt) || l.finishedAt !== null
+        : !time(l.finishedAt) || (l.startedAt !== null && !time(l.startedAt))) return null;
+      if (l.error !== null && !str(l.error)) return null;
+      if (!Array.isArray(l.accounts)) return null;
+      if (!l.accounts.every((a) => isObj(a) && str(a.shortId) && typeof a.updated === "boolean")) return null;
+      last = l;
+    }
+    return { minMs, nextAllowedAt: time(f.nextAllowedAt), last };
+  }
+
+  const reqView = happy.kv.track(REQ_KEY);
+  // When this page first saw each request, on its own monotonic clock; null for an old one.
+  const seenAt = new Map();
+  const oldRequests = new Set();
+  const ownRequests = new Set();
+  let sendStartedAt = null;
+  // A refused write is reported until the publisher's answer changes.
+  let sendError = null;
+
+  /** The request in the store that the publisher would act on, or null. */
+  function requestState() {
+    if (!reqView.loaded || !reqView.exists) return null;
+    if (reqView.pending) return { pending: true };
+    if (!isObj(reqView.value) || reqView.value.schema !== REQ_SCHEMA) return null;
+    const version = str(reqView.version);
+    if (!version || !UUID7.test(version)) return null;
+    // The request's write time and the Mac's time both come from the Mac; until a report gives
+    // the Mac's time, the request is not judged at all.
+    const now = macNow();
+    if (now === null || typeof reqView.updatedAt !== "number") return null;
+    if (!seenAt.has(version)) seenAt.set(version, mono());
+    const seen = seenAt.get(version);
+    // Its age when this page first saw it, by the best estimate of the Mac's time so far: a later
+    // report can show it was already old, and the wait is never restarted.
+    // A request this page wrote is never old. Otherwise, found old by published Mac time, it
+    // stays old; the device-clock estimate for a report found at opening only counts while that
+    // report is shown, and is never kept.
+    if (ownRequests.has(version)) return { version, seen };
+    const sinceSight = mono() - seen;
+    const published = now - staleExtra;
+    if (published - sinceSight - reqView.updatedAt > OLD_REQUEST_MS) oldRequests.add(version);
+    const old = oldRequests.has(version) || now - sinceSight - reqView.updatedAt > OLD_REQUEST_MS;
+    return { version, seen: old ? null : seen };
+  }
+
+  function drawRefresh() {
+    const btn = $("rf-btn"), label = $("rf-label"), msg = $("rf-msg");
+    const rf = report ? refreshOf(report) : null;
+    const online = happy.status === "online" || happy.status === "syncing";
+    const req = requestState();
+    // One request at a time: while this page's write is unconfirmed, no other can be sent.
+    const queued = !!(req && req.pending);
+    const set = (busy, text, kind, title) => {
+      btn.disabled = busy || queued || !rf || !online;
+      btn.classList.toggle("busy", busy);
+      label.textContent = busy ? "Atualizando…" : "Atualizar";
+      msg.className = "rf-msg" + (kind ? ` ${kind}` : "");
+      msg.textContent = text;
+      msg.title = title || "";
+    };
+    if (rf) {
+      const ms = rf.minMs;
+      $("rf-min").textContent = ms % 60000 === 0 ? `${ms / 60000} min` : `${Math.round(ms / 1000)} s`;
+    }
+    if (!report) { set(false, ""); return; }
+    if (!rf) { set(false, "Atualização manual indisponível"); return; }
+    const last = rf.last;
+    const now = macNow();
+    // A reread the report says is running is shown as such, whoever asked for it, while in time.
+    const running = !!last && last.status === "running";
+    if (running && now !== null && now - time(last.startedAt).getTime() < RUN_MS) {
+      set(true, "Lendo a cota das contas na Anthropic…");
+      return;
+    }
+    if (queued) {
+      // Past a few seconds the write is still waiting for the network: no animation, and no
+      // second request, until it is confirmed.
+      set(sendStartedAt !== null && mono() - sendStartedAt < SEND_MS, "Enviando pedido…");
+      return;
+    }
+    if (sendError && sendError.answer === answerKey(last)) {
+      set(false, "Não foi possível enviar o pedido · tente de novo", "warn");
+      return;
+    }
+    const answered = req && last && last.requestVersion >= req.version;
+    if (req && req.seen !== null && !answered) {
+      if (mono() - req.seen < ACK_MS) { set(true, "Pedido enviado · aguardando o publicador"); return; }
+      set(false, "O publicador no Mac não respondeu · valores abaixo são da última leitura", "warn");
+      return;
+    }
+    if (running) {
+      set(false, `A releitura não terminou em ${RUN_MS / 1000} s · valores abaixo são da última leitura`, "warn");
+      return;
+    }
+    if (!last) { set(false, "Relê a cota das contas na Anthropic agora"); return; }
+    const done = time(last.finishedAt);
+    const next = rf.nextAllowedAt && now !== null && rf.nextAllowedAt.getTime() > now ? rf.nextAllowedAt : null;
+    const nextText = next ? ` · de novo às ${hm(next)}` : "";
+    const accounts = last.accounts;
+    if (last.status === "throttled") {
+      set(false, `Leitura mais recente já exibida${next ? ` · pode atualizar de novo às ${hm(next)}` : ""}`);
+      return;
+    }
+    if (last.status === "done") { set(false, `Relida às ${hm(done)}${nextText}`, "ok"); return; }
+    if (last.status === "partial") {
+      const ok = accounts.filter((a) => a.updated).length;
+      const miss = accounts.filter((a) => !a.updated);
+      const name = (a) => { const acc = report.accounts.find((x) => x.shortId === a.shortId); return str(acc && acc.email) || a.shortId; };
+      const why = miss.map((a) => `${name(a)}: ${str(a.reason) || "sem leitura nova"}`).join("; ");
+      let text = `Relida às ${hm(done)} em ${ok} de ${accounts.length} contas`;
+      if (miss.length === 1) text += ` · ${why}`;
+      set(false, text, "warn", why);
+      return;
+    }
+    // failed
+    set(false, `Não atualizou: ${errorText(last.error)} · valores abaixo são da leitura anterior`, "warn");
+  }
+
+  $("rf-btn").addEventListener("click", () => {
+    const rf = report ? refreshOf(report) : null;
+    sendError = null;
+    sendStartedAt = mono();
+    happy.kv.set(REQ_KEY, { schema: REQ_SCHEMA }).then(
+      (entry) => {
+        sendStartedAt = null;
+        if (entry && str(entry.version)) {
+          seenAt.set(entry.version, mono());
+          ownRequests.add(entry.version);
+        }
+        drawRefresh();
+      },
+      (error) => {
+        sendStartedAt = null;
+        sendError = { answer: answerKey(rf && rf.last) };
+        happy.debug.log("refresh request refused", { status: error && error.status, code: error && error.code }, "warn");
+        drawRefresh();
+      }
+    );
+    drawRefresh();
+  });
+  reqView.subscribe(drawRefresh);
+
+  const view = happy.kv.track(KEY);
+  // The first report this page reads is the one found in the store; later ones are live.
+  let reportSeen = false;
+  view.subscribe(() => {
+    if (!view.loaded) return;
+    if (view.exists && valid(view.value)) {
+      report = view.value;
+      updatedAt = typeof view.updatedAt === "number" ? view.updatedAt : null;
+      noteReport(report, updatedAt, reportSeen);
+      reportSeen = true;
+    } else {
+      report = null;
+      updatedAt = null;
+      noteReport(null);
+      if (view.exists) happy.debug.log("omni-route/usage has an unexpected shape", null, "warn");
+    }
+    draw();
+  });
+  happy.onStatus(() => { drawState(); drawRefresh(); });
+  // Waiting states and their timeouts change by the second.
+  setInterval(drawRefresh, 1000);
+  // Redraw everything, so a window whose reset passes during a silence stops showing its number.
+  setInterval(draw, 15000);
+  draw();
+})();
+</script>
+</body>
+</html>

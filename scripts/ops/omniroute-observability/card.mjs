@@ -247,6 +247,23 @@ function resetCell(w, fmt, renewed) {
   return w.resetsAt ? fmt.resetText(w.resetsAt) : "não informada";
 }
 
+// EARLIEST_QUOTA_RENEWAL_FIRST, as the panel shows it: only with the policy on and the report's
+// own order; absent or off, the card is exactly the previous one.
+const SEL_TIERS = ["A", "B", "out"];
+function selectionOn(report) {
+  const p = isObj(report.pool) && isObj(report.pool.policy) ? report.pool.policy : null;
+  return !!p && p.enabled === true;
+}
+// Gen UI tables take at most 6 columns (docs/genui/components/table.md), and the card already
+// uses 6, so the approved "Ordem" column is drawn inside the "Conta" cell ("· 1ª", "· fora").
+function orderText(account) {
+  const o = isObj(account.selection) ? account.selection : null;
+  if (!o || !SEL_TIERS.includes(o.tier)) return null;
+  if (o.tier === "out") return "fora";
+  const pos = num(o.position);
+  return pos !== null && pos >= 1 ? `${pos}ª` : null;
+}
+
 function intervalText(ms) {
   return ms % 60_000 === 0 ? `${ms / 60_000} min` : `${Math.round(ms / 1000)} s`;
 }
@@ -319,6 +336,22 @@ function draw(report, now, { timeZone = "America/Sao_Paulo", minIntervalMs = 300
       },
     ];
   }
+  const selection = selectionOn(r);
+  if (selection) {
+    const chosen = isObj(r.pool.chosen) ? r.pool.chosen : null;
+    const account = chosen ? r.accounts.find((a) => a.connectionId === chosen.connectionId) : null;
+    const n = account ? poolNumber(str(account.shortId)) : null;
+    const reset = account && isObj(account.selection) ? time(account.selection.resetAt) : null;
+    let value = "nenhuma conta apta agora";
+    if (chosen) {
+      const who = n ? `Conta ${n}` : str(chosen.email) || "conta fora do pool";
+      value =
+        chosen.tier === "B"
+          ? `${who} · sem leitura recente · por prioridade`
+          : `${who} · renova primeiro com saldo${reset ? ` (${fmt.resetText(reset)})` : ""}`;
+    }
+    usage.push({ label: "Sessão nova", value });
+  }
 
   // Accounts of the pool, in pool order.
   const pool = r.accounts
@@ -349,8 +382,9 @@ function draw(report, now, { timeZone = "America/Sao_Paulo", minIntervalMs = 300
       }
       if (parts.length) limits.push(`conta ${n ?? name} com ${parts.join(" e ")}`);
     }
+    const order = selection ? orderText(a) : null;
     return {
-      conta: `${n ?? "—"} · ${name}`,
+      conta: `${n ?? "—"} · ${name}${order ? ` · ${order}` : ""}`,
       h5: cell(five),
       h5z: resetCell(five, fmt, "zerou"),
       sem: cell(week),
@@ -372,6 +406,9 @@ function draw(report, now, { timeZone = "America/Sao_Paulo", minIntervalMs = 300
     );
   const caption = [
     fiveHourAbsent ? "“—”: a Anthropic não informou a janela de 5 h dessa conta." : null,
+    selection
+      ? "Ordem (após o e-mail): renovação semanal mais cedo entre as contas com saldo; “fora” = cota esgotada até renovar."
+      : null,
     outside.length ? `Fora do pool: ${outside.join("; ")}.` : null,
   ].filter(Boolean);
   const table = {

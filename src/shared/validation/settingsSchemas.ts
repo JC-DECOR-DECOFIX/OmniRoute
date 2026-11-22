@@ -259,6 +259,8 @@ export const updateSettingsSchema = z.object({
       z.object({
         fallbackStrategy: z.enum(ACCOUNT_FALLBACK_STRATEGY_VALUES).optional(),
         stickyRoundRobinLimit: z.number().int().min(1).max(1000).optional(),
+        /** Sliding session-affinity TTL for this provider only (0/absent = off). */
+        sessionAffinityTtlMs: z.number().int().min(0).max(86_400_000).optional(),
       })
     )
     .optional(),

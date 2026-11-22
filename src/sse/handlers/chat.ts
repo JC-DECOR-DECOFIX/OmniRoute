@@ -103,6 +103,7 @@ import {
   withModalityBridgeHeader,
   withConversationId,
 } from "./chatHelpers";
+import { finalizeAccountSelection } from "./chat/accountSelectionAudit";
 import { buildModalityBridgeHeader } from "@/lib/guardrails/modalityBridge/bridgeStats";
 import { resolveConversationId } from "@omniroute/open-sse/services/conversationTracker.ts";
 import {
@@ -1950,6 +1951,13 @@ async function handleSingleModelChat(
       });
 
       if (result.success) {
+        const audit = { provider, model, credentials, sessionKey: occupancySessionKey, lastStatus };
+        result.response = finalizeAccountSelection(result.response, {
+          ...audit,
+          attemptedConnectionIds: [...excludedConnectionIds, credentials.connectionId],
+          forcedConnection: hasForcedConnection,
+          userAgent: request?.headers?.get?.("user-agent") ?? null,
+        });
         if (claudeAccountContinuityOnly && apiKeyInfo?.noLog !== true) {
           const attempts = Array.from(continuityAttemptedConnections);
           log.info(
