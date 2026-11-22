@@ -50,8 +50,14 @@ model lockout, quota policy, quota exhaustion, API-key `allowedConnections` and 
 - The session stays on its account while the account remains in tier A or B. It does not move
   because another account became better. It is re-evaluated on a new session, when the pin
   expires (sliding TTL), or on a real event: 429, quota exhausted, credential failure, terminal
-  status.
-- An operator pin (`x-omniroute-connection`) keeps precedence.
+  status. A transient upstream failure that fails the request over (5xx, stream closed early,
+  combo target timeout) also evicts the pin, so the session continues on the account that
+  answered.
+- An operator pin (`x-omniroute-connection`) keeps precedence for that request, and the account
+  it chose becomes the session's pin until the pin expires or a real event moves it.
+- Combos whose Claude targets name an explicit `connectionId`: while the Claude TTL is on, an
+  active session pin replaces that target connection when the pinned account is eligible
+  (`applySessionAffinityPin`, #5903). No such combo was used in the 7 days before the rollout.
 - Accounts never change after useful streaming output: the Claude continuity retry runs only
   before the first useful output (`src/sse/handlers/chat.ts`).
 
@@ -90,8 +96,18 @@ Enable for Claude only (settings, namespace `settings`, key `providerStrategies`
 use, moving a session to another account loses no cache.
 
 Roll back by configuration: set `providerStrategies.claude.fallbackStrategy` back to `priority`.
-That single key restores the previous behaviour exactly (priority order, no session pins), and
-the scoped TTL becomes inert. Existing pins expire on their own.
+That single key restores the previous account choice (priority order through the fill-first
+branch, no new session pins; the scoped TTL becomes inert and existing pins are no longer read).
+It is not byte-identical to the previous build: the Claude Code session key (`claude:<uuid>`) still
+feeds OAuth session occupancy and `reserveOAuthSession`, and the selection header, failover log and
+session activity keep being written. The exact previous semantics come back only with the package
+rollback (`ROLLBACK.md` in the mission directory).
+
+Post-deploy watch: count `failover` events per account and per hour in `key_value` namespace
+`account_failover_events` (for example
+`SELECT json_extract(value,'$.fromConnectionId') AS account, substr(json_extract(value,'$.at'),1,13) AS hour, COUNT(*) FROM key_value WHERE namespace='account_failover_events' AND json_extract(value,'$.kind')='failover' GROUP BY 1,2 ORDER BY 2 DESC`,
+read-only). A growing count on the first-ranked account means the ranking keeps choosing an
+account that the vendor is limiting.
 
 Codex is intentionally left on its own strategy: the pool has a single Codex account and the
 Codex account pool already rotates by its own quota scopes. GPT/Codex requests never enter the

@@ -274,3 +274,43 @@ test("sliding TTL: an idle pin expires and the session is re-evaluated", async (
   assert.equal(affinityDb.getSessionAccountAffinity("s-ttl", "claude", TTL, t0), null);
   assert.equal((await select("s-ttl"))?.connectionId, ids.p2);
 });
+
+test("only the full pool of a normal selection is published as the last decision", async () => {
+  const ids = await seedAcceptancePool();
+  await select("s-full");
+  const persisted = () => {
+    const row = core
+      .getDbInstance()
+      .prepare(
+        "SELECT value FROM key_value WHERE namespace = 'account_selection_ranking' AND key = 'claude'"
+      )
+      .get() as { value: string } | undefined;
+    return row ? (JSON.parse(row.value) as { ordered: Array<{ connectionId: string }> }) : null;
+  };
+  const full = [ids.p2, ids.p1];
+  assert.deepEqual(
+    ranking.getLastAccountSelectionRanking("claude")?.ordered.map((d) => d.connectionId),
+    full
+  );
+  assert.deepEqual(
+    persisted()?.ordered.map((d) => d.connectionId),
+    full
+  );
+
+  // A retry that excluded an account or an operator pin narrows the pool: neither may replace
+  // the published "next session / reserve".
+  ranking.__resetQuotaRenewalRankingForTests();
+  await select("s-retry", { excludeConnectionIds: [ids.p2] });
+  await select("s-forced", { forcedConnectionId: ids.p1, strictForcedConnection: true });
+  assert.equal(ranking.getLastAccountSelectionRanking("claude"), null);
+  assert.deepEqual(
+    persisted()?.ordered.map((d) => d.connectionId),
+    full
+  );
+  // A pinned session still ranks the full pool, so it publishes the full order.
+  await select("s-full");
+  assert.deepEqual(
+    ranking.getLastAccountSelectionRanking("claude")?.ordered.map((d) => d.connectionId),
+    full
+  );
+});

@@ -1817,7 +1817,9 @@ export async function getProviderCredentials(
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
     // EARLIEST_QUOTA_RENEWAL_FIRST: rank the filtered pool; affinity and new pins use it too.
     const renewal = isEarliestQuotaRenewalStrategy(strategy)
-      ? applyEarliestQuotaRenewal(resolvedId, orderedConnections, requestedModel)
+      ? applyEarliestQuotaRenewal(resolvedId, orderedConnections, requestedModel, {
+          record: !forcedConnectionId && !excludedConnectionIds.size && !options._leaseCandidateIds,
+        })
       : null;
     const affinityPool = renewal?.pool ?? orderedConnections;
     const pickNew = renewal ? (pool: typeof affinityPool) => pool[0] ?? null : undefined;

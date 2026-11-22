@@ -338,7 +338,16 @@ export function applyEarliestQuotaRenewal<T extends { id: string; priority?: num
   provider: string,
   connections: T[],
   requestedModel: string | null,
-  options: { now?: number; read?: (connectionId: string) => QuotaRenewalReading | null } = {}
+  options: {
+    now?: number;
+    read?: (connectionId: string) => QuotaRenewalReading | null;
+    /**
+     * Persist this ranking as the provider's last decision (observability). Only the full pool
+     * of a normal selection qualifies: a forced connection, a retry that excluded accounts or a
+     * lease-frozen candidate set would publish a partial order as "next session / reserve".
+     */
+    record?: boolean;
+  } = {}
 ): EarliestRenewalSelection<T> {
   const read = options.read ?? readQuotaRenewalReading;
   const ranking = rankByEarliestQuotaRenewal(
@@ -352,7 +361,7 @@ export function applyEarliestQuotaRenewal<T extends { id: string; priority?: num
   const byId = new Map(connections.map((connection) => [connection.id, connection]));
   const ranked = ranking.ordered.map((decision) => byId.get(decision.connectionId)!);
   const pool = ranked.length > 0 ? ranked : connections;
-  recordAccountSelectionRanking(provider, ranking);
+  if (options.record !== false) recordAccountSelectionRanking(provider, ranking);
   return {
     ranking,
     pool,
