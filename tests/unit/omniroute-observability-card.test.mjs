@@ -717,3 +717,83 @@ test("after a restart the card is not written before the interval from its last 
   await new Promise((resolve) => setTimeout(resolve, 2_000));
   assert.equal(daemon.requests.filter((r) => r.method === "PATCH").length, 0);
 });
+
+// EARLIEST_QUOTA_RENEWAL_FIRST (mock approved 21/11/2026): "Sessão nova" line, "Ordem" column and
+// one caption sentence, only while the report says the policy is on.
+function withRenewalPolicy(report, { enabled = true } = {}) {
+  const r = structuredClone(report);
+  const pool = r.accounts.filter((a) => a.authorized === true);
+  const [first, second, third] = pool;
+  const weekly = (a) => a.quota?.windows?.weekly?.resetsAt ?? null;
+  r.pool.policy = {
+    name: "EARLIEST_QUOTA_RENEWAL_FIRST",
+    strategy: enabled ? "earliest-quota-renewal" : "priority",
+    enabled,
+    sessionAffinityTtlMs: enabled ? 3_600_000 : 0,
+    quotaFreshMs: 600_000,
+  };
+  const pick = (a, tier) => ({
+    connectionId: a.connectionId,
+    shortId: a.shortId,
+    email: a.email,
+    tier,
+    reason: "x",
+  });
+  r.pool.chosen = pick(second, "A");
+  r.pool.reserve = pick(first, "A");
+  second.selection = {
+    tier: "A",
+    position: 1,
+    reason: "weekly_usable_earliest_reset",
+    limitingWindow: "weekly",
+    resetAt: weekly(second),
+  };
+  first.selection = {
+    tier: "B",
+    position: 2,
+    reason: "quota_stale",
+    limitingWindow: null,
+    resetAt: null,
+  };
+  if (third)
+    third.selection = {
+      tier: "out",
+      position: null,
+      reason: "weekly_exhausted",
+      limitingWindow: "weekly",
+      resetAt: weekly(third),
+    };
+  return r;
+}
+
+test("renewal policy on: next-session line, order column and caption", () => {
+  const doc = render(withRenewalPolicy(REPORT), AT);
+  assertGenUi(doc);
+  const usage = items(children(doc)[0]);
+  assert.match(usage["Sessão nova"], /^Conta 2 · renova primeiro com saldo/);
+  // Gen UI allows at most 6 table columns; the order rides in the "Conta" cell.
+  const columns = table(doc).columns.map((c) => c.label);
+  assert.deepEqual(columns, ["Conta", "5 h", "5 h zera", "Semana", "Semana renova", "Estado"]);
+  assert.match(row(doc, 1).conta, / · 2ª$/);
+  assert.match(row(doc, 2).conta, / · 1ª$/);
+  if (table(doc).rows.length > 2) assert.match(row(doc, 3).conta, / · fora$/);
+  assert.match(
+    table(doc).caption,
+    /Ordem \(após o e-mail\): renovação semanal mais cedo entre as contas com saldo; “fora” = cota esgotada até renovar\./
+  );
+});
+
+test("renewal policy off or absent: the card is exactly the previous one", () => {
+  const off = render(withRenewalPolicy(REPORT, { enabled: false }), AT);
+  const absent = render(REPORT, AT);
+  assert.equal(canonical(JSON.stringify(off)), canonical(JSON.stringify(absent)));
+  assert.ok(!table(absent).rows.some((r) => / · (\d+ª|fora)$/.test(r.conta)));
+  assert.ok(!("Sessão nova" in items(children(absent)[0])));
+});
+
+test("a stale chosen account says so instead of claiming the earliest renewal", () => {
+  const r = withRenewalPolicy(REPORT);
+  r.pool.chosen.tier = "B";
+  const usage = items(children(render(r, AT))[0]);
+  assert.match(usage["Sessão nova"], /sem leitura recente · por prioridade$/);
+});

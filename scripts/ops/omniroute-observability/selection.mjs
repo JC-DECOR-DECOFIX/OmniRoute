@@ -107,6 +107,8 @@ export function readSessions(db, provider, now, pins, emailOf) {
       email: emailOf(connectionId),
       model: match(s.model, TEXT_RE),
       client: CLIENTS.has(s.client) ? s.client : "unknown",
+      firstServedAt:
+        ms(s.firstServedAt) !== null ? new Date(ms(s.firstServedAt)).toISOString() : null,
       lastServedAt: new Date(lastServedAt).toISOString(),
       pinned: !!pin && pin.connectionId === connectionId,
       pinExpiresAt: pin && pin.connectionId === connectionId ? pin.expiresAt : null,

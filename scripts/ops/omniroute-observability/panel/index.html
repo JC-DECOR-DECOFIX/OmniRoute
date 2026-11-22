@@ -46,6 +46,9 @@
   .mini .m span:last-child { text-align: right; }
   .mini .track { height: 4px; }
   .a .rn { grid-column: 2 / 4; font-size: 11px; line-height: 15px; color: var(--happy-faint); font-variant-numeric: tabular-nums; }
+  .a .ord { grid-column: 2 / 4; font-size: 11px; line-height: 15px; color: var(--color-text-success, #0a7f6f); font-variant-numeric: tabular-nums; }
+  .a .ord.out { color: var(--color-text-warning, #ffab00); }
+  .panel [hidden] { display: none !important; }
   .out { font-size: 11px; color: var(--happy-faint); padding-top: 2px; }
   .sep { border-top: 1px dashed var(--happy-border); margin: 4px 0 0; }
   .sw { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
@@ -95,6 +98,20 @@
     <div class="bar-sub" id="cur-wk-sub"></div>
   </div>
 
+  <div class="sec" id="sel" hidden>
+    <div class="sec-h">Escolha de conta <span class="r">renovação mais cedo primeiro</span></div>
+    <dl class="kv">
+      <dt>Sessão nova</dt><dd id="sel-next">—</dd>
+      <dt></dt><dd class="faint wrap" id="sel-next-why"></dd>
+      <dt>Reserva</dt><dd id="sel-res">—</dd>
+      <dt></dt><dd class="faint wrap" id="sel-res-why"></dd>
+      <dt>Sessões</dt><dd id="sel-pins">0 fixadas em contas</dd>
+      <dt></dt><dd class="faint wrap">cada sessão fica na mesma conta até <span id="sel-ttl">60 min</span> sem uso ou até a cota dela acabar</dd>
+    </dl>
+    <div class="sec-h" id="sel-ses-h" style="margin-top:4px" hidden>Sessões fixadas</div>
+    <ul class="sw" id="sel-ses" hidden></ul>
+  </div>
+
   <div class="sec">
     <div class="sec-h">Contas <span class="r" id="in-use"></span></div>
     <div class="accts" id="accts"></div>
@@ -107,7 +124,7 @@
   </div>
 
   <div class="foot">
-    Fonte: Omni Route (registros por requisição) · cota de assinatura lida pelo Omni Route em api.anthropic.com/api/oauth/usage, não consumo de API · o painel redesenha a cada 15 s · Atualizar relê a cota na hora (no máximo 1 vez a cada <span id="rf-min">2 min</span>)
+    Fonte: Omni Route (registros por requisição) · cota de assinatura lida pelo Omni Route em api.anthropic.com/api/oauth/usage, não consumo de API · <span id="foot-sel" hidden>ordem de escolha decidida pelo Omni Route a cada sessão nova · </span>o painel redesenha a cada 15 s · Atualizar relê a cota na hora (no máximo 1 vez a cada <span id="rf-min">2 min</span>)
   </div>
 </div>
 
@@ -311,6 +328,51 @@
     };
   }
 
+  // ---- EARLIEST_QUOTA_RENEWAL_FIRST: the order in which Omni Route picks an account for a new
+  // session. The report carries the gateway's own decision (or the same rule recomputed when that
+  // decision is older than 15 min); the panel only formats it. Absent or off: nothing is shown.
+  const SEL_TIERS = ["A", "B", "out"];
+  const CLIENTS = {
+    "claude-code-cli": "Claude Code",
+    "claude-code-vscode": "VS Code",
+    "happy-claude-code": "Happy",
+    "agent-sdk": "Agent SDK",
+  };
+  const HASH16 = /^[0-9a-f]{16}$/;
+  /** The selection block, or null when the report has none, the policy is off, or it is malformed. */
+  function selectionOf(r) {
+    const p = r && isObj(r.pool) && isObj(r.pool.policy) ? r.pool.policy : null;
+    if (!p || p.enabled !== true) return null;
+    const side = (x) => (x === null || x === undefined ? null : isObj(x) && str(x.connectionId) && SEL_TIERS.includes(x.tier) ? x : undefined);
+    const chosen = side(r.pool.chosen), reserve = side(r.pool.reserve);
+    if (chosen === undefined || reserve === undefined) return null;
+    const ttl = num(p.sessionAffinityTtlMs);
+    const sessions = (Array.isArray(r.sessions) ? r.sessions : []).filter((x) =>
+      isObj(x) && HASH16.test(str(x.sessionHash) || "") && str(x.connectionId) && time(x.lastServedAt));
+    const events = (Array.isArray(r.failoverEvents) ? r.failoverEvents : []).filter((e) =>
+      isObj(e) && e.kind === "manual_pin" && time(e.at) && str(e.toConnectionId));
+    return { chosen, reserve, ttlMs: ttl !== null && ttl > 0 ? ttl : null, sessions, events };
+  }
+  /** One account's place in the order, or null. */
+  function orderOf(a) {
+    const o = a && isObj(a.selection) ? a.selection : null;
+    if (!o || !SEL_TIERS.includes(o.tier)) return null;
+    if (o.tier === "out") {
+      const until = time(o.resetAt);
+      const win = o.limitingWindow === "5h" ? "5 h" : "semanal";
+      return { out: true, text: `Fora da ordem · ${win} esgotada${until ? ` até ${resetText(until)}` : ""}` };
+    }
+    const pos = num(o.position);
+    if (pos === null || pos < 1) return null;
+    const why = o.tier === "B" ? "sem leitura recente · por prioridade"
+      : pos === 1 ? "renova primeiro com saldo" : pos === 2 ? "reserva" : "";
+    return { out: false, text: `${pos}ª na ordem${why ? ` · ${why}` : ""}` };
+  }
+  const ago = (d) => {
+    const min = Math.floor((Date.now() - d.getTime()) / 60000);
+    return min < 1 ? "agora" : `há ${min} min`;
+  };
+
   let report = null;
   let updatedAt = null;
 
@@ -350,6 +412,8 @@
   }
 
   function drawUnavailable() {
+    $("sel").hidden = true;
+    $("foot-sel").hidden = true;
     $("cur-at").textContent = "";
     $("cur-email").textContent = "Indisponível";
     $("cur-id").textContent = "—";
@@ -362,6 +426,61 @@
     $("accts").replaceChildren(el("span", "na", "Indisponível"));
     $("sw").replaceChildren(el("li", "na", "Indisponível"));
     $("more").textContent = "";
+  }
+
+  function drawSelection(r, sel, poolNumber) {
+    $("sel").hidden = !sel;
+    $("foot-sel").hidden = !sel;
+    if (!sel) return;
+    const byId = (id) => r.accounts.find((a) => a.connectionId === id) || null;
+    const label = (id) => {
+      const a = byId(id);
+      const n = a ? poolNumber(a.shortId) : null;
+      const email = a && str(a.email);
+      return `${n ? `conta ${n}` : "fora do pool"}${email ? ` · ${email}` : ""}`;
+    };
+    const why = (side, first) => {
+      if (!side) return "";
+      if (side.tier === "B") return "sem leitura recente · por prioridade";
+      const a = byId(side.connectionId);
+      const reset = a && isObj(a.selection) ? time(a.selection.resetAt) : null;
+      if (!reset) return "";
+      return first ? `semanal com saldo que renova primeiro: ${resetText(reset)}` : `semanal renova ${resetText(reset)}`;
+    };
+    $("sel-next").textContent = sel.chosen ? label(sel.chosen.connectionId) : "nenhuma conta apta agora";
+    $("sel-next-why").textContent = why(sel.chosen, true);
+    $("sel-res").textContent = sel.reserve ? label(sel.reserve.connectionId) : "—";
+    $("sel-res-why").textContent = why(sel.reserve, false);
+    const pins = r.accounts.reduce((n, a) => n + (num(a.sessionPins) ?? 0), 0);
+    $("sel-pins").textContent = pins === 1 ? "1 fixada em conta" : `${pins} fixadas em contas`;
+    $("sel-ttl").textContent = sel.ttlMs ? `${Math.round(sel.ttlMs / 60000)} min` : "60 min";
+    const pinned = sel.sessions.filter((x) => x.pinned === true).slice(0, MAX_SWITCHES);
+    const list = $("sel-ses");
+    list.replaceChildren();
+    $("sel-ses-h").hidden = list.hidden = pinned.length === 0;
+    const accountN = (id) => { const a = byId(id); const n = a ? poolNumber(a.shortId) : null; return n ? `conta ${n}` : "fora do pool"; };
+    for (const x of pinned) {
+      const change = isObj(x.lastChange) && time(x.lastChange.at) ? x.lastChange : null;
+      const client = CLIENTS[x.client] || "outro cliente";
+      let tail;
+      if (change) {
+        const reason = str(change.reason) || "";
+        const status = reason.match(/^failover: upstream (\d{3})$/);
+        const cause = status ? `${status[1]} da ${accountN(change.fromConnectionId)}`
+          : reason.startsWith("manual_pin") ? "troca manual" : "reavaliação";
+        tail = `trocada às ${hm(time(change.at))} por ${cause}${status ? " · mesmo modelo" : ""}`;
+      } else {
+        const first = time(x.firstServedAt) || time(x.lastServedAt);
+        tail = `fixada às ${hm(first)} · renovação mais cedo`;
+      }
+      const li = el("li");
+      li.append(
+        el("span", "t", ago(time(x.lastServedAt))),
+        el("span", null, `sessão ${x.sessionHash.slice(0, 4)}… · ${accountN(x.connectionId)}${str(x.model) ? ` · ${x.model}` : ""}`),
+        el("span", "why", `${client} · ${tail}`)
+      );
+      list.append(li);
+    }
   }
 
   function draw() {
@@ -386,6 +505,8 @@
     const curQuota = quotaOf(curAccount);
     drawMainWindow("cur-5h", "cur-5h-sub", "5 h", curQuota, "fiveHour");
     drawMainWindow("cur-wk", "cur-wk-sub", "Semanal", curQuota, "weekly");
+    const sel = selectionOf(r);
+    drawSelection(r, sel, poolNumber);
 
     const pool = r.accounts.filter((a) => a.authorized === true)
       .sort((x, y) => (poolNumber(x.shortId) ?? 99) - (poolNumber(y.shortId) ?? 99));
@@ -404,6 +525,8 @@
       row.append(el("span", "pr", poolNumber(a.shortId) ?? "—"), el("span", "em", str(a.email) || str(a.shortId) || "—"), b, mini);
       const renew = quota.known ? renewText(quota.windows.weekly) : "";
       if (renew) row.append(el("span", "rn", renew));
+      const order = sel ? orderOf(a) : null;
+      if (order) row.append(el("span", order.out ? "ord out" : "ord", order.text));
       list.append(row);
     }
     const term = terminalOf(r);
@@ -435,9 +558,22 @@
     const items = [
       ...switches.map((s) => ({ at: time(s.at), s })),
       ...(term ? term.episodes : []).map((e) => ({ at: time(e.end), e })),
+      ...(sel ? sel.events : []).map((m) => ({ at: time(m.at), m })),
     ].sort((x, y) => y.at - x.at);
     if (!items.length) sw.append(el("li", "na", "Nenhuma alternância nos últimos 7 dias"));
     for (const item of items.slice(0, MAX_SWITCHES)) {
+      if (item.m) {
+        const m = item.m;
+        const n = (id) => { const a = r.accounts.find((x) => x.connectionId === id); const k = a ? poolNumber(a.shortId) : null; return k ? `conta ${k}` : "fora do pool"; };
+        const li = el("li");
+        li.append(
+          el("span", "t", sameDay(item.at, new Date()) ? hm(item.at) : dm(item.at)),
+          el("span", null, `troca manual · ${n(m.fromConnectionId)} → ${n(m.toConnectionId)}`),
+          el("span", "why", "fixada pelo pedido (x-omniroute-connection)")
+        );
+        sw.append(li);
+        continue;
+      }
       if (item.e) {
         const e = item.e, start = time(e.start), end = time(e.end);
         const req = str(e.requestedModel);
